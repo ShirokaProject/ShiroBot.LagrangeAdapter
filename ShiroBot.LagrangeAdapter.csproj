@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+        <HostAdapterDir>..\ShiroBot\ShiroBot\bin\Debug\$(TargetFramework)\adapters\$(AssemblyName)\</HostAdapterDir>
+        <!-- Lagrange.Core 面向 net8/net9,net10 引用向下兼容 -->
+        <NoWarn>$(NoWarn);NU1702</NoWarn>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- 进程内 QQ 协议库(LagrangeDev/LagrangeV2 源码) -->
+        <ProjectReference Include="..\LagrangeV2\Lagrange.Core\Lagrange.Core.csproj" />
+        <ProjectReference Include="..\ShiroBot\ShiroBot.SDK\ShiroBot.SDK.csproj">
+            <Private>false</Private>
+        </ProjectReference>
+        <!-- Qq.Model 由宿主共享(Default ALC),适配器只做编译期引用 -->
+        <ProjectReference Include="..\ShiroBot\ShiroBot.Qq.Model\ShiroBot.Qq.Model.csproj">
+            <Private>false</Private>
+        </ProjectReference>
+    </ItemGroup>
+
+    <Target Name="CopyAdapterToHost"
+            AfterTargets="Build"
+            Condition="'$(Configuration)'=='Debug'">
+        <MakeDir Directories="$(HostAdapterDir)" />
+
+        <ItemGroup>
+            <AdapterDebugOutput Include="$(TargetDir)**\*"
+                                Exclude="$(TargetDir)ShiroBot.SDK.dll;$(TargetDir)ShiroBot.SDK.pdb;$(TargetDir)ShiroBot.Qq.Model.dll;$(TargetDir)ShiroBot.Qq.Model.pdb" />
+        </ItemGroup>
+
+        <Copy SourceFiles="@(AdapterDebugOutput)"
+              DestinationFiles="@(AdapterDebugOutput->'$(HostAdapterDir)%(RecursiveDir)%(Filename)%(Extension)')"
+              SkipUnchangedFiles="true" />
+    </Target>
+
+</Project>
