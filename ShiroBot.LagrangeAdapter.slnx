@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ShiroBot.LagrangeAdapter.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ContractChecks/ContractChecks.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="scripts/version-check/VersionCheck.csproj" />
+    <File Path="scripts/dev.sh" />
+    <File Path="scripts/dev.ps1" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="README.md" />
+    <File Path="CAPABILITIES.md" />
+  </Folder>
+</Solution>

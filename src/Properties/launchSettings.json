@@ -1,0 +1,13 @@
+{
+  "profiles": {
+    "ShiroBot": {
+      "commandName": "Executable",
+      "executablePath": "$(MSBuildProjectDirectory)/../.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)/$(ShiroBotDevExecutable)",
+      "commandLineArgs": "",
+      "workingDirectory": "$(MSBuildProjectDirectory)/../.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)",
+      "environmentVariables": {
+        "DOTNET_ROOT": "$(NetCoreRoot)"
+      }
+    }
+  }
+}

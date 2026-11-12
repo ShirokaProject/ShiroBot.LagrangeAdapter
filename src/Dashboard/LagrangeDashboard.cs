@@ -15,9 +15,8 @@ public partial class LagrangeAdapter
     {
         var root = exception.GetBaseException();
         var text = $"{root.GetType().Name}: {root.Message}";
-        foreach (var secret in new[] { config.Password, config.SignToken }.Where(x => !string.IsNullOrEmpty(x)))
-            text = text.Replace(secret!, "[已隐藏]", StringComparison.Ordinal);
-        return text;
+        return new[] { config.Password, config.SignToken }.Where(x => !string.IsNullOrEmpty(x))
+            .Aggregate(text, (current, secret) => current.Replace(secret!, "[已隐藏]", StringComparison.Ordinal));
     }
 
     private void RegisterDashboard(IPluginDashboard dashboard) => dashboard.AddWebPage("login", "QQ 登录",
@@ -43,13 +42,17 @@ public partial class LagrangeAdapter
 
     private async Task<JsonNode?> HandleLoginPageAsync(string action, JsonNode? arguments, CancellationToken token)
     {
-        if (action == "status") return LoginPageState();
-        if (action is "qr-login" or "quick-login")
+        switch (action)
         {
-            var result = await ExecuteActionAsync(action, token);
-            if (!result.Ok) _loginError = result.Message;
-            return LoginPageState();
+            case "status":
+                return LoginPageState();
+            case "qr-login":
+            case "quick-login":
+                var result = await ExecuteActionAsync(action, token);
+                if (!result.Ok) _loginError = result.Message;
+                return LoginPageState();
         }
+
         await _lifecycle.WaitAsync(token);
         try
         {
@@ -67,36 +70,61 @@ public partial class LagrangeAdapter
                 InitializeConnection(config, true);
                 _loginStatus = "logging_in";
                 var stopping = _loginCancellation!.Token;
+                _loginTask = Lifetime.Run(Run);
+                return LoginPageState();
+
                 async Task Run(CancellationToken unused)
                 {
-                    try { await LoginAsync(config, false, stopping); }
-                    catch (OperationCanceledException) { }
-                    catch (Exception ex) { _loginStatus = "failed"; _loginError = DescribeLoginFailure(ex, config); Logger.Error($"账号密码登录失败: {_loginError}"); }
-                    finally { config.Password = ""; }
+                    try
+                    {
+                        await LoginAsync(config, false, stopping);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        _loginStatus = "failed";
+                        _loginError = DescribeLoginFailure(ex, config);
+                        Logger.Error($"账号密码登录失败: {_loginError}");
+                    }
+                    finally
+                    {
+                        config.Password = "";
+                    }
                 }
-                _loginTask = Lifetime is null ? Run(CancellationToken.None) : Lifetime.Run(Run);
-                return LoginPageState();
             }
-            if (action == "captcha")
+
+            switch (action)
             {
-                var ticket = arguments?["ticket"]?.GetValue<string>() ?? "";
-                var randstr = arguments?["randstr"]?.GetValue<string>() ?? "";
-                if (ticket.Length is 0 or > 8192 || randstr.Length is 0 or > 1024 || _loginStatus != "captcha")
-                    throw new ArgumentException("当前无滑块验证请求，或验证结果无效。");
-                if (!_services.Context.SubmitCaptcha(ticket, randstr)) throw new InvalidOperationException("滑块验证提交失败。");
+                case "captcha":
+                {
+                    var ticket = arguments?["ticket"]?.GetValue<string>() ?? "";
+                    var randstr = arguments?["randstr"]?.GetValue<string>() ?? "";
+                    if (ticket.Length is 0 or > 8192 || randstr.Length is 0 or > 1024 || _loginStatus != "captcha")
+                        throw new ArgumentException("当前无滑块验证请求，或验证结果无效。");
+                    if (!_services.Context.SubmitCaptcha(ticket, randstr))
+                        throw new InvalidOperationException("滑块验证提交失败。");
+                    break;
+                }
+                case "sms":
+                {
+                    var code = arguments?["code"]?.GetValue<string>() ?? "";
+                    if (code.Length is 0 or > 16 || code.Any(c => !char.IsAsciiDigit(c)) || _loginStatus != "sms")
+                        throw new ArgumentException("当前无短信验证请求，或验证码无效。");
+                    if (!_services.Context.SubmitSMSCode(code)) throw new InvalidOperationException("短信验证码提交失败。");
+                    break;
+                }
+                default: throw new ArgumentException("未知的登录操作。");
             }
-            else if (action == "sms")
-            {
-                var code = arguments?["code"]?.GetValue<string>() ?? "";
-                if (code.Length is 0 or > 16 || code.Any(c => !char.IsAsciiDigit(c)) || _loginStatus != "sms")
-                    throw new ArgumentException("当前无短信验证请求，或验证码无效。");
-                if (!_services.Context.SubmitSMSCode(code)) throw new InvalidOperationException("短信验证码提交失败。");
-            }
-            else throw new ArgumentException("未知的登录操作。");
+
             _loginStatus = "logging_in";
             _verificationUrl = null;
             return LoginPageState();
         }
-        finally { _lifecycle.Release(); }
+        finally
+        {
+            _lifecycle.Release();
+        }
     }
 }

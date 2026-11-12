@@ -11,6 +11,8 @@
     <PackageProjectUrl>https://github.com/ShirokaProject/ShiroBot.LagrangeAdapter</PackageProjectUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>shirobot;adapter;qq;lagrange;lagrange-v2</PackageTags>
+    <ShiroBotDevExecutable Condition="'$(OS)' == 'Windows_NT'">ShiroBot.exe</ShiroBotDevExecutable>
+    <ShiroBotDevExecutable Condition="'$(OS)' != 'Windows_NT'">ShiroBot</ShiroBotDevExecutable>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
@@ -20,10 +22,7 @@
   <ItemGroup>
     <PackageReference Include="ShiroBot.SDK" Version="1.0.2" />
     <PackageReference Include="Net.Codecrete.QrCodeGenerator" Version="3.0.0" />
-    <ProjectReference Include="external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
-    <EmbeddedResource Include="dashboard/index.html" LogicalName="dashboard/index.html" />
-    <Compile Remove="external/**/*.cs;tests/**/*.cs" />
-    <EmbeddedResource Remove="external/**/*;tests/**/*" />
-    <None Remove="external/**/*;tests/**/*" />
+    <ProjectReference Include="../external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
+    <EmbeddedResource Include="Dashboard/index.html" LogicalName="dashboard/index.html" />
   </ItemGroup>
 </Project>

@@ -27,17 +27,17 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/.*<Version>\([^<]*\)<.*/\1/p' ShiroBot.LagrangeAdapter.csproj | head -1)
+          version=$(sed -n 's/.*<Version>\([^<]*\)<.*/\1/p' src/ShiroBot.LagrangeAdapter.csproj | head -1)
           test "$RELEASE_TAG" = "v$version"
-          grep -q "Version = \"$version\"" LagrangeAdapter.cs
+          grep -q "Version = \"$version\"" src/LagrangeAdapter.cs
       - name: Run contract and regression checks
-        run: dotnet run --project tests/ContractChecks --configuration Debug
+        run: dotnet run --project tests/ContractChecks --configuration Debug -p:ShiroBotPrepareDevelopmentHost=false
       - name: Build .NET 11 async2 release
-        run: dotnet build ShiroBot.LagrangeAdapter.csproj --configuration Release -p:ContinuousIntegrationBuild=true
+        run: dotnet build src/ShiroBot.LagrangeAdapter.csproj --configuration Release -p:ContinuousIntegrationBuild=true
       - name: Prepare release files
         run: |
           mkdir -p artifacts
-          cp bin/Release/net11.0/ShiroBot.LagrangeAdapter.dll artifacts/
+          cp src/bin/Release/net11.0/ShiroBot.LagrangeAdapter.dll artifacts/
           cp LICENSE artifacts/
           cp examples/config.toml artifacts/config.example.toml
           cp examples/appinfo.example.json artifacts/

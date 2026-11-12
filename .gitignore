@@ -4,3 +4,5 @@ obj/
 *.DotSettings.user
 lagrange-keystore.json
 qrcode.png
+.shirobot-dev/
+artifacts/

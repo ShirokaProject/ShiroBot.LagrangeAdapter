@@ -13,7 +13,8 @@ internal static class LagrangeConnectionOptions
         if (!BotAppInfo.ProtocolToAppInfo.TryGetValue(protocol, out var defaults))
             throw new ArgumentException($"不支持的协议: {protocol}");
         var node = JsonSerializer.SerializeToNode(defaults)!.AsObject();
-        if (overrides is not null)
+        if (overrides is null)
+            return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
         {
             var modern = new JsonObject();
             foreach (var (key, value) in overrides)
@@ -25,8 +26,10 @@ internal static class LagrangeConnectionOptions
                 };
                 if (sdkKey is not null)
                     Merge(node["SdkInfo"]!.AsObject(), new JsonObject { [sdkKey] = value?.DeepClone() });
-                else if (!key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase)) modern[key] = value?.DeepClone();
+                else if (!key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase))
+                    modern[key] = value?.DeepClone();
             }
+
             Merge(node, modern);
         }
         return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
@@ -34,7 +37,7 @@ internal static class LagrangeConnectionOptions
 
     internal static void ValidatePlatform(Protocols protocol, BotAppInfo info)
     {
-        var os = info.Os?.ToLowerInvariant();
+        var os = info.Os.ToLowerInvariant();
         var mismatch = protocol switch
         {
             Protocols.Linux => os != "linux",
@@ -42,12 +45,14 @@ internal static class LagrangeConnectionOptions
             Protocols.Windows => os is not ("windows" or "win"),
             _ => false
         };
-        if (mismatch) throw new ArgumentException($"客户端平台 {protocol} 与 AppInfo.Os={info.Os} 不一致，请使用同一平台的 AppInfo 和签名服务。");
+        if (mismatch)
+            throw new ArgumentException($"客户端平台 {protocol} 与 AppInfo.Os={info.Os} 不一致，请使用同一平台的 AppInfo 和签名服务。");
     }
 
     internal static string ResolveDeviceName(string? previous)
     {
-        if (previous is not null && System.Text.RegularExpressions.Regex.IsMatch(previous, @"^Shiro-[0-9]{4,8}$"))
+        if (previous is not null && System.Text.RegularExpressions.Regex.IsMatch(previous, "^Shiro-[0-9]{4,8}$",
+                System.Text.RegularExpressions.RegexOptions.NonBacktracking))
             return previous;
         var digits = System.Security.Cryptography.RandomNumberGenerator.GetInt32(4, 9);
         var minimum = (int)Math.Pow(10, digits - 1);
@@ -56,14 +61,15 @@ internal static class LagrangeConnectionOptions
     }
 
     internal static bool HasSession(BotKeystore keystore) =>
-        keystore.Uin > 0 && keystore.WLoginSigs is { A2.Length: > 0, D2.Length: > 0 };
+        keystore is { Uin: > 0, WLoginSigs: { A2.Length: > 0, D2.Length: > 0 } };
 
     private static void Merge(JsonObject target, JsonObject source)
     {
         foreach (var (key, value) in source)
         {
-            var actual = target.Select(x => x.Key).FirstOrDefault(x => x.Equals(key, StringComparison.OrdinalIgnoreCase))
-                ?? throw new InvalidDataException($"未知 AppInfo 字段: {key}");
+            var actual = target.Select(x => x.Key)
+                             .FirstOrDefault(x => x.Equals(key, StringComparison.OrdinalIgnoreCase))
+                         ?? throw new InvalidDataException($"未知 AppInfo 字段: {key}");
             if (value is null) throw new InvalidDataException($"AppInfo.{key} 不能为空。");
             if (target[actual] is JsonObject child && value is JsonObject patch) Merge(child, patch);
             else target[actual] = value.DeepClone();

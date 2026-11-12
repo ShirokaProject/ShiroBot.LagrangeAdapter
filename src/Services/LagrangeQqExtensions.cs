@@ -15,10 +15,12 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         var peer = LagrangeMapper.ParseId(userId, nameof(userId));
-        return session.Context.SendFriendNudge(peer, isSelf ? session.Context.BotUin : peer).WaitAsync(cancellationToken);
+        return session.Context.SendFriendNudge(peer, isSelf ? session.Context.BotUin : peer)
+            .WaitAsync(cancellationToken);
     }
 
-    public async Task<IReadOnlyList<QFriendRequest>> GetFriendRequestsAsync(int limit = 20, bool isFiltered = false, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<QFriendRequest>> GetFriendRequestsAsync(int limit = 20, bool isFiltered = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
@@ -44,6 +46,7 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
                 }
             });
         }
+
         return result;
     }
 
@@ -64,41 +67,54 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
 
 internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
 {
-    public Task<IReadOnlyList<QGroup>> GetGroupListAsync(bool noCache = false, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<QGroup>> GetGroupListAsync(bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (new LagrangeQqSystemApi(session).GetGroupListAsync(noCache, cancellationToken)).WaitAsync(cancellationToken);
+        return new LagrangeQqSystemApi(session).GetGroupListAsync(noCache, cancellationToken)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task<QGroup> GetGroupInfoAsync(string groupId, bool noCache = false, CancellationToken cancellationToken = default)
+    public Task<QGroup> GetGroupInfoAsync(string groupId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (new LagrangeQqSystemApi(session).GetGroupInfoAsync(groupId, noCache, cancellationToken)).WaitAsync(cancellationToken);
+        return new LagrangeQqSystemApi(session).GetGroupInfoAsync(groupId, noCache, cancellationToken)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task<IReadOnlyList<QGroupMember>> GetGroupMemberListAsync(string groupId, bool noCache = false, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<QGroupMember>> GetGroupMemberListAsync(string groupId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (new LagrangeQqSystemApi(session).GetGroupMemberListAsync(groupId, noCache, cancellationToken)).WaitAsync(cancellationToken);
+        return new LagrangeQqSystemApi(session).GetGroupMemberListAsync(groupId, noCache, cancellationToken)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task<QGroupMember> GetGroupMemberInfoAsync(string groupId, string userId, bool noCache = false, CancellationToken cancellationToken = default)
+    public Task<QGroupMember> GetGroupMemberInfoAsync(string groupId, string userId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (new LagrangeQqSystemApi(session).GetGroupMemberInfoAsync(groupId, userId, noCache, cancellationToken)).WaitAsync(cancellationToken);
+        return new LagrangeQqSystemApi(session).GetGroupMemberInfoAsync(groupId, userId, noCache, cancellationToken)
+            .WaitAsync(cancellationToken);
     }
 
-    public async Task<QGroupJoinRequestPage> GetJoinRequestsAsync(string groupId, string? cursor = null, int limit = 20, CancellationToken cancellationToken = default)
+    public async Task<QGroupJoinRequestPage> GetJoinRequestsAsync(string groupId, string? cursor = null, int limit = 20,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
-        var notifications = await session.Context.FetchGroupNotifications((ulong)limit, cursor is null ? 0 : ulong.Parse(cursor)).WaitAsync(cancellationToken);
+        var notifications = await session.Context
+            .FetchGroupNotifications((ulong)limit, cursor is null ? 0 : ulong.Parse(cursor))
+            .WaitAsync(cancellationToken);
         var requests = notifications.Where(x => x.GroupUin == LagrangeMapper.ParseId(groupId, nameof(groupId)))
             .Select(LagrangeMapper.ToJoinRequest).OfType<QGroupJoinRequest>().ToArray();
-        return new QGroupJoinRequestPage(requests, notifications.Count == 0 ? null : notifications[^1].Sequence.ToString());
+        return new QGroupJoinRequestPage(requests,
+            notifications.Count == 0 ? null : notifications[^1].Sequence.ToString());
     }
 
-    public async Task<QBatchOperationResult> SetMemberMutesAsync(string groupId, IReadOnlyList<QMemberMute> members, CancellationToken cancellationToken = default)
+    public async Task<QBatchOperationResult> SetMemberMutesAsync(string groupId, IReadOnlyList<QMemberMute> members,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var results = new List<QOperationResult>();
@@ -115,82 +131,104 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                results.Add(new QOperationResult { UserId = member.UserId, Status = started ? QOperationStatus.Unknown : QOperationStatus.NotExecuted });
-                results.AddRange(members.Skip(index + 1).Select(x => new QOperationResult { UserId = x.UserId, Status = QOperationStatus.NotExecuted }));
-                throw new QBatchOperationCanceledException(new QBatchOperationResult { Items = results }, cancellationToken);
+                results.Add(new QOperationResult
+                {
+                    UserId = member.UserId, Status = started ? QOperationStatus.Unknown : QOperationStatus.NotExecuted
+                });
+                results.AddRange(members.Skip(index + 1).Select(x => new QOperationResult
+                    { UserId = x.UserId, Status = QOperationStatus.NotExecuted }));
+                throw new QBatchOperationCanceledException(new QBatchOperationResult { Items = results },
+                    cancellationToken);
             }
             catch (Exception ex)
             {
-                results.Add(new QOperationResult { UserId = member.UserId, Status = QOperationStatus.Failed, ErrorMessage = ex.Message });
+                results.Add(new QOperationResult
+                    { UserId = member.UserId, Status = QOperationStatus.Failed, ErrorMessage = ex.Message });
             }
         }
+
         return new QBatchOperationResult { Items = results };
     }
 
     public Task SetGroupNameAsync(string groupId, string name, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupRename(LagrangeMapper.ParseId(groupId, "groupId"), name)).WaitAsync(cancellationToken);
+        return session.Context.GroupRename(LagrangeMapper.ParseId(groupId, "groupId"), name)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task SetMemberCardAsync(string groupId, string userId, string card, CancellationToken cancellationToken = default)
+    public Task SetMemberCardAsync(string groupId, string userId, string card,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupMemberRename(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"), card)).WaitAsync(cancellationToken);
+        return session.Context
+            .GroupMemberRename(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"),
+                card).WaitAsync(cancellationToken);
     }
 
-    public Task SetMemberSpecialTitleAsync(string groupId, string userId, string title, CancellationToken cancellationToken = default)
+    public Task SetMemberSpecialTitleAsync(string groupId, string userId, string title,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupSetSpecialTitle(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"), title)).WaitAsync(cancellationToken);
+        return session.Context
+            .GroupSetSpecialTitle(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"),
+                title).WaitAsync(cancellationToken);
     }
 
     public Task QuitGroupAsync(string groupId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupQuit(LagrangeMapper.ParseId(groupId, "groupId"))).WaitAsync(cancellationToken);
+        return session.Context.GroupQuit(LagrangeMapper.ParseId(groupId, "groupId")).WaitAsync(cancellationToken);
     }
 
     public Task SendNudgeAsync(string groupId, string userId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.SendGroupNudge(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"))).WaitAsync(cancellationToken);
+        return session.Context
+            .SendGroupNudge(LagrangeMapper.ParseId(groupId, "groupId"), LagrangeMapper.ParseId(userId, "userId"))
+            .WaitAsync(cancellationToken);
     }
 
-    public Task SendMessageReactionAsync(string groupId, string messageId, string faceId, bool isAdd = true, CancellationToken cancellationToken = default)
+    public Task SendMessageReactionAsync(string groupId, string messageId, string faceId, bool isAdd = true,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.SetGroupReaction(LagrangeMapper.ParseId(groupId, "groupId"), ulong.Parse(messageId), faceId, isAdd)).WaitAsync(cancellationToken);
+        return session.Context
+            .SetGroupReaction(LagrangeMapper.ParseId(groupId, "groupId"), ulong.Parse(messageId), faceId, isAdd)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task SendMessageReactionAsync(string groupId, string messageId, string reactionId, QReactionType reactionType, bool isAdd = true, CancellationToken cancellationToken = default)
+    public Task SendMessageReactionAsync(string groupId, string messageId, string reactionId,
+        QReactionType reactionType, bool isAdd = true, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (SendMessageReactionAsync(groupId, messageId, reactionId, isAdd)).WaitAsync(cancellationToken);
+        return SendMessageReactionAsync(groupId, messageId, reactionId, isAdd, cancellationToken)
+            .WaitAsync(cancellationToken);
     }
 
     public Task AcceptJoinRequestAsync(QGroupJoinRequest request, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.SetGroupNotification(
+        return session.Context.SetGroupNotification(
             LagrangeMapper.ParseId(request.GroupId, "GroupId"),
             ulong.Parse(request.RequestId),
             request.IsInvited ? BotGroupNotificationType.Invite : BotGroupNotificationType.Join,
             request.IsFiltered,
-            GroupNotificationOperate.Allow)).WaitAsync(cancellationToken);
+            GroupNotificationOperate.Allow).WaitAsync(cancellationToken);
     }
 
-    public Task RejectJoinRequestAsync(QGroupJoinRequest request, string? reason = null, bool addToBlacklist = false, CancellationToken cancellationToken = default)
+    public Task RejectJoinRequestAsync(QGroupJoinRequest request, string? reason = null, bool addToBlacklist = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (addToBlacklist) throw LagrangeMapper.Unsupported("拒绝申请并拉黑，上游没有拉黑参数");
-        return (session.Context.SetGroupNotification(
+        return session.Context.SetGroupNotification(
             LagrangeMapper.ParseId(request.GroupId, "GroupId"),
             ulong.Parse(request.RequestId),
             request.IsInvited ? BotGroupNotificationType.Invite : BotGroupNotificationType.Join,
             request.IsFiltered,
             GroupNotificationOperate.Deny,
-            reason ?? string.Empty)).WaitAsync(cancellationToken);
+            reason ?? string.Empty).WaitAsync(cancellationToken);
     }
 
     public async Task<(IReadOnlyList<QGroupNotification> Notifications, string? NextCursor)> GetNotificationsAsync(
@@ -198,8 +236,11 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         var notifications = isFiltered
-            ? await session.Context.FetchFilteredGroupNotifications((ulong)limit, (cursor is null ? 0 : ulong.Parse(cursor))).ConfigureAwait(false)
-            : await session.Context.FetchGroupNotifications((ulong)limit, (cursor is null ? 0 : ulong.Parse(cursor))).ConfigureAwait(false);
+            ? await session.Context
+                .FetchFilteredGroupNotifications((ulong)limit, cursor is null ? 0 : ulong.Parse(cursor))
+                .ConfigureAwait(false)
+            : await session.Context.FetchGroupNotifications((ulong)limit, cursor is null ? 0 : ulong.Parse(cursor))
+                .ConfigureAwait(false);
 
         var converted = notifications
             .Select(ToQqNotification)
@@ -215,51 +256,51 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
     {
         BotGroupJoinNotification join => new QJoinRequestNotification
         {
-            GroupId = (join.GroupUin).ToString(),
+            GroupId = join.GroupUin.ToString(),
             NotificationId = ((long)join.Sequence).ToString(),
-            InitiatorId = (join.TargetUin).ToString(),
+            InitiatorId = join.TargetUin.ToString(),
             State = ToQqState(join.State),
             Comment = join.Comment,
             IsFiltered = join.IsFiltered,
-            OperatorId = (join.OperatorUin).ToString()
+            OperatorId = join.OperatorUin.ToString()
         },
         BotGroupInviteNotification invite => new QInvitedJoinRequestNotification
         {
-            GroupId = (invite.GroupUin).ToString(),
+            GroupId = invite.GroupUin.ToString(),
             NotificationId = ((long)invite.Sequence).ToString(),
-            InitiatorId = (invite.InviterUin).ToString(),
-            TargetUserId = (invite.TargetUin).ToString(),
+            InitiatorId = invite.InviterUin.ToString(),
+            TargetUserId = invite.TargetUin.ToString(),
             State = ToQqState(invite.State),
-            OperatorId = (invite.OperatorUin).ToString()
+            OperatorId = invite.OperatorUin.ToString()
         },
         BotGroupSetAdminNotification admin => new QAdminChangeNotification
         {
-            GroupId = (admin.GroupUin).ToString(),
+            GroupId = admin.GroupUin.ToString(),
             NotificationId = ((long)admin.Sequence).ToString(),
-            TargetUserId = (admin.TargetUin).ToString(),
+            TargetUserId = admin.TargetUin.ToString(),
             IsSet = true,
-            OperatorId = (admin.OperatorUin).ToString()
+            OperatorId = admin.OperatorUin.ToString()
         },
         BotGroupUnsetAdminNotification unset => new QAdminChangeNotification
         {
-            GroupId = (unset.GroupUin).ToString(),
+            GroupId = unset.GroupUin.ToString(),
             NotificationId = ((long)unset.Sequence).ToString(),
-            TargetUserId = (unset.TargetUin).ToString(),
+            TargetUserId = unset.TargetUin.ToString(),
             IsSet = false,
-            OperatorId = (unset.OperatorUin).ToString()
+            OperatorId = unset.OperatorUin.ToString()
         },
         BotGroupKickNotification kick => new QKickNotification
         {
-            GroupId = (kick.GroupUin).ToString(),
+            GroupId = kick.GroupUin.ToString(),
             NotificationId = ((long)kick.Sequence).ToString(),
-            TargetUserId = (kick.TargetUin).ToString(),
-            OperatorId = (kick.OperatorUin).ToString()
+            TargetUserId = kick.TargetUin.ToString(),
+            OperatorId = kick.OperatorUin.ToString()
         },
         BotGroupExitNotification exit => new QQuitNotification
         {
-            GroupId = (exit.GroupUin).ToString(),
+            GroupId = exit.GroupUin.ToString(),
             NotificationId = ((long)exit.Sequence).ToString(),
-            TargetUserId = (exit.TargetUin).ToString()
+            TargetUserId = exit.TargetUin.ToString()
         },
         _ => null
     };
@@ -278,13 +319,15 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
         throw LagrangeMapper.Unsupported("设置群头像(Lagrange.Core 未提供 API)");
     }
 
-    public Task SetMemberAdminAsync(string groupId, string userId, bool isSet = true, CancellationToken cancellationToken = default)
+    public Task SetMemberAdminAsync(string groupId, string userId, bool isSet = true,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("设置群管理员(Lagrange.Core 未提供 API)");
     }
 
-    public Task MuteMemberAsync(string groupId, string userId, TimeSpan duration, CancellationToken cancellationToken = default)
+    public Task MuteMemberAsync(string groupId, string userId, TimeSpan duration,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return LagrangeOperations.RequireSuccessAsync(session.Context.MuteGroupMember(
@@ -299,7 +342,8 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
             LagrangeMapper.ParseId(groupId, nameof(groupId)), isMute), "全员禁言", cancellationToken);
     }
 
-    public Task KickMemberAsync(string groupId, string userId, bool rejectAddRequest = false, CancellationToken cancellationToken = default)
+    public Task KickMemberAsync(string groupId, string userId, bool rejectAddRequest = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return LagrangeOperations.RequireSuccessAsync(session.Context.KickGroupMember(
@@ -307,46 +351,54 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
             rejectAddRequest), "踢出群成员", cancellationToken);
     }
 
-    public Task<IReadOnlyList<QGroupAnnouncement>> GetAnnouncementsAsync(string groupId, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<QGroupAnnouncement>> GetAnnouncementsAsync(string groupId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
     }
 
-    public Task SendAnnouncementAsync(string groupId, string content, string? imageUri = null, CancellationToken cancellationToken = default)
+    public Task SendAnnouncementAsync(string groupId, string content, string? imageUri = null,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
     }
 
-    public Task DeleteAnnouncementAsync(string groupId, string announcementId, CancellationToken cancellationToken = default)
+    public Task DeleteAnnouncementAsync(string groupId, string announcementId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
     }
 
-    public Task<IReadOnlyList<QEssenceMessage>> GetEssenceMessagesAsync(string groupId, int pageIndex, int pageSize, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<QEssenceMessage>> GetEssenceMessagesAsync(string groupId, int pageIndex, int pageSize,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("精华消息(Lagrange.Core 未提供 API)");
     }
 
-    public async Task SetEssenceMessageAsync(string groupId, string messageId, bool isSet = true, CancellationToken cancellationToken = default)
+    public async Task SetEssenceMessageAsync(string groupId, string messageId, bool isSet = true,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var message = await session.ResolveMessageAsync(messageId, LagrangeMapper.ParseId(groupId, nameof(groupId)), true, cancellationToken)
-            ?? throw new InvalidOperationException("找不到精华消息。");
+        var message = await session.ResolveMessageAsync(messageId, LagrangeMapper.ParseId(groupId, nameof(groupId)),
+                          true, cancellationToken)
+                      ?? throw new InvalidOperationException("找不到精华消息。");
         await (isSet ? session.Context.SetEssenceMessage(message) : session.Context.RemoveEssenceMessage(message))
             .WaitAsync(cancellationToken);
     }
 
-    public Task AcceptInvitationAsync(string groupId, string invitationSeq, CancellationToken cancellationToken = default)
+    public Task AcceptInvitationAsync(string groupId, string invitationSeq,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("处理他人邀请自身入群(Lagrange.Core 未提供 API)");
     }
 
-    public Task RejectInvitationAsync(string groupId, string invitationSeq, CancellationToken cancellationToken = default)
+    public Task RejectInvitationAsync(string groupId, string invitationSeq,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("处理他人邀请自身入群(Lagrange.Core 未提供 API)");
@@ -355,62 +407,78 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
 
 internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
 {
-    public async Task<string> UploadPrivateFileAsync(string userId, string fileUri, string fileName, CancellationToken cancellationToken = default)
+    public async Task<string> UploadPrivateFileAsync(string userId, string fileUri, string fileName,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri).ConfigureAwait(false);
-        await session.Context.SendFriendFile(LagrangeMapper.ParseId(userId, "userId"), stream, fileName).ConfigureAwait(false);
+        await session.Context.SendFriendFile(LagrangeMapper.ParseId(userId, "userId"), stream, fileName)
+            .ConfigureAwait(false);
         return string.Empty; // 好友文件无 fileId
     }
 
-    public async Task<string> UploadGroupFileAsync(string groupId, string fileUri, string fileName, string parentFolderId = "/", CancellationToken cancellationToken = default)
+    public async Task<string> UploadGroupFileAsync(string groupId, string fileUri, string fileName,
+        string parentFolderId = "/", CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri).ConfigureAwait(false);
-        return await session.Context.SendGroupFile(LagrangeMapper.ParseId(groupId, "groupId"), stream, fileName, parentFolderId).ConfigureAwait(false);
+        return await session.Context
+            .SendGroupFile(LagrangeMapper.ParseId(groupId, "groupId"), stream, fileName, parentFolderId)
+            .ConfigureAwait(false);
     }
 
-    public Task<string> GetGroupFileDownloadUrlAsync(string groupId, string fileId, CancellationToken cancellationToken = default)
+    public Task<string> GetGroupFileDownloadUrlAsync(string groupId, string fileId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupFSDownload(LagrangeMapper.ParseId(groupId, "groupId"), fileId)).WaitAsync(cancellationToken);
+        return session.Context.GroupFSDownload(LagrangeMapper.ParseId(groupId, "groupId"), fileId)
+            .WaitAsync(cancellationToken);
     }
 
-    public Task MoveGroupFileAsync(string groupId, string fileId, string targetFolderId, string parentFolderId = "/", CancellationToken cancellationToken = default)
+    public Task MoveGroupFileAsync(string groupId, string fileId, string targetFolderId, string parentFolderId = "/",
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupFSMove(LagrangeMapper.ParseId(groupId, "groupId"), fileId, targetFolderId, parentFolderId)).WaitAsync(cancellationToken);
+        return session.Context
+            .GroupFSMove(LagrangeMapper.ParseId(groupId, "groupId"), fileId, targetFolderId, parentFolderId)
+            .WaitAsync(cancellationToken);
     }
 
     public Task DeleteGroupFileAsync(string groupId, string fileId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GroupFSDelete(LagrangeMapper.ParseId(groupId, "groupId"), fileId)).WaitAsync(cancellationToken);
+        return session.Context.GroupFSDelete(LagrangeMapper.ParseId(groupId, "groupId"), fileId)
+            .WaitAsync(cancellationToken);
     }
 
     // 不支持项:
-    public Task<string> GetPrivateFileDownloadUrlAsync(string userId, string fileId, string fileHash, CancellationToken cancellationToken = default)
+    public Task<string> GetPrivateFileDownloadUrlAsync(string userId, string fileId, string fileHash,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("私聊文件下载链接(Lagrange.Core 未提供 API)");
     }
 
-    public async Task<(IReadOnlyList<QGroupFile> Files, IReadOnlyList<QGroupFolder> Folders)> GetGroupFilesAsync(string groupId, string parentFolderId = "/", CancellationToken cancellationToken = default)
+    public async Task<(IReadOnlyList<QGroupFile> Files, IReadOnlyList<QGroupFolder> Folders)> GetGroupFilesAsync(
+        string groupId, string parentFolderId = "/", CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var entries = await session.Context.FetchGroupFSList(LagrangeMapper.ParseId(groupId, nameof(groupId)), parentFolderId)
+        var entries = await session.Context
+            .FetchGroupFSList(LagrangeMapper.ParseId(groupId, nameof(groupId)), parentFolderId)
             .WaitAsync(cancellationToken);
-        return (entries.OfType<BotFileEntry>().Select(x => LagrangeMapper.ToQq(x, groupId)).ToArray(),
-            entries.OfType<BotFolderEntry>().Select(x => LagrangeMapper.ToQq(x, groupId)).ToArray());
+        return ([.. entries.OfType<BotFileEntry>().Select(x => LagrangeMapper.ToQq(x, groupId))],
+            [.. entries.OfType<BotFolderEntry>().Select(x => LagrangeMapper.ToQq(x, groupId))]);
     }
 
-    public Task RenameGroupFileAsync(string groupId, string fileId, string newFileName, string parentFolderId = "/", CancellationToken cancellationToken = default)
+    public Task RenameGroupFileAsync(string groupId, string fileId, string newFileName, string parentFolderId = "/",
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("重命名群文件(Lagrange.Core 未提供 API)");
     }
 
-    public async Task<string> CreateGroupFolderAsync(string groupId, string folderName, CancellationToken cancellationToken = default)
+    public async Task<string> CreateGroupFolderAsync(string groupId, string folderName,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var peer = LagrangeMapper.ParseId(groupId, nameof(groupId));
@@ -419,14 +487,17 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
         await session.Context.GroupFSCreateFolder(peer, folderName).WaitAsync(cancellationToken);
         var created = (await session.Context.FetchGroupFSList(peer).WaitAsync(cancellationToken))
             .OfType<BotFolderEntry>().Where(x => x.FolderName == folderName && !before.Contains(x.FolderId)).ToArray();
-        return created.Length == 1 ? created[0].FolderId
+        return created.Length == 1
+            ? created[0].FolderId
             : throw new InvalidOperationException("创建操作已完成，但无法唯一确定新文件夹 ID，请刷新群文件列表。");
     }
 
-    public Task RenameGroupFolderAsync(string groupId, string folderId, string newFolderName, CancellationToken cancellationToken = default)
+    public Task RenameGroupFolderAsync(string groupId, string folderId, string newFolderName,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return session.Context.GroupFSRenameFolder(LagrangeMapper.ParseId(groupId, nameof(groupId)), folderId, newFolderName)
+        return session.Context
+            .GroupFSRenameFolder(LagrangeMapper.ParseId(groupId, nameof(groupId)), folderId, newFolderName)
             .WaitAsync(cancellationToken);
     }
 
@@ -449,10 +520,11 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     public async Task<QUserProfile> GetUserProfileAsync(string userId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var stranger = await session.Context.FetchStranger(LagrangeMapper.ParseId(userId, "userId")).ConfigureAwait(false);
+        var stranger = await session.Context.FetchStranger(LagrangeMapper.ParseId(userId, "userId"))
+            .ConfigureAwait(false);
         return new QUserProfile
         {
-            UserId = (stranger.Uin).ToString(),
+            UserId = stranger.Uin.ToString(),
             Nickname = stranger.Nickname,
             Qid = string.IsNullOrEmpty(stranger.QID) ? null : stranger.QID,
             Age = (int)stranger.Age,
@@ -471,47 +543,54 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
         };
     }
 
-    public async Task<IReadOnlyList<QFriend>> GetFriendListAsync(bool noCache = false, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<QFriend>> GetFriendListAsync(bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var friends = await session.Context.FetchFriends(noCache).ConfigureAwait(false);
-        return friends.Select(LagrangeMapper.ToQq).ToArray();
+        return [.. friends.Select(LagrangeMapper.ToQq)];
     }
 
-    public async Task<QFriend> GetFriendInfoAsync(string userId, bool noCache = false, CancellationToken cancellationToken = default)
+    public async Task<QFriend> GetFriendInfoAsync(string userId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var friends = await GetFriendListAsync(noCache).ConfigureAwait(false);
+        var friends = await GetFriendListAsync(noCache, cancellationToken).ConfigureAwait(false);
         return friends.FirstOrDefault(friend => friend.UserId == userId)
                ?? throw new InvalidOperationException($"好友 {userId} 不存在。");
     }
 
-    internal async Task<IReadOnlyList<QGroup>> GetGroupListAsync(bool noCache = false, CancellationToken cancellationToken = default)
+    internal async Task<IReadOnlyList<QGroup>> GetGroupListAsync(bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var groups = await session.Context.FetchGroups(noCache).ConfigureAwait(false);
-        return groups.Select(LagrangeMapper.ToQq).ToArray();
+        return [.. groups.Select(LagrangeMapper.ToQq)];
     }
 
-    internal async Task<QGroup> GetGroupInfoAsync(string groupId, bool noCache = false, CancellationToken cancellationToken = default)
+    internal async Task<QGroup> GetGroupInfoAsync(string groupId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var groups = await GetGroupListAsync(noCache).ConfigureAwait(false);
+        var groups = await GetGroupListAsync(noCache, cancellationToken).ConfigureAwait(false);
         return groups.FirstOrDefault(group => group.GroupId == groupId)
                ?? throw new InvalidOperationException($"群 {groupId} 不存在。");
     }
 
-    internal async Task<IReadOnlyList<QGroupMember>> GetGroupMemberListAsync(string groupId, bool noCache = false, CancellationToken cancellationToken = default)
+    internal async Task<IReadOnlyList<QGroupMember>> GetGroupMemberListAsync(string groupId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var members = await session.Context.FetchMembers(LagrangeMapper.ParseId(groupId, "groupId"), noCache).ConfigureAwait(false);
-        return members.Select(LagrangeMapper.ToQq).ToArray();
+        var members = await session.Context.FetchMembers(LagrangeMapper.ParseId(groupId, "groupId"), noCache)
+            .ConfigureAwait(false);
+        return [.. members.Select(LagrangeMapper.ToQq)];
     }
 
-    internal async Task<QGroupMember> GetGroupMemberInfoAsync(string groupId, string userId, bool noCache = false, CancellationToken cancellationToken = default)
+    internal async Task<QGroupMember> GetGroupMemberInfoAsync(string groupId, string userId, bool noCache = false,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var members = await GetGroupMemberListAsync(groupId, noCache).ConfigureAwait(false);
+        var members = await GetGroupMemberListAsync(groupId, noCache, cancellationToken).ConfigureAwait(false);
         return members.FirstOrDefault(member => member.UserId == userId)
                ?? throw new InvalidOperationException($"群成员 {groupId}/{userId} 不存在。");
     }
@@ -526,7 +605,7 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     public async Task<string> GetCookiesAsync(string domain, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var cookies = await session.Context.FetchCookies([domain]).ConfigureAwait(false);
+        var cookies = await session.Context.FetchCookies(domain).ConfigureAwait(false);
         return cookies.GetValueOrDefault(domain, string.Empty);
     }
 
@@ -550,13 +629,15 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     }
 
     // 不支持项:
-    public Task SetPeerPinAsync(QMessageScene scene, string peerId, bool isPinned = true, CancellationToken cancellationToken = default)
+    public Task SetPeerPinAsync(QMessageScene scene, string peerId, bool isPinned = true,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var peer = LagrangeMapper.ParseId(peerId, nameof(peerId));
         if (scene == QMessageScene.Temp) throw LagrangeMapper.Unsupported("临时会话置顶");
-        return (scene == QMessageScene.Group ? session.Context.SetPinGroup(peer, isPinned)
-            : session.Context.SetPinFriend(peer, isPinned)).WaitAsync(cancellationToken);
+        return scene == QMessageScene.Group
+            ? session.Context.SetPinGroup(peer, isPinned)
+            : session.Context.SetPinFriend(peer, isPinned).WaitAsync(cancellationToken);
     }
 
     public Task SetNicknameAsync(string nickname, CancellationToken cancellationToken = default)
@@ -580,39 +661,53 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
 
 internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageApi
 {
-    public async Task<string> SendMessageAsync(QMessageScene scene, string peerId, IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default) =>
+    public async Task<string> SendMessageAsync(QMessageScene scene, string peerId,
+        IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default) =>
         (await SendMessageDetailedAsync(scene, peerId, segments, cancellationToken)).MessageId;
 
-    public async Task<QSentMessage> SendMessageDetailedAsync(QMessageScene scene, string peerId, IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default)
+    public async Task<QSentMessage> SendMessageDetailedAsync(QMessageScene scene, string peerId,
+        IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var chain = new Lagrange.Core.Message.MessageChain();
         foreach (var segment in segments)
         {
-            await LagrangeMapper.AppendQqSegmentAsync(chain, segment, id => session.ResolveMessageAsync(id, LagrangeMapper.ParseId(peerId, "peerId"), scene == QMessageScene.Group)).ConfigureAwait(false);
+            await LagrangeMapper.AppendQqSegmentAsync(chain, segment,
+                id => session.ResolveMessageAsync(id, LagrangeMapper.ParseId(peerId, "peerId"),
+                    scene == QMessageScene.Group, cancellationToken)).ConfigureAwait(false);
         }
 
         var sent = scene == QMessageScene.Group
-            ? await session.Context.SendGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain).ConfigureAwait(false)
-            : await session.Context.SendFriendMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain).ConfigureAwait(false);
+            ? await session.Context.SendGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
+                .ConfigureAwait(false)
+            : await session.Context.SendFriendMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
+                .ConfigureAwait(false);
 
         session.CacheMessage(sent);
         return new QSentMessage(sent.Sequence.ToString(), DateTimeOffset.FromUnixTimeSeconds(sent.Time));
     }
 
-    public async Task<QIncomingMessage?> GetMessageAsync(QMessageScene scene, string peerId, string messageId, CancellationToken cancellationToken = default)
+    public async Task<QIncomingMessage?> GetMessageAsync(QMessageScene scene, string peerId, string messageId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var messages = scene == QMessageScene.Group
-            ? await session.Context.GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId), ulong.Parse(messageId)).ConfigureAwait(false)
-            : await session.Context.GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId), ulong.Parse(messageId)).ConfigureAwait(false);
+            ? await session.Context
+                .GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId),
+                    ulong.Parse(messageId)).ConfigureAwait(false)
+            : await session.Context
+                .GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId), ulong.Parse(messageId))
+                .ConfigureAwait(false);
 
         var message = messages.FirstOrDefault();
-        return message is null ? null : LagrangeMapper.ToMessageEvent(message, session.Context.BotUin.ToString()).Raw as QIncomingMessage;
+        return message is null
+            ? null
+            : LagrangeMapper.ToMessageEvent(message, session.Context.BotUin.ToString()).Raw as QIncomingMessage;
     }
 
     public async Task<(IReadOnlyList<QIncomingMessage> Messages, string? NextCursor)> GetHistoryMessagesAsync(
-        QMessageScene scene, string peerId, string? cursor = null, int limit = 20, CancellationToken cancellationToken = default)
+        QMessageScene scene, string peerId, string? cursor = null, int limit = 20,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
@@ -622,17 +717,23 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
                 checked((uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds()), (uint)limit).WaitAsync(cancellationToken);
             foreach (var item in recent) session.CacheMessage(item);
             var first = recent.Count == 0 ? 0 : recent.Min(x => x.Sequence);
-            return (recent.Select(x => (QIncomingMessage)LagrangeMapper.ToMessageEvent(x, session.Context.BotUin.ToString()).Raw!).ToArray(),
+            return (
+                [
+                    .. recent.Select(x =>
+                        (QIncomingMessage)LagrangeMapper.ToMessageEvent(x, session.Context.BotUin.ToString()).Raw!)
+                ],
                 first > 1 ? (first - 1).ToString() : null);
         }
+
         ulong endSequence;
-        if (cursor is { } start)
+        if (cursor is not null)
         {
-            endSequence = ulong.Parse(start);
+            endSequence = ulong.Parse(cursor);
         }
         else if (scene == QMessageScene.Group)
         {
-            var extra = await session.Context.FetchGroupExtra(LagrangeMapper.ParseId(peerId, "peerId")).ConfigureAwait(false);
+            var extra = await session.Context.FetchGroupExtra(LagrangeMapper.ParseId(peerId, "peerId"))
+                .ConfigureAwait(false);
             endSequence = (ulong)extra.LatestMessageSequence;
         }
         else
@@ -642,8 +743,11 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
 
         var startSequence = endSequence > (ulong)limit ? endSequence - (ulong)limit + 1 : 1;
         var messages = scene == QMessageScene.Group
-            ? await session.Context.GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), startSequence, endSequence).ConfigureAwait(false)
-            : await session.Context.GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), startSequence, endSequence).ConfigureAwait(false);
+            ? await session.Context
+                .GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), startSequence, endSequence)
+                .ConfigureAwait(false)
+            : await session.Context.GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), startSequence, endSequence)
+                .ConfigureAwait(false);
 
         foreach (var item in messages) session.CacheMessage(item);
         var converted = messages
@@ -655,10 +759,12 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         return (converted, next);
     }
 
-    public async Task RecallMessageAsync(QMessageScene scene, string peerId, string messageId, CancellationToken cancellationToken = default)
+    public async Task RecallMessageAsync(QMessageScene scene, string peerId, string messageId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var message = await session.ResolveMessageAsync(messageId, LagrangeMapper.ParseId(peerId, "peerId"), scene == QMessageScene.Group, cancellationToken)
+        var message = await session.ResolveMessageAsync(messageId, LagrangeMapper.ParseId(peerId, "peerId"),
+                          scene == QMessageScene.Group, cancellationToken)
                       ?? throw new InvalidOperationException($"找不到要撤回的消息: {messageId}");
         await session.Context.RecallMessage(message).ConfigureAwait(false);
     }
@@ -666,26 +772,32 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
     public Task<string> GetResourceTempUrlAsync(string resourceId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return (session.Context.GetNTV2RichMediaUrl(resourceId)).WaitAsync(cancellationToken);
+        return session.Context.GetNTV2RichMediaUrl(resourceId).WaitAsync(cancellationToken);
     }
 
     // 不支持项:
-    public async Task<IReadOnlyList<QForwardedIncomingMessage>> GetForwardedMessagesAsync(string forwardId, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<QForwardedIncomingMessage>> GetForwardedMessagesAsync(string forwardId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var entity = new Lagrange.Core.Message.Entities.MultiMsgEntity(forwardId);
-        var envelope = Lagrange.Core.Message.BotMessage.CreateCustomGroup(0, 0, "", DateTimeOffset.UtcNow.ToUnixTimeSeconds(), []);
+        var envelope =
+            Lagrange.Core.Message.BotMessage.CreateCustomGroup(0, 0, "", DateTimeOffset.UtcNow.ToUnixTimeSeconds(), []);
         await entity.Postprocess(session.Context, envelope).WaitAsync(cancellationToken);
-        return entity.Messages.Select(x => new QForwardedIncomingMessage
-        {
-            MessageId = x.Sequence.ToString(),
-            SenderName = x.Contact.Nickname,
-            Time = DateTimeOffset.FromUnixTimeSeconds(x.Time),
-            Segments = LagrangeMapper.ToQqSegments(x.Entities)
-        }).ToArray();
+        return
+        [
+            .. entity.Messages.Select(x => new QForwardedIncomingMessage
+            {
+                MessageId = x.Sequence.ToString(),
+                SenderName = x.Contact.Nickname,
+                Time = DateTimeOffset.FromUnixTimeSeconds(x.Time),
+                Segments = LagrangeMapper.ToQqSegments(x.Entities)
+            })
+        ];
     }
 
-    public Task MarkAsReadAsync(QMessageScene scene, string peerId, string messageId, CancellationToken cancellationToken = default)
+    public Task MarkAsReadAsync(QMessageScene scene, string peerId, string messageId,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         throw LagrangeMapper.Unsupported("标记已读(Lagrange.Core 未提供 API)");

@@ -1,5 +1,3 @@
-using Lagrange.Core;
-using Lagrange.Core.Events;
 using Lagrange.Core.Common.Entity;
 using Lagrange.Core.Message.Entities;
 using Lagrange.Core.Events.EventArgs;
@@ -16,7 +14,7 @@ internal sealed class LagrangeEventService : IEventService
 {
     private LagrangeSession? _session;
 
-    public event Func<Sdk.BotEvent, Task>? EventReceived;
+    public event Func<BotEvent, Task>? EventReceived;
 
     public void Detach() => _session = null;
 
@@ -43,7 +41,7 @@ internal sealed class LagrangeEventService : IEventService
             SelfId = _session?.ActiveContext?.BotUin.ToString(),
             Raw = e,
             MessageId = e.Sequence.ToString(),
-            Channel = Sdk.Channel.Direct(e.PeerUin.ToString()),
+            Channel = Channel.Direct(e.PeerUin.ToString()),
             SenderId = e.AuthorUin.ToString()
         }));
         invoker.RegisterEvent<BotGroupMemberIncreaseEvent>(async (_, e) => await PublishAsync(new MemberJoinedEvent
@@ -65,8 +63,8 @@ internal sealed class LagrangeEventService : IEventService
             UserId = e.UserUin.ToString(),
             OperatorId = e.OperatorUin?.ToString()
         }));
-        invoker.RegisterEvent<LgrEvents.BotFriendRequestEvent>(async (_, e) =>
-            await PublishAsync(new Sdk.FriendRequestEvent
+        invoker.RegisterEvent<BotFriendRequestEvent>(async (_, e) =>
+            await PublishAsync(new FriendRequestEvent
             {
                 Platform = LagrangeMapper.PlatformId,
                 SelfId = _session?.ActiveContext?.BotUin.ToString(),
@@ -87,10 +85,10 @@ internal sealed class LagrangeEventService : IEventService
                 Raw = new QGroupJoinRequest
                 {
                     Time = DateTimeOffset.Now,
-                    SelfId = (SelfUin()).ToString(),
-                    GroupId = (notification.GroupUin).ToString(),
+                    SelfId = SelfUin().ToString(),
+                    GroupId = notification.GroupUin.ToString(),
                     RequestId = ((long)notification.Sequence).ToString(),
-                    UserId = (notification.TargetUin).ToString(),
+                    UserId = notification.TargetUin.ToString(),
                     Comment = notification.Comment,
                     IsFiltered = notification.IsFiltered
                 }
@@ -108,12 +106,12 @@ internal sealed class LagrangeEventService : IEventService
                 Raw = new QGroupJoinRequest
                 {
                     Time = DateTimeOffset.Now,
-                    SelfId = (SelfUin()).ToString(),
-                    GroupId = (notification.GroupUin).ToString(),
+                    SelfId = SelfUin().ToString(),
+                    GroupId = notification.GroupUin.ToString(),
                     RequestId = ((long)notification.Sequence).ToString(),
                     InviterId = notification.InviterUin.ToString(),
                     IsInvited = true,
-                    UserId = (notification.TargetUin).ToString()
+                    UserId = notification.TargetUin.ToString()
                 }
             });
         });
@@ -126,10 +124,10 @@ internal sealed class LagrangeEventService : IEventService
             Raw = new QGroupNudge
             {
                 Time = DateTimeOffset.Now,
-                SelfId = (SelfUin()).ToString(),
-                GroupId = (e.GroupUin).ToString(),
-                SenderId = (e.OperatorUin).ToString(),
-                ReceiverId = (e.TargetUin).ToString(),
+                SelfId = SelfUin().ToString(),
+                GroupId = e.GroupUin.ToString(),
+                SenderId = e.OperatorUin.ToString(),
+                ReceiverId = e.TargetUin.ToString(),
                 DisplayAction = e.Action,
                 DisplaySuffix = e.Suffix
             }
@@ -143,9 +141,9 @@ internal sealed class LagrangeEventService : IEventService
             Raw = new QGroupMessageReaction
             {
                 Time = DateTimeOffset.Now,
-                SelfId = (SelfUin()).ToString(),
-                GroupId = (e.TargetGroupUin).ToString(),
-                UserId = (e.OperatorUin).ToString(),
+                SelfId = SelfUin().ToString(),
+                GroupId = e.TargetGroupUin.ToString(),
+                UserId = e.OperatorUin.ToString(),
                 MessageId = ((long)e.TargetSequence).ToString(),
                 FaceId = e.Code,
                 IsAdd = e.IsAdd
@@ -163,7 +161,8 @@ internal sealed class LagrangeEventService : IEventService
     private async Task OnMessageAsync(BotMessageEvent e)
     {
         _session?.CacheMessage(e.Message);
-        await PublishAsync(LagrangeMapper.ToMessageEvent(e.Message, _session?.ActiveContext?.BotUin.ToString())).ConfigureAwait(false);
+        await PublishAsync(LagrangeMapper.ToMessageEvent(e.Message, _session?.ActiveContext?.BotUin.ToString()))
+            .ConfigureAwait(false);
         if (e.Message.Contact is BotGroupMember member)
         {
             foreach (var file in e.Message.Entities.OfType<GroupFileEntity>())
@@ -187,17 +186,17 @@ internal sealed class LagrangeEventService : IEventService
         }
     }
 
-    private async Task PublishAsync(Sdk.BotEvent botEvent)
+    private async Task PublishAsync(BotEvent botEvent)
     {
         if (EventReceived is { } handler)
         {
-            foreach (Func<Sdk.BotEvent, Task> subscriber in handler.GetInvocationList())
+            foreach (var subscriber in handler.GetInvocationList().Cast<Func<BotEvent, Task>>())
                 await subscriber(botEvent).ConfigureAwait(false);
         }
     }
 
     private long SelfUin() => _session?.Context.BotUin ?? 0;
 
-    private static Sdk.Channel GroupChannel(long groupUin) =>
+    private static Channel GroupChannel(long groupUin) =>
         new(groupUin.ToString(), ChannelType.Group) { GuildId = groupUin.ToString() };
 }

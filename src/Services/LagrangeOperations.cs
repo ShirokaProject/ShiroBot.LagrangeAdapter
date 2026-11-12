@@ -1,4 +1,4 @@
-namespace ShiroBot.LagrangeAdapter;
+namespace ShiroBot.LagrangeAdapter.Services;
 
 internal static class LagrangeOperations
 {

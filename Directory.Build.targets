@@ -8,4 +8,12 @@
     <Features Condition="'$(Features)' == ''">runtime-async=on</Features>
     <Features Condition="'$(Features)' != '' and !$(Features.Contains('runtime-async'))">$(Features),runtime-async=on</Features>
   </PropertyGroup>
+  <!-- Same direct-host workflow as the official adapter template. -->
+  <Target Name="PrepareShiroBotDevelopmentHost" AfterTargets="Build"
+          Condition="'$(MSBuildProjectName)' == 'ShiroBot.LagrangeAdapter' and '$(Configuration)' == 'Debug' and '$(DesignTimeBuild)' != 'true' and '$(ShiroBotPrepareDevelopmentHost)' != 'false'">
+    <Exec Condition="'$(OS)' != 'Windows_NT'" WorkingDirectory="$(MSBuildThisFileDirectory)"
+          Command="/bin/sh &quot;$(MSBuildThisFileDirectory)scripts/dev.sh&quot; --prepare --no-build" />
+    <Exec Condition="'$(OS)' == 'Windows_NT'" WorkingDirectory="$(MSBuildThisFileDirectory)"
+          Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)scripts/dev.ps1&quot; --prepare --no-build" />
+  </Target>
 </Project>
