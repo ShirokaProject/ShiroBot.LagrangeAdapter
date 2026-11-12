@@ -28,6 +28,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private LagrangeSignProvider? _signProvider;
     private TaskCompletionSource<string>? _qrReady;
     private bool _started;
+    private string? _automaticDeviceName;
     private LagrangeSession? _session;
     private readonly LagrangeSession _services = new();
     private readonly LagrangeEventService _eventService = new();
@@ -153,10 +154,17 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         var botConfig = config.CreateBotConfig(protocol);
         botConfig.SignProvider = _signProvider;
         Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
-        var context = !fresh && File.Exists(keystorePath)
-            ? BotFactory.Create(botConfig, JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
-                ?? throw new InvalidDataException("Keystore 内容为空。"), resolved)
-            : BotFactory.Create(botConfig, resolved);
+        var keystore = !fresh && File.Exists(keystorePath)
+            ? JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
+                ?? throw new InvalidDataException("Keystore 内容为空。")
+            : BotKeystore.CreateEmpty();
+        if (string.IsNullOrWhiteSpace(config.DeviceName))
+        {
+            _automaticDeviceName = LagrangeConnectionOptions.ResolveDeviceName(_automaticDeviceName ?? keystore.DeviceName);
+            keystore.DeviceName = _automaticDeviceName;
+        }
+        else keystore.DeviceName = config.DeviceName.Trim();
+        var context = BotFactory.Create(botConfig, keystore, resolved);
         _services.ActiveContext = context;
         _session = _services;
         _message = new LagrangeMessageService(_session);
@@ -422,6 +430,8 @@ public sealed class LagrangeAdapterConfig
     public void Validate()
     {
         _ = AccountUin;
+        if (DeviceName.Length > 64 || DeviceName.Any(char.IsControl))
+            throw new ArgumentException("设备名称最多 64 个字符，不能包含控制字符。");
         if (!Enum.TryParse<Protocols>(Protocol, true, out var protocol) || !BotAppInfo.ProtocolToAppInfo.ContainsKey(protocol))
             throw new ArgumentException($"未知协议: {Protocol}");
         if (!Enum.TryParse<Lagrange.Core.Events.EventArgs.LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
@@ -453,6 +463,9 @@ public sealed class LagrangeAdapterConfig
     /// <summary>QQ 号。配合 Password 使用密码登录;留 0 使用二维码登录。</summary>
     [ConfigField("自动密码登录使用的 QQ 号；手动登录可在登录页面填写。", Label = "QQ 账号", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 20, Type = "string", Placeholder = "请输入 QQ 账号")]
     public string Uin { get; set; } = "";
+
+    [ConfigField("留空自动生成 Shiro- 加随机 4–8 位数字；自动名称随登录凭据保存，刷新二维码时保持不变。", Label = "设备名称", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 35, Placeholder = "Shiro-123456")]
+    public string DeviceName { get; set; } = "";
 
     /// <summary>密码。留空使用二维码登录(推荐,首次扫码后 keystore 自动续期)。</summary>
     [ConfigField("仅自动密码登录需要。建议通过登录页面输入，避免把密码保存到配置。", Label = "登录密码", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 30, Type = "password")]

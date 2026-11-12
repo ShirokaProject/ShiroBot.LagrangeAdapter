@@ -231,6 +231,15 @@ foreach (var (protocol, expected) in new[]
 }
 Console.WriteLine("Lagrange V2 PC signing endpoint, numeric account, three platform QUA and empty HEX checks passed.");
 
+var resolveDevice = optionsType.GetMethod("ResolveDeviceName", BindingFlags.Static | BindingFlags.NonPublic)!;
+for (var n = 0; n < 100; n++)
+{
+    var name = (string)resolveDevice.Invoke(null, ["Lagrange-ABCDEF"])!;
+    if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^Shiro-[0-9]{4,8}$")) throw new Exception("Invalid automatic device name.");
+    if ((string)resolveDevice.Invoke(null, [name])! != name) throw new Exception("Automatic device name was not retained.");
+}
+Console.WriteLine("Default device name format and stability checks passed.");
+
 sealed class RejectSignHandler : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) =>

@@ -45,6 +45,16 @@ internal static class LagrangeConnectionOptions
         if (mismatch) throw new ArgumentException($"客户端平台 {protocol} 与 AppInfo.Os={info.Os} 不一致，请使用同一平台的 AppInfo 和签名服务。");
     }
 
+    internal static string ResolveDeviceName(string? previous)
+    {
+        if (previous is not null && System.Text.RegularExpressions.Regex.IsMatch(previous, @"^Shiro-[0-9]{4,8}$"))
+            return previous;
+        var digits = System.Security.Cryptography.RandomNumberGenerator.GetInt32(4, 9);
+        var minimum = (int)Math.Pow(10, digits - 1);
+        var number = System.Security.Cryptography.RandomNumberGenerator.GetInt32(minimum, minimum * 10);
+        return "Shiro-" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     private static void Merge(JsonObject target, JsonObject source)
     {
         foreach (var (key, value) in source)

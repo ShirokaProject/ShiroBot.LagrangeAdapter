@@ -12,6 +12,8 @@ password = ""
 protocol = "Linux"
 # 留空保存在本配置文件同目录；相对路径也以本目录解析。
 keystore_path = ""
+# 留空自动生成 Shiro- 加随机 4–8 位数字，随凭据保存。
+device_name = ""
 
 # Lagrange V2 PC 签名服务，填写基础地址，自动追加 /api/sign/sec-sign。留空 sign_server 使用 Lagrange.Core 内置签名服务。
 sign_server = ""
