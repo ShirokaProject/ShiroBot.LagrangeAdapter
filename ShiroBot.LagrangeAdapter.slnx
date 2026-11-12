@@ -4,14 +4,16 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ContractChecks/ContractChecks.csproj" />
+    <Project Path="tests/VersionCheck/VersionCheck.csproj" />
   </Folder>
   <Folder Name="/tools/">
-    <Project Path="scripts/version-check/VersionCheck.csproj" />
     <File Path="scripts/dev.sh" />
     <File Path="scripts/dev.ps1" />
   </Folder>
   <Folder Name="/docs/">
     <File Path="README.md" />
-    <File Path="CAPABILITIES.md" />
+    <File Path="docs/CAPABILITIES.md" />
+    <File Path="docs/examples/config.toml" />
+    <File Path="docs/examples/appinfo.example.json" />
   </Folder>
 </Solution>

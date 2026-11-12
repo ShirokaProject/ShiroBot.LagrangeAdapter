@@ -2,6 +2,17 @@
 
 基于 LagrangeV2 的进程内 QQ 适配器。
 
+## 项目结构
+
+- `src/`：适配器源码和项目文件。
+- `tests/`：契约回归检查和版本检查。
+- `docs/`：能力说明、配置示例和宿主集成补丁。
+- `build/`：公共构建规则和包元数据。
+- `scripts/`：本地开发宿主脚本。
+- `external/`：LagrangeV2 源码子模块。
+
+使用根目录的 `ShiroBot.LagrangeAdapter.slnx` 打开解决方案。
+
 ## 构建
 
 ```sh
@@ -34,7 +45,7 @@ git submodule update --remote external/LagrangeV2
 
 ## 能力与验证范围
 
-具体能力与限制见 [CAPABILITIES.md](CAPABILITIES.md)。
+具体能力与限制见 [能力与限制](docs/CAPABILITIES.md)。
 
 ## 在适配器内触发扫码
 

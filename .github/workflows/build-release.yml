@@ -39,8 +39,8 @@ jobs:
           mkdir -p artifacts
           cp src/bin/Release/net11.0/ShiroBot.LagrangeAdapter.dll artifacts/
           cp LICENSE artifacts/
-          cp examples/config.toml artifacts/config.example.toml
-          cp examples/appinfo.example.json artifacts/
+          cp docs/examples/config.toml artifacts/config.example.toml
+          cp docs/examples/appinfo.example.json artifacts/
           cd artifacts
           sha256sum ShiroBot.LagrangeAdapter.dll > SHA256SUMS
       - uses: actions/upload-artifact@v4

@@ -6,4 +6,5 @@
     <Nullable>enable</Nullable>
     <ShiroBotPluginPackagingEnabled>false</ShiroBotPluginPackagingEnabled>
   </PropertyGroup>
+  <Import Project="../../build/Adapter.targets" />
 </Project>
