@@ -1,0 +1,57 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Verify tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/.*<Version>\([^<]*\)<.*/\1/p' ShiroBot.LagrangeAdapter.csproj | head -1)
+          test "$RELEASE_TAG" = "v$version"
+          grep -q "Version = \"$version\"" LagrangeAdapter.cs
+      - name: Run contract and regression checks
+        run: dotnet run --project tests/ContractChecks --configuration Debug
+      - name: Build .NET 11 async2 release
+        run: dotnet build ShiroBot.LagrangeAdapter.csproj --configuration Release -p:ContinuousIntegrationBuild=true
+      - name: Prepare release files
+        run: |
+          mkdir -p artifacts
+          cp bin/Release/net11.0/ShiroBot.LagrangeAdapter.dll artifacts/
+          cp LICENSE artifacts/
+          cp examples/config.toml artifacts/config.example.toml
+          cp examples/appinfo.example.json artifacts/
+          cd artifacts
+          sha256sum ShiroBot.LagrangeAdapter.dll > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShiroBot.LagrangeAdapter
+          path: artifacts/
+          if-no-files-found: error
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/* --verify-tag --title "$RELEASE_TAG" --notes-file .github/release-notes.md

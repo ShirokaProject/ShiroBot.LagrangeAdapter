@@ -11,14 +11,18 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.0")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
-    Name = "LagrangeAdapter",
-    Version = "0.2.0",
-    Description = "In-process QQ adapter powered by LagrangeV2 (Lagrange.Core)",
+    Name = "Lagrange V2",
+    Version = "0.1.0",
+    Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、扫码与会话快速登录。",
+    Author = "ShirokaProject",
+    GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
+    IsSingleFile = true,
     Protocol = "lagrange-v2")]
 public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginActionProvider, IConfigurableAdapter, IConfigurableComponent<LagrangeAdapterConfig>
 {

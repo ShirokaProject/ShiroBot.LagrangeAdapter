@@ -10,6 +10,11 @@ if (args is ["--export-appinfo", var output])
 }
 
 var assembly = typeof(LagrangeAdapter).Assembly;
+var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.0" ||
+    adapterMetadata.Author != "ShirokaProject" || adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
+    adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)
+    throw new Exception("Release adapter metadata is incomplete or inconsistent.");
 var failures = new List<string>();
 foreach (var type in assembly.GetTypes().Where(t => t.Namespace == "ShiroBot.LagrangeAdapter.Services"))
 {

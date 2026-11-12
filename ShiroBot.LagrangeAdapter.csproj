@@ -1,7 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
-    <Version>0.2.0</Version>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Authors>ShirokaProject</Authors>
+    <Company>ShirokaProject</Company>
+    <Product>ShiroBot Lagrange V2 Adapter</Product>
+    <Description>基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、扫码与会话快速登录。</Description>
+    <PackageProjectUrl>https://github.com/ShirokaProject/ShiroBot.LagrangeAdapter</PackageProjectUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>shirobot;adapter;qq;lagrange;lagrange-v2</PackageTags>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
