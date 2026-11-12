@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Text.Json.Nodes;
 using Lagrange.Core.Common;
 
@@ -10,15 +12,25 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
     private readonly HttpClient _client;
     private readonly Uri _endpoint;
     private readonly CancellationToken _stopping;
+    private readonly LagrangeAdapterConfig _options;
 
     public LagrangeSignProvider(string endpoint, CancellationToken stopping, HttpMessageHandler? handler = null)
+        : this(new LagrangeAdapterConfig { SignServer = endpoint }, stopping, handler) { }
+
+    public LagrangeSignProvider(LagrangeAdapterConfig options, CancellationToken stopping, HttpMessageHandler? handler = null)
     {
-        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
-            throw new ArgumentException("SignServer 必须是完整的 HTTP(S) 签名端点。");
-        _endpoint = uri;
+        options.Validate();
+        if (string.IsNullOrWhiteSpace(options.SignServer)) throw new ArgumentException("SignServer 不能为空。");
+        _options = options;
+        var address = options.SignServer!;
+        _endpoint = options.SignApi == "Milky"
+            ? new Uri(new Uri(address.TrimEnd('/') + "/"), "sign/sec-sign") : new Uri(address);
         _stopping = stopping;
-        _client = handler is null ? new HttpClient() : new HttpClient(handler);
-        _client.Timeout = TimeSpan.FromSeconds(30);
+        handler ??= string.IsNullOrWhiteSpace(options.SignProxyUrl) ? new HttpClientHandler()
+            : new HttpClientHandler { Proxy = new WebProxy(options.SignProxyUrl), UseProxy = true };
+        _client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(options.SignTimeoutSeconds) };
+        if (!string.IsNullOrWhiteSpace(options.SignToken))
+            _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.SignToken);
     }
 
     private static readonly HashSet<string> WhiteListCommand =
@@ -561,8 +573,18 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
 
     public override async Task<SsoSecureInfo?> GetSecSign(long uin, string cmd, int seq, ReadOnlyMemory<byte> body)
     {
-        using var response = await _client.PostAsJsonAsync(_endpoint,
-            new { cmd, seq, src = Convert.ToHexString(body.Span) }, _stopping);
+        object payload = _options.SignApi == "Milky"
+            ? new
+            {
+                uin = uin == 0 ? _options.Uin : uin,
+                command = cmd,
+                seq,
+                body = Convert.ToHexString(body.Span).ToLowerInvariant(),
+                guid = Convert.ToHexString(Context.Keystore.Guid).ToLowerInvariant(),
+                qua = Context.AppInfo.Qua
+            }
+            : new { cmd, seq, src = Convert.ToHexString(body.Span) };
+        using var response = await _client.PostAsJsonAsync(_endpoint, payload, _stopping);
         response.EnsureSuccessStatusCode();
         var root = await response.Content.ReadFromJsonAsync<JsonObject>(_stopping)
             ?? throw new InvalidDataException("签名服务返回空响应。");
@@ -570,13 +592,13 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
             throw new InvalidDataException("签名服务返回失败状态。");
         var value = (root["value"] ?? root["data"]) as JsonObject
             ?? throw new InvalidDataException("签名服务响应缺少 value/data。");
-        var sign = value["sign"]?.GetValue<string>();
+        var sign = (value["sec_sign"] ?? value["sign"])?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(sign)) throw new InvalidDataException("签名服务返回空 sign。");
         return new SsoSecureInfo
         {
             SecSign = Convert.FromHexString(sign),
-            SecToken = Convert.FromHexString(value["token"]?.GetValue<string>() ?? ""),
-            SecExtra = Convert.FromHexString(value["extra"]?.GetValue<string>() ?? "")
+            SecToken = Convert.FromHexString((value["sec_token"] ?? value["token"])?.GetValue<string>() ?? ""),
+            SecExtra = Convert.FromHexString((value["sec_extra"] ?? value["extra"])?.GetValue<string>() ?? "")
         };
     }
 

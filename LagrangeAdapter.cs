@@ -19,7 +19,7 @@ namespace ShiroBot.LagrangeAdapter;
     Version = "0.2.0",
     Description = "In-process QQ adapter powered by LagrangeV2 (Lagrange.Core)",
     Protocol = "lagrange-v2")]
-public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginActionProvider
+public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginActionProvider, IConfigurableAdapter, IConfigurableComponent<LagrangeAdapterConfig>
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private CancellationTokenSource? _loginCancellation;
@@ -40,6 +40,21 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
     private LagrangeQqFileApi? _qqFileApi;
     private LagrangeQqSystemApi? _qqSystemApi;
     private LagrangeQqMessageApi? _qqMessageApi;
+
+    public LagrangeAdapterConfig CurrentConfigValue { get; private set; } = new();
+    public ConfigApplyMode ApplyMode => ConfigApplyMode.RestartComponent;
+
+    public Task OnConfigLoadedAsync(LagrangeAdapterConfig config, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        config.Validate();
+        CurrentConfigValue = config;
+        Config.Save(config);
+        return Task.CompletedTask;
+    }
+
+    public Task OnConfigChangedAsync(LagrangeAdapterConfig previous, LagrangeAdapterConfig current, CancellationToken cancellationToken) =>
+        OnConfigLoadedAsync(current, cancellationToken);
 
     public IPluginLifetime Lifetime { get; set; } = null!;
 
@@ -72,6 +87,8 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
         {
             if (_started) throw new InvalidOperationException("适配器已经启动。");
             var config = Config.Load<LagrangeAdapterConfig>();
+            config.Validate();
+            CurrentConfigValue = config;
             Config.Save(config);
             InitializeConnection(config, false);
             _started = true;
@@ -94,6 +111,7 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
 
     private void InitializeConnection(LagrangeAdapterConfig config, bool fresh)
     {
+        config.Validate();
         var keystorePath = ResolveKeystorePath(config);
         if (!Enum.TryParse<Protocols>(config.Protocol, true, out var protocol))
             throw new ArgumentException($"未知 Lagrange 协议: {config.Protocol}");
@@ -108,8 +126,9 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
         var resolved = LagrangeConnectionOptions.ResolveAppInfo(protocol, appInfo);
         _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime?.Stopping ?? CancellationToken.None);
         if (!string.IsNullOrWhiteSpace(config.SignServer))
-            _signProvider = new LagrangeSignProvider(config.SignServer, _loginCancellation.Token);
-        var botConfig = new BotConfig { Protocol = protocol, AutoReconnect = true, AutoReLogin = true, SignProvider = _signProvider };
+            _signProvider = new LagrangeSignProvider(config, _loginCancellation.Token);
+        var botConfig = config.CreateBotConfig(protocol);
+        botConfig.SignProvider = _signProvider;
         Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
         var context = !fresh && File.Exists(keystorePath)
             ? BotFactory.Create(botConfig, JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
@@ -216,6 +235,7 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
     {
         context.EventInvoker.RegisterEvent<BotLogEvent>((_, e) =>
         {
+            if (e.Level < context.Config.LogLevel) return;
             var text = $"[Lagrange][{e.Tag}] {e.Message}";
             switch (e.Level)
             {
@@ -229,7 +249,9 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
                 case Lagrange.Core.Events.EventArgs.LogLevel.Information:
                     Logger.Info(text);
                     break;
-                    // Debug/Trace 不刷屏
+                default:
+                    Logger.Log(text);
+                    break;
             }
         });
 
@@ -288,26 +310,74 @@ public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginAction
 public sealed class LagrangeAdapterConfig
 {
     /// <summary>启动后自动恢复会话或登录；false 时由 Action 触发扫码。</summary>
-    public bool AutoLogin { get; set; } = true;
+    public bool AutoLogin { get; set; } = false;
 
     /// <summary>覆盖当前协议内置 AppInfo 的字段，可只提供需要修改的字段。</summary>
-    public string? AppInfo { get; set; }
+    public string? AppInfo { get; set; } = "";
 
     /// <summary>AppInfo JSON 文件路径，相对于适配器配置目录。与 AppInfo 互斥。</summary>
-    public string? AppInfoPath { get; set; }
+    public string? AppInfoPath { get; set; } = "";
 
-    /// <summary>完整签名 POST 端点，留空使用 Lagrange 默认签名服务。</summary>
-    public string? SignServer { get; set; }
+    /// <summary>Milky 模式填签名基础地址，Lagrange 模式填完整 POST 端点；留空使用上游默认服务。</summary>
+    public string? SignServer { get; set; } = "";
+
+    /// <summary>Milky: SignServer 为基础地址，追加 sign/sec-sign；Lagrange: SignServer 为完整 POST 端点。</summary>
+    public string SignApi { get; set; } = "Lagrange";
+    /// <summary>签名请求的 Bearer Token，留空不发送 Authorization。</summary>
+    public string SignToken { get; set; } = "";
+    /// <summary>签名服务 HTTP(S) 代理地址，留空使用系统代理设置。</summary>
+    public string SignProxyUrl { get; set; } = "";
+    public int SignTimeoutSeconds { get; set; } = 30;
+
+    public bool AutoReconnect { get; set; } = true;
+    public bool AutoReLogin { get; set; } = true;
+    public bool UseIpv6Network { get; set; } = false;
+    public bool GetOptimumServer { get; set; } = true;
+    public string LogLevel { get; set; } = "Information";
+    /// <summary>每个上传分块大小，最大 1048576 字节。</summary>
+    public uint HighwayChunkSize { get; set; } = 1048576;
+    public uint HighwayConcurrent { get; set; } = 4;
+
+    public void Validate()
+    {
+        if (!Enum.TryParse<Protocols>(Protocol, true, out var protocol) || !BotAppInfo.ProtocolToAppInfo.ContainsKey(protocol))
+            throw new ArgumentException($"未知协议: {Protocol}");
+        if (!Enum.TryParse<Lagrange.Core.Events.EventArgs.LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
+            throw new ArgumentException($"未知日志等级: {LogLevel}");
+        if (SignApi is not ("Lagrange" or "Milky")) throw new ArgumentException("SignApi 必须是 Lagrange 或 Milky。");
+        if (SignTimeoutSeconds <= 0 || SignTimeoutSeconds > 600) throw new ArgumentOutOfRangeException(nameof(SignTimeoutSeconds));
+        if (HighwayChunkSize == 0 || HighwayChunkSize > 1048576) throw new ArgumentOutOfRangeException(nameof(HighwayChunkSize));
+        if (HighwayConcurrent == 0) throw new ArgumentOutOfRangeException(nameof(HighwayConcurrent));
+        if (!string.IsNullOrWhiteSpace(AppInfo) && !string.IsNullOrWhiteSpace(AppInfoPath))
+            throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
+        foreach (var address in new[] { SignServer, SignProxyUrl }.Where(x => !string.IsNullOrWhiteSpace(x)))
+            if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+                throw new ArgumentException("签名服务和代理必须为完整 HTTP(S) 地址。");
+        if (string.IsNullOrWhiteSpace(SignServer) && (!string.IsNullOrWhiteSpace(SignToken) || !string.IsNullOrWhiteSpace(SignProxyUrl)))
+            throw new ArgumentException("设置签名 Token 或代理前，请先填写 SignServer。");
+    }
+
+    internal BotConfig CreateBotConfig(Protocols protocol) => new()
+    {
+        Protocol = protocol,
+        AutoReconnect = AutoReconnect,
+        AutoReLogin = AutoReLogin,
+        UseIPv6Network = UseIpv6Network,
+        GetOptimumServer = GetOptimumServer,
+        LogLevel = Enum.Parse<Lagrange.Core.Events.EventArgs.LogLevel>(LogLevel, true),
+        HighwayChunkSize = HighwayChunkSize,
+        HighwayConcurrent = HighwayConcurrent
+    };
 
     /// <summary>QQ 号。配合 Password 使用密码登录;留 0 使用二维码登录。</summary>
     public long Uin { get; set; }
 
     /// <summary>密码。留空使用二维码登录(推荐,首次扫码后 keystore 自动续期)。</summary>
-    public string? Password { get; set; }
+    public string? Password { get; set; } = "";
 
     /// <summary>协议: Linux / Windows / MacOs / AndroidPhone / AndroidPad / AndroidWatch。默认 Linux。</summary>
     public string Protocol { get; set; } = "Linux";
 
     /// <summary>keystore 保存路径,留空则保存在适配器配置目录。</summary>
-    public string? KeystorePath { get; set; }
+    public string? KeystorePath { get; set; } = "";
 }

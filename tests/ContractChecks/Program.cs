@@ -1,6 +1,14 @@
 using System.Reflection;
 using ShiroBot.LagrangeAdapter;
 
+if (args is ["--export-appinfo", var output])
+{
+    File.WriteAllText(output, System.Text.Json.JsonSerializer.Serialize(
+        Lagrange.Core.Common.BotAppInfo.ProtocolToAppInfo[Lagrange.Core.Common.Protocols.Linux],
+        new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return;
+}
+
 var assembly = typeof(LagrangeAdapter).Assembly;
 var failures = new List<string>();
 foreach (var type in assembly.GetTypes().Where(t => t.Namespace == "ShiroBot.LagrangeAdapter.Services"))
@@ -140,6 +148,48 @@ if (mappedRequest.RequestId != "42" || !mappedRequest.IsInvited || !mappedReques
     throw new Exception("Group request approval credentials were not preserved.");
 Console.WriteLine("File metadata and group request credential mapping checks passed.");
 
+var milkyHandler = new MilkySignHandler();
+var milkyOptions = new LagrangeAdapterConfig { SignApi = "Milky", SignServer = "http://localhost/api", SignToken = "test-token", Uin = 123 };
+using (var signer = (IDisposable)Activator.CreateInstance(signType, [milkyOptions, CancellationToken.None, milkyHandler])!)
+{
+    var provider = (Lagrange.Core.Common.BotSignProvider)signer;
+    using var bot = Lagrange.Core.Common.Interface.BotFactory.Create(new Lagrange.Core.Common.BotConfig { SignProvider = provider });
+    var signed = await provider.GetSecSign(0, "wtlogin.login", 7, new byte[] { 0xab });
+    if (!milkyHandler.Checked || Convert.ToHexString(signed!.SecSign!) != "AABB") throw new Exception("Milky sign protocol mismatch.");
+}
+foreach (var invalid in new[]
+{
+    new LagrangeAdapterConfig { HighwayChunkSize = 0 },
+    new LagrangeAdapterConfig { SignApi = "unknown" },
+    new LagrangeAdapterConfig { SignToken = "without-server" },
+    new LagrangeAdapterConfig { AppInfo = "{}", AppInfoPath = "other.json" }
+})
+{
+    try { invalid.Validate(); throw new Exception("Invalid connection options accepted."); }
+    catch (ArgumentException) { }
+}
+var networkOptions = new LagrangeAdapterConfig
+{
+    AutoReconnect = false, AutoReLogin = false, UseIpv6Network = true, GetOptimumServer = false,
+    LogLevel = "Debug", HighwayChunkSize = 1024, HighwayConcurrent = 2
+};
+var nativeConfig = (Lagrange.Core.Common.BotConfig)typeof(LagrangeAdapterConfig)
+    .GetMethod("CreateBotConfig", BindingFlags.NonPublic | BindingFlags.Instance)!
+    .Invoke(networkOptions, [Lagrange.Core.Common.Protocols.Linux])!;
+if (nativeConfig.AutoReconnect || nativeConfig.AutoReLogin || !nativeConfig.UseIPv6Network || nativeConfig.GetOptimumServer ||
+    nativeConfig.HighwayChunkSize != 1024 || nativeConfig.HighwayConcurrent != 2 || nativeConfig.LogLevel.ToString() != "Debug")
+    throw new Exception("Connection options were not propagated.");
+Console.WriteLine("Milky signing, connection option propagation and config validation checks passed.");
+
+var configKeys = typeof(LagrangeAdapterConfig).GetProperties().Select(x =>
+    System.Text.Json.JsonNamingPolicy.SnakeCaseLower.ConvertName(x.Name)).ToHashSet();
+foreach (var requiredKey in new[] { "sign_server", "sign_api", "sign_token", "sign_proxy_url", "sign_timeout_seconds", "app_info_path", "use_ipv6_network", "auto_re_login" })
+    if (!configKeys.Contains(requiredKey)) throw new Exception($"Configuration key was renamed unexpectedly: {requiredKey}");
+if (adapter is not ShiroBot.SDK.Config.IConfigurableAdapter ||
+    adapter is not ShiroBot.SDK.Config.IConfigurableComponent<LagrangeAdapterConfig>)
+    throw new Exception("Adapter must expose the typed config schema.");
+Console.WriteLine("Host configuration key and typed schema checks passed.");
+
 sealed class SignHandler : HttpMessageHandler
 {
     public bool Checked { get; private set; }
@@ -149,5 +199,19 @@ sealed class SignHandler : HttpMessageHandler
         Checked = request.Method == HttpMethod.Post && body["cmd"]!.GetValue<string>() == "wtlogin.login" &&
             body["seq"]!.GetValue<int>() == 7 && body["src"]!.GetValue<string>() == "AB";
         return new(System.Net.HttpStatusCode.OK) { Content = new StringContent("{\"value\":{\"sign\":\"aabb\",\"token\":\"cc\",\"extra\":\"dd\"}}", System.Text.Encoding.UTF8, "application/json") };
+    }
+}
+
+sealed class MilkySignHandler : HttpMessageHandler
+{
+    public bool Checked { get; private set; }
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
+    {
+        var body = System.Text.Json.Nodes.JsonNode.Parse(await request.Content!.ReadAsStringAsync(token))!;
+        Checked = request.RequestUri!.AbsolutePath == "/api/sign/sec-sign" &&
+            request.Headers.Authorization?.ToString() == "Bearer test-token" && body["uin"]!.GetValue<long>() == 123 &&
+            body["command"]!.GetValue<string>() == "wtlogin.login" && body["body"]!.GetValue<string>() == "ab" &&
+            !string.IsNullOrEmpty(body["guid"]!.GetValue<string>()) && !string.IsNullOrEmpty(body["qua"]!.GetValue<string>());
+        return new(System.Net.HttpStatusCode.OK) { Content = new StringContent("{\"code\":0,\"value\":{\"sec_sign\":\"aabb\",\"sec_token\":\"cc\",\"sec_extra\":\"dd\"}}", System.Text.Encoding.UTF8, "application/json") };
     }
 }

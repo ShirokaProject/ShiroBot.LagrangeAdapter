@@ -1,0 +1,39 @@
+# 放在宿主 adapters/lagrange/config.toml；实例 ID 须全局唯一。
+[[instances]]
+id = "lagrange-qq"
+name = "Lagrange QQ"
+enabled = false
+
+[instances.config]
+# false：启动后通过适配器 Action 扫码；true：自动恢复 keystore / 密码登录 / 扫码。
+auto_login = false
+uin = 0
+password = ""
+protocol = "Linux"
+# 留空保存在本配置文件同目录；相对路径也以本目录解析。
+keystore_path = ""
+
+# 签名服务。留空 sign_server 使用 Lagrange.Core 内置签名服务。
+# Milky：填写基础地址，自动追加 sign/sec-sign；Lagrange：填写完整 POST 端点。
+sign_api = "Milky"
+sign_server = ""
+sign_token = ""
+sign_proxy_url = ""
+sign_timeout_seconds = 30
+
+# 自定义 AppInfo：推荐复制 appinfo.example.json 后填写文件路径。
+# 留空使用所选 protocol 的内置 AppInfo；JSON 可只覆盖需要修改的字段。
+# app_info 为内联 JSON 字符串，与 app_info_path 二选一。
+app_info_path = ""
+app_info = ""
+
+# 与 Lagrange.Milky 的 Login/Server 配置对应。
+auto_re_login = true
+auto_reconnect = true
+use_ipv6_network = false
+get_optimum_server = true
+# Trace / Debug / Information / Warning / Error / Critical
+log_level = "Information"
+# 上传分块大小（字节，1..1048576）和并发数量（至少 1）。
+highway_chunk_size = 1048576
+highway_concurrent = 4

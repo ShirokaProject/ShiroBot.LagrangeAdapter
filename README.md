@@ -52,7 +52,9 @@ Release 使用 SDK 自带打包器合并协议依赖。将 `bin/Release/net11.0/
   "AutoLogin": false,
   "Protocol": "Linux",
   "AppInfoPath": "appinfo.json",
-  "SignServer": "http://127.0.0.1:8080/sign"
+  "SignApi": "Milky",
+  "SignServer": "http://127.0.0.1:8080",
+  "SignToken": ""
 }
 ```
 
@@ -68,7 +70,18 @@ Release 使用 SDK 自带打包器合并协议依赖。将 `bin/Release/net11.0/
 
 其余字段继承所选协议的内置 AppInfo，`SdkInfo` 也支持局部覆盖。也可将 JSON 文本放在字符串字段 `AppInfo` 中；它与 `AppInfoPath` 互斥。`ApkSignatureMd5` 按 System.Text.Json 约定使用 Base64 字符串。未知字段、空字段和错误类型会导致启动失败。
 
-`SignServer` 是完整 HTTP(S) POST 签名端点，不会自动追加路径。请求为 `{cmd, seq, src}`，src 为十六进制正文；响应支持 `{value:{sign,token,extra}}` 或 `{code:0,data:{sign,token,extra}}`，三个签名字段为十六进制。超时为 30 秒。签名命令列表与当前固定的上游 PC provider 一致；此配置不替代 Android 特有的 energy 等签名接口。
+签名配置支持两种模式：
+
+- `sign_api = "Milky"`：`sign_server` 填基础地址，自动追加 `sign/sec-sign`，请求携带 UIN、GUID、QUA，支持 Milky 的 `sec_sign/sec_token/sec_extra` 响应。
+- `sign_api = "Lagrange"`：`sign_server` 填完整 POST 端点，请求为 `{cmd, seq, src}`，兼容原来的签名服务。
+
+两种模式均支持 `sign_token`（Bearer）、`sign_proxy_url` 和 `sign_timeout_seconds`。`sign_server` 留空时使用上游内置签名服务，此时不能单独设置 token 或代理。这些签名配置面向 PC 协议，不替代 Android 特有 energy 接口。
+
+完整且带注释的宿主 TOML 示例见 [examples/config.toml](examples/config.toml)，完整 Linux AppInfo 模板见 [examples/appinfo.example.json](examples/appinfo.example.json)。复制模板并将 `app_info_path` 指向你的 JSON 文件即可使用；AppInfo 与签名服务版本需要匹配。
+
+已接入 Milky 对应的服务器与登录参数：`auto_reconnect`、`auto_re_login`、`use_ipv6_network`、`get_optimum_server`；另提供 `log_level`、`highway_chunk_size` 和 `highway_concurrent`。这些字段会直接传入 BotConfig。适配器声明强类型配置契约，Dashboard 可读取完整配置 schema，变更按重启连接方式生效。
+
+Milky 的 HTTP/WebSocket/SSE/WebHook 配置属于 Milky 传输层，进程内适配器不需要。Milky 的在线验证码解析与终端 ASCII 二维码选项目前没有移植，不会展示成无效开关。
 
 ## 在适配器内触发扫码
 
