@@ -9,19 +9,6 @@ internal static class LagrangeStorage
     {
         if (!string.IsNullOrWhiteSpace(config.KeystorePath)) return false;
         var relative = Path.Combine("sessions", Guid.NewGuid().ToString("N"), "keystore.json");
-        var directory = Path.GetDirectoryName(Path.GetFullPath(configPath))!;
-        var legacy = Path.Combine(directory, "lagrange-keystore.json");
-        // Only migrate a legacy shared file when the configured account identifies its owner.
-        if (config.AccountUin > 0 && File.Exists(legacy))
-        {
-            var saved = JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(legacy));
-            if (saved?.Uin == config.AccountUin)
-            {
-                var target = Path.Combine(directory, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.Copy(legacy, target, false);
-            }
-        }
         config.KeystorePath = relative;
         return true;
     }
@@ -39,14 +26,30 @@ internal static class LagrangeStorage
         catch (IOException ex) { throw new IOException("登录凭据路径已被其他实例使用，请为每个实例设置独立的凭据路径。", ex); }
     }
 
-    internal static async Task SaveAsync(string path, BotKeystore keystore)
+    internal static BotKeystore? ReadSession(ShiroBot.SDK.Config.IConfigContext context, LagrangeAdapterConfig config)
     {
-        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
+        var values = context.Load<Dictionary<string, object>>();
+        if (values.TryGetValue("session_store", out var stored))
         {
-            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(keystore));
-            File.Move(temporary, path, true);
+            if (stored is not string json) throw new InvalidDataException("session_store 必须是 JSON 字符串。");
+            return string.IsNullOrWhiteSpace(json) ? null
+                : JsonSerializer.Deserialize<BotKeystore>(json) ?? throw new InvalidDataException("session_store 内容为空。");
         }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        var root = Path.GetDirectoryName(Path.GetFullPath(context.ConfigPath))!;
+        var legacyPath = string.IsNullOrWhiteSpace(config.KeystorePath)
+            ? Path.Combine(root, "lagrange-keystore.json") : Path.GetFullPath(config.KeystorePath, root);
+        BotKeystore? legacy = null;
+        if (File.Exists(legacyPath))
+        {
+            var saved = JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(legacyPath));
+            if (saved is not null && (!string.IsNullOrWhiteSpace(config.KeystorePath) || config.AccountUin > 0 && saved.Uin == config.AccountUin))
+                legacy = saved;
+        }
+        // An explicit empty value prevents a later deleted session being reimported from a legacy file.
+        context.SetValue("session_store", legacy is null ? "" : JsonSerializer.Serialize(legacy));
+        return legacy;
     }
+
+    internal static void SaveSession(ShiroBot.SDK.Config.IConfigContext context, BotKeystore keystore) =>
+        context.SetValue("session_store", JsonSerializer.Serialize(keystore));
 }

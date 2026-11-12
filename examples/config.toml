@@ -10,7 +10,7 @@ auto_login = false
 uin = ""
 password = ""
 protocol = "Linux"
-# 留空为本实例分配独立 sessions 目录并写回配置；相对路径以本目录解析。
+# 会话自动保存到本实例 session_store；此路径仅用于旧文件导入和二维码临时目录。
 keystore_path = ""
 # 留空自动生成 Shiro- 加随机 4–8 位数字，随凭据保存。
 device_name = ""

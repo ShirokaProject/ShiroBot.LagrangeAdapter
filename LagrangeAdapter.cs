@@ -65,6 +65,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             context.SetValue("uin", text == "0" ? "" : text);
         }
         var config = context.Load<LagrangeAdapterConfig>();
+        _ = LagrangeStorage.ReadSession(context, config);
         if (LagrangeStorage.EnsurePath(config, context.ConfigPath)) context.Save(config);
         return config;
     }
@@ -163,9 +164,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         botConfig.SignProvider = _signProvider;
         Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
         _storageLease = LagrangeStorage.Acquire(keystorePath);
-        var keystore = !fresh && File.Exists(keystorePath)
-            ? JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
-                ?? throw new InvalidDataException("Keystore 内容为空。")
+        var keystore = !fresh ? LagrangeStorage.ReadSession(Config, config) ?? BotKeystore.CreateEmpty()
             : BotKeystore.CreateEmpty();
         if (string.IsNullOrWhiteSpace(config.DeviceName))
         {
@@ -200,6 +199,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             ? await context.Login(token)
             : await context.Login(config.AccountUin, config.Password, token);
         if (!success) throw new InvalidOperationException("Lagrange 登录失败，请查看协议日志。");
+        await PersistSessionAsync(context, ResolveKeystorePath(config));
         _loginStatus = "online";
         Logger.Success($"Lagrange 登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
     }
@@ -249,9 +249,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             if (!_started) return new(false, "请先启动适配器。");
             if (_services.ActiveContext?.IsOnline == true) return new(true, "当前已经登录。");
             var config = LoadAdapterConfig(Config);
-            var path = ResolveKeystorePath(config);
-            if (!File.Exists(path)) return new(false, "没有上次登录的凭据，请先扫码登录。");
-            var saved = JsonSerializer.Deserialize<BotKeystore>(await File.ReadAllTextAsync(path, token));
+            var saved = LagrangeStorage.ReadSession(Config, config);
             if (saved is null || !LagrangeConnectionOptions.HasSession(saved))
                 return new(false, "保存的凭据不包含有效会话，请重新扫码登录。");
             if (config.AccountUin != 0 && config.AccountUin != saved.Uin)
@@ -265,6 +263,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             {
                 var success = await context.LoginWithSession(_loginCancellation!.Token);
                 if (!success) throw new InvalidOperationException("上次登录凭据已失效，请重新扫码登录。");
+                await PersistSessionAsync(context, ResolveKeystorePath(config));
                 _loginStatus = "online";
                 Logger.Success($"快速登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
                 return true;
@@ -356,7 +355,10 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
         context.EventInvoker.RegisterEvent<BotQrCodeEvent>(async (_, e) =>
         {
-            if (!ReferenceEquals(_services.ActiveContext, context)) return;
+            await _keystoreWrite.WaitAsync();
+            try
+            {
+            if (!ReferenceEquals(_services.ActiveContext, context) || context.IsOnline) return;
             var pngPath = Path.Combine(Path.GetDirectoryName(keystorePath)!, "qrcode.png");
             await File.WriteAllBytesAsync(pngPath, e.Image);
             _qrImage = e.Image.ToArray();
@@ -369,6 +371,8 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             }
             Logger.Warning($"请扫码登录 QQ。二维码已保存: {pngPath}");
             Logger.Warning($"或使用链接生成二维码: {e.Url}");
+            }
+            finally { _keystoreWrite.Release(); }
         });
 
         context.EventInvoker.RegisterEvent<BotQrCodeQueryEvent>((_, e) =>
@@ -416,13 +420,33 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             try
             {
                 if (!ReferenceEquals(_services.ActiveContext, context)) return;
-                await LagrangeStorage.SaveAsync(keystorePath, e.Keystore);
+                LagrangeStorage.SaveSession(Config, e.Keystore);
             }
             finally { _keystoreWrite.Release(); }
         });
 
-        context.EventInvoker.RegisterEvent<BotOnlineEvent>((_, e) =>
-            Logger.Success($"Lagrange 已上线({e.Reason})。"));
+        context.EventInvoker.RegisterEvent<BotOnlineEvent>(async (_, e) =>
+        {
+            await PersistSessionAsync(context, keystorePath);
+            Logger.Success($"Lagrange 已上线({e.Reason})。");
+        });
+    }
+
+    private async Task PersistSessionAsync(BotContext context, string keystorePath)
+    {
+        await _keystoreWrite.WaitAsync();
+        try
+        {
+            if (!ReferenceEquals(_services.ActiveContext, context)) return;
+            LagrangeStorage.SaveSession(Config, context.Keystore);
+            _qrImage = null;
+            _verificationUrl = null;
+            var qrFile = Path.Combine(Path.GetDirectoryName(keystorePath)!, "qrcode.png");
+            try { File.Delete(qrFile); }
+            catch (IOException) { Logger.Warning("登录已成功，但二维码文件删除失败，请检查文件占用。"); }
+            catch (UnauthorizedAccessException) { Logger.Warning("登录已成功，但无权删除二维码文件。"); }
+        }
+        finally { _keystoreWrite.Release(); }
     }
 
     private string ResolveKeystorePath(LagrangeAdapterConfig config)
@@ -546,6 +570,6 @@ public sealed class LagrangeAdapterConfig
     public string Protocol { get; set; } = "Linux";
 
     /// <summary>keystore 保存路径,留空则保存在适配器配置目录。</summary>
-    [ConfigField("留空自动生成独立 sessions 目录并保存到当前实例配置；不同实例不可共用路径。凭据用于快速登录，请勿公开。", Label = "登录凭据路径", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 40)]
+    [ConfigField("二维码临时目录的路径标识；旧版凭据文件会导入本实例的 session_store。实际登录凭据保存在当前实例配置中，不再写独立 JSON 文件。", Label = "登录凭据路径", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 40)]
     public string? KeystorePath { get; set; } = "";
 }

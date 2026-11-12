@@ -287,14 +287,40 @@ try
     {
         try { using var duplicate = (IDisposable)acquire.Invoke(null, [fullPath])!; throw new Exception("Duplicate session path was accepted."); }
         catch (TargetInvocationException ex) when (ex.InnerException is IOException) { }
-        await (Task)storage.GetMethod("SaveAsync", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, [fullPath, savedSession])!;
+        var configA = new StoredConfigContext(Path.Combine(rootStorage, "config.toml"));
+        var configB = new StoredConfigContext(configA.ConfigPath);
+        var saveSession = storage.GetMethod("SaveSession", BindingFlags.NonPublic | BindingFlags.Static)!;
+        saveSession.Invoke(null, [configA, savedSession]);
+        var readSession = storage.GetMethod("ReadSession", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var restored = (Lagrange.Core.Common.BotKeystore)readSession.Invoke(null, [configA, firstConfig])!;
+        if (restored.Uin != 123 || restored.WLoginSigs.A2[0] != 1 || configB.Values.ContainsKey("session_store"))
+            throw new Exception("Inline session storage crossed instance boundaries or lost tickets.");
+        if (File.Exists(fullPath)) throw new Exception("Inline session unexpectedly created a keystore JSON file.");
     }
-    var persisted = System.Text.Json.JsonSerializer.Deserialize<Lagrange.Core.Common.BotKeystore>(File.ReadAllText(fullPath))!;
-    if (persisted.Uin != 123 || persisted.WLoginSigs.A2[0] != 1) throw new Exception("Session was not saved correctly.");
     using var reopened = (IDisposable)acquire.Invoke(null, [fullPath])!;
 }
 finally { Directory.Delete(rootStorage, true); }
-Console.WriteLine("Quick login tickets, per-instance storage, atomic save and exclusive path checks passed.");
+Console.WriteLine("Quick login tickets, per-instance storage, inline config save and exclusive path checks passed.");
+
+var qrCleanupRoot = Path.Combine(Path.GetTempPath(), "lagrange-qr-cleanup-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(qrCleanupRoot);
+try
+{
+    using var cleanupBot = Lagrange.Core.Common.Interface.BotFactory.Create(new Lagrange.Core.Common.BotConfig());
+    var cleanupAdapter = new LagrangeAdapter { Config = new StoredConfigContext(Path.Combine(qrCleanupRoot, "config.toml")) };
+    var services = typeof(LagrangeAdapter).GetField("_services", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(cleanupAdapter)!;
+    sessionType.GetProperty("ActiveContext")!.SetValue(services, cleanupBot);
+    typeof(LagrangeAdapter).GetField("_qrImage", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(cleanupAdapter, new byte[] { 1 });
+    var png = Path.Combine(qrCleanupRoot, "qrcode.png");
+    await File.WriteAllBytesAsync(png, new byte[] { 1 });
+    await (Task)typeof(LagrangeAdapter).GetMethod("PersistSessionAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .Invoke(cleanupAdapter, [cleanupBot, Path.Combine(qrCleanupRoot, "keystore.json")])!;
+    if (File.Exists(png) || typeof(LagrangeAdapter).GetField("_qrImage", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(cleanupAdapter) is not null ||
+        !((StoredConfigContext)cleanupAdapter.Config).Values.ContainsKey("session_store"))
+        throw new Exception("Successful login did not save inline session or clear its QR.");
+}
+finally { Directory.Delete(qrCleanupRoot, true); }
+Console.WriteLine("Login completion inline persistence and QR file/memory cleanup checks passed.");
 
 sealed class RejectSignHandler : HttpMessageHandler
 {
@@ -314,4 +340,14 @@ sealed class YogurtSignHandler(string expectedQua) : HttpMessageHandler
             data["seq"]!.GetValue<int>() == 100 && data["body"]!.GetValue<string>() == "ab" && data["qua"]!.GetValue<string>() == expectedQua;
         return new(System.Net.HttpStatusCode.OK) { Content = new StringContent("{\"code\":0,\"value\":{\"sec_sign\":\"\",\"sec_token\":\"\",\"sec_extra\":\"\"}}", System.Text.Encoding.UTF8, "application/json") };
     }
+}
+
+sealed class StoredConfigContext(string path) : ShiroBot.SDK.Config.IConfigContext
+{
+    public Dictionary<string, object> Values { get; } = new();
+    public string ConfigPath => path;
+    public T Load<T>() where T : class, new() => Values as T ?? new T();
+    public void Save<T>(T value) where T : class => throw new Exception("Session persistence must update only its own field.");
+    public void SetValue(string keyPath, object? value) => Values[keyPath] = value!;
+    public IDisposable Watch<T>(Action<T> changed, int debounceMs = 500) where T : class, new() => throw new NotSupportedException();
 }

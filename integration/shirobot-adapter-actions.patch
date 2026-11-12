@@ -617,7 +617,7 @@ index d275e02..213d341 100644
 +}
 --- /dev/null
 +++ b/Tests/Verification/AdapterLoginPageVerification.cs
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,91 @@
 +using System.Runtime.CompilerServices;
 +using ShiroBot.Adapters;
 +using ShiroBot.Components.Reloading;
@@ -675,6 +675,12 @@ index d275e02..213d341 100644
 +            if (AdapterInstanceStore.GetConfig(configPath, "a")["uin"] is not string account || account != "123")
 +                throw new Exception("Legacy numeric QQ account was not migrated to a string.");
 +            var owner = adapters.GetDashboardOwner("a") ?? throw new Exception("Adapter dashboard owner missing.");
++            AdapterInstanceStore.Update(configPath, "a", item => item.Config["session_store"] = "{\"Uin\":123,\"DeviceName\":\"stored-device\",\"WLoginSigs\":{}}");
++            await Task.Delay(1200);
++            if (!ReferenceEquals(owner, adapters.GetDashboardOwner("a"))) throw new Exception("Session refresh restarted the adapter.");
++            if (!AdapterInstanceStore.GetConfig(configPath, "b").ContainsKey("session_store"))
++                throw new Exception("Instance B session field was lost.");
++            Console.WriteLine("Inline session field updates preserve instance isolation without restarting adapters.");
 +            var page = ShiroBot.Plugins.PluginDashboard.List(owner).Single();
 +            if (page.Id != "login" || page.Web is null) throw new Exception("Login web page not registered.");
 +            var html = await ShiroBot.Plugins.PluginDashboard.WebDocumentAsync(owner, "login", CancellationToken.None);
