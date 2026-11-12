@@ -39,7 +39,7 @@ index 501df6e..0c36d65 100644
  
              api.MapGet("/adapters/{id}/config", (string id) =>
 diff --git a/Core/Hosting/Http/HostHttpServer.Endpoints.cs b/Core/Hosting/Http/HostHttpServer.Endpoints.cs
-index 2d0d626..20baf95 100644
+index 2d0d626..8a2bf0c 100644
 --- a/Core/Hosting/Http/HostHttpServer.Endpoints.cs
 +++ b/Core/Hosting/Http/HostHttpServer.Endpoints.cs
 @@ -103,6 +103,7 @@ internal sealed partial class HostHttpServer
@@ -50,6 +50,287 @@ index 2d0d626..20baf95 100644
          HostRuntimeState runtimeState,
          ConfigManager configManager,
          AdapterManager adapterManager,
+@@ -113,6 +114,7 @@ internal sealed partial class HostHttpServer
+         public void Map(RouteGroupBuilder api)
+         {
+             MapAdapters(api);
++            MapDashboardPages(api, options.Value, "/adapters", adapterManager.GetDashboardOwner);
+             MapRawConfig(api);
+         }
+     }
+diff --git a/Core/Hosting/Http/HostHttpServer.Plugins.Pages.cs b/Core/Hosting/Http/HostHttpServer.Plugins.Pages.cs
+index 1efd5c7..076b4a6 100644
+--- a/Core/Hosting/Http/HostHttpServer.Plugins.Pages.cs
++++ b/Core/Hosting/Http/HostHttpServer.Plugins.Pages.cs
+@@ -23,12 +23,16 @@ internal sealed partial class HostHttpServer
+     {
+         public void Map(RouteGroupBuilder api)
+         {
+-            var config = options.Value;
++            MapDashboardPages(api, options.Value, "/plugins", id => FindLoadedPlugin(pluginManager, id));
++        }
++    }
+ 
+-            api.MapGet("/plugins/{id}/pages", (string id, HttpContext context) =>
++    private static void MapDashboardPages(RouteGroupBuilder api, ApiHostConfig config, string prefix, Func<string, IDashboardOwner?> find)
++    {
++            api.MapGet($"{prefix}/{{id}}/pages", (string id, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin)
++                if (find(id) is not { } plugin)
+                     return Results.NotFound(new { error = "plugin_not_found", message = $"未找到已加载插件: {id}" });
+                 return Results.Ok(new
+                 {
+@@ -43,12 +47,12 @@ internal sealed partial class HostHttpServer
+                 });
+             });
+ 
+-            MapPluginWebPageEndpoints(api, config, pluginManager);
++            MapDashboardWebPageEndpoints(api, config, prefix, find);
+ 
+-            api.MapPost("/plugins/{id}/pages/{pageId}/render", async (string id, string pageId, HttpContext context) =>
++            api.MapPost($"{prefix}/{{id}}/pages/{{pageId}}/render", async (string id, string pageId, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin)
++                if (find(id) is not { } plugin)
+                     return Results.NotFound(new { error = "plugin_not_found", message = $"未找到已加载插件: {id}" });
+                 if (await ReadPageRequestAsync(context).ConfigureAwait(false) is not { } body)
+                     return Results.BadRequest(new { error = "invalid_request", message = "请求内容无效。" });
+@@ -64,10 +68,10 @@ internal sealed partial class HostHttpServer
+                     : PageFailure(outcome.Status, outcome.Message, outcome.Errors);
+             });
+ 
+-            api.MapPost("/plugins/{id}/pages/{pageId}/events", async (string id, string pageId, HttpContext context) =>
++            api.MapPost($"{prefix}/{{id}}/pages/{{pageId}}/events", async (string id, string pageId, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin)
++                if (find(id) is not { } plugin)
+                     return Results.NotFound(new { error = "plugin_not_found", message = $"未找到已加载插件: {id}" });
+                 if (await ReadPageRequestAsync(context).ConfigureAwait(false) is not { } body ||
+                     body["event"] is not JsonObject e || PageString(e["kind"]) is not { } kind ||
+@@ -81,10 +85,10 @@ internal sealed partial class HostHttpServer
+                 return EventResponse(outcome);
+             });
+ 
+-            api.MapPost("/plugins/{id}/pages/{pageId}/upload", async (string id, string pageId, HttpContext context) =>
++            api.MapPost($"{prefix}/{{id}}/pages/{{pageId}}/upload", async (string id, string pageId, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin)
++                if (find(id) is not { } plugin)
+                     return Results.NotFound(new { error = "plugin_not_found", message = $"未找到已加载插件: {id}" });
+                 var query = context.Request.Query;
+                 JsonNode? state;
+@@ -107,10 +111,10 @@ internal sealed partial class HostHttpServer
+                 return EventResponse(outcome);
+             });
+ 
+-            api.MapGet("/plugins/{id}/pages/{pageId}/files", async (string id, string pageId, HttpContext context) =>
++            api.MapGet($"{prefix}/{{id}}/pages/{{pageId}}/files", async (string id, string pageId, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin)
++                if (find(id) is not { } plugin)
+                     return Results.NotFound(new { error = "plugin_not_found", message = $"未找到已加载插件: {id}" });
+                 var fileId = context.Request.Query["id"].ToString();
+                 if (string.IsNullOrWhiteSpace(fileId))
+@@ -125,7 +129,6 @@ internal sealed partial class HostHttpServer
+                 context.Response.RegisterForDispose(file.Content);
+                 return Results.File(file.Content, file.ContentType, enableRangeProcessing: true);
+             });
+-        }
+     }
+ 
+     private static IResult EventResponse(PluginPageOutcome<PluginPageEventResponse> outcome)
+diff --git a/Core/Hosting/Http/HostHttpServer.Plugins.WebPages.cs b/Core/Hosting/Http/HostHttpServer.Plugins.WebPages.cs
+index 0b6994b..dcb8f5a 100644
+--- a/Core/Hosting/Http/HostHttpServer.Plugins.WebPages.cs
++++ b/Core/Hosting/Http/HostHttpServer.Plugins.WebPages.cs
+@@ -9,15 +9,15 @@ namespace ShiroBot.Hosting.Http;
+ 
+ internal sealed partial class HostHttpServer
+ {
+-    private static void MapPluginWebPageEndpoints(RouteGroupBuilder api, ApiHostConfig config,
+-        PluginManager pluginManager)
++    private static void MapDashboardWebPageEndpoints(RouteGroupBuilder api, ApiHostConfig config,
++        string prefix, Func<string, IDashboardOwner?> find)
+     {
+-        api.MapMethods("/plugins/{id}/pages/{pageId}/web/request",
++        api.MapMethods($"{prefix}/{{id}}/pages/{{pageId}}/web/request",
+             ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+             async (string id, string pageId, HttpContext context) =>
+             {
+                 if (Unauthorized(context, config) is { } denied) return denied;
+-                if (FindLoadedPlugin(pluginManager, id) is not { } plugin) return Results.NotFound();
++                if (find(id) is not { } plugin) return Results.NotFound();
+                 PluginPageOutcome<bool> outcome;
+                 try
+                 {
+@@ -49,10 +49,10 @@ internal sealed partial class HostHttpServer
+                 return PageFailure(outcome.Status, outcome.Message, outcome.Errors);
+             });
+ 
+-        api.MapGet("/plugins/{id}/pages/{pageId}/web", async (string id, string pageId, HttpContext context) =>
++        api.MapGet($"{prefix}/{{id}}/pages/{{pageId}}/web", async (string id, string pageId, HttpContext context) =>
+         {
+             if (Unauthorized(context, config) is { } denied) return denied;
+-            if (FindLoadedPlugin(pluginManager, id) is not { } plugin) return Results.NotFound();
++            if (find(id) is not { } plugin) return Results.NotFound();
+             context.Response.Headers.CacheControl = "no-store";
+             var outcome = await PluginDashboard.WebDocumentAsync(plugin, pageId, context.RequestAborted)
+                 .ConfigureAwait(false);
+@@ -61,10 +61,10 @@ internal sealed partial class HostHttpServer
+                 : PageFailure(outcome.Status, outcome.Message, null);
+         });
+ 
+-        api.MapGet("/plugins/{id}/pages/{pageId}/web/assets", async (string id, string pageId, HttpContext context) =>
++        api.MapGet($"{prefix}/{{id}}/pages/{{pageId}}/web/assets", async (string id, string pageId, HttpContext context) =>
+         {
+             if (Unauthorized(context, config) is { } denied) return denied;
+-            if (FindLoadedPlugin(pluginManager, id) is not { } plugin) return Results.NotFound();
++            if (find(id) is not { } plugin) return Results.NotFound();
+             var outcome = await PluginDashboard
+                 .WebAssetAsync(plugin, pageId, context.Request.Query["path"].ToString(), context.RequestAborted)
+                 .ConfigureAwait(false);
+@@ -77,10 +77,10 @@ internal sealed partial class HostHttpServer
+             return Results.File(file.Content, file.ContentType);
+         });
+ 
+-        api.MapPost("/plugins/{id}/pages/{pageId}/web/call", async (string id, string pageId, HttpContext context) =>
++        api.MapPost($"{prefix}/{{id}}/pages/{{pageId}}/web/call", async (string id, string pageId, HttpContext context) =>
+         {
+             if (Unauthorized(context, config) is { } denied) return denied;
+-            if (FindLoadedPlugin(pluginManager, id) is not { } plugin) return Results.NotFound();
++            if (find(id) is not { } plugin) return Results.NotFound();
+             if (await ReadPageRequestAsync(context).ConfigureAwait(false) is not { } body ||
+                 PageString(body["action"]) is not { } action)
+                 return Results.BadRequest(new { error = "invalid_request", message = "请求内容无效。" });
+diff --git a/Core/Plugins/LoadedPluginHandle.cs b/Core/Plugins/LoadedPluginHandle.cs
+index 0464550..741b393 100644
+--- a/Core/Plugins/LoadedPluginHandle.cs
++++ b/Core/Plugins/LoadedPluginHandle.cs
+@@ -15,7 +15,7 @@ using ShiroBot.SDK.Plugin;
+ 
+ namespace ShiroBot.Plugins;
+ 
+-internal sealed class LoadedPluginHandle
++internal sealed class LoadedPluginHandle : IDashboardOwner
+ {
+     private static readonly TimeSpan DefaultActiveDispatchDrainTimeout = TimeSpan.FromSeconds(30);
+     private static readonly TimeSpan DefaultPluginOnUnloadTimeout = TimeSpan.FromSeconds(30);
+@@ -101,6 +101,7 @@ internal sealed class LoadedPluginHandle
+     }
+ 
+     /// <summary>插件注册的 Dashboard 页面；卸载后为 null。</summary>
++    PluginDashboardScope? IDashboardOwner.Dashboard => Dashboard;
+     internal PluginDashboardScope? Dashboard => _context?.DashboardScope;
+ 
+     public string Name { get; }
+diff --git a/Core/Plugins/PluginDashboard.Web.cs b/Core/Plugins/PluginDashboard.Web.cs
+index 13fd7c7..d0a2c40 100644
+--- a/Core/Plugins/PluginDashboard.Web.cs
++++ b/Core/Plugins/PluginDashboard.Web.cs
+@@ -17,7 +17,7 @@ internal static partial class PluginDashboard
+                path.Split('/').All(part => part.Length > 0 && part is not "." and not "..");
+     }
+ 
+-    public static Task<PluginPageOutcome<string>> WebDocumentAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<string>> WebDocumentAsync(IDashboardOwner plugin, string pageId,
+         CancellationToken ct)
+     {
+         return RunAsync(plugin, pageId, "读取网页", async page =>
+@@ -28,7 +28,7 @@ internal static partial class PluginDashboard
+         });
+     }
+ 
+-    public static Task<PluginPageOutcome<PluginPageFile>> WebAssetAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<PluginPageFile>> WebAssetAsync(IDashboardOwner plugin, string pageId,
+         string path, CancellationToken ct)
+     {
+         return RunAsync(plugin, pageId, "读取网页资源", async page =>
+@@ -42,7 +42,7 @@ internal static partial class PluginDashboard
+         });
+     }
+ 
+-    public static Task<PluginPageOutcome<JsonNode?>> WebCallAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<JsonNode?>> WebCallAsync(IDashboardOwner plugin, string pageId,
+         string action,
+         JsonNode? arguments, CancellationToken ct)
+     {
+diff --git a/Core/Plugins/PluginDashboard.WebRequests.cs b/Core/Plugins/PluginDashboard.WebRequests.cs
+index 584a760..8745db8 100644
+--- a/Core/Plugins/PluginDashboard.WebRequests.cs
++++ b/Core/Plugins/PluginDashboard.WebRequests.cs
+@@ -49,7 +49,7 @@ internal static partial class PluginDashboard
+         return true;
+     }
+ 
+-    public static Task<PluginPageOutcome<bool>> WebRequestAsync(LoadedPluginHandle plugin, string pageId, string target,
++    public static Task<PluginPageOutcome<bool>> WebRequestAsync(IDashboardOwner plugin, string pageId, string target,
+         HttpContext http)
+     {
+         return RunAsync(plugin, pageId, "处理网页请求", async page =>
+diff --git a/Core/Plugins/PluginDashboard.cs b/Core/Plugins/PluginDashboard.cs
+index c3398d4..34cccfc 100644
+--- a/Core/Plugins/PluginDashboard.cs
++++ b/Core/Plugins/PluginDashboard.cs
+@@ -53,7 +53,7 @@ internal static partial class PluginDashboard
+     private const int MaxStateKeys = 64;
+     private const int MaxStateValue = 2000;
+ 
+-    public static IReadOnlyList<DashboardPageRegistration> List(LoadedPluginHandle plugin)
++    public static IReadOnlyList<DashboardPageRegistration> List(IDashboardOwner plugin)
+     {
+         return plugin.Dashboard?.Pages ?? [];
+     }
+@@ -67,7 +67,7 @@ internal static partial class PluginDashboard
+             .ToDictionary(pair => pair.Key, pair => pair.Value!, StringComparer.Ordinal);
+     }
+ 
+-    public static Task<PluginPageOutcome<PluginPageView>> RenderAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<PluginPageView>> RenderAsync(IDashboardOwner plugin, string pageId,
+         Dictionary<string, string> state, CancellationToken cancellationToken)
+     {
+         return RunAsync(plugin, pageId, "渲染页面", async page =>
+@@ -80,7 +80,7 @@ internal static partial class PluginDashboard
+         });
+     }
+ 
+-    public static Task<PluginPageOutcome<PluginPageEventResponse>> EventAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<PluginPageEventResponse>> EventAsync(IDashboardOwner plugin, string pageId,
+         Dictionary<string, string> state, PluginPageEvent pageEvent, CancellationToken cancellationToken)
+     {
+         return RunAsync(plugin, pageId, "执行页面操作", async page =>
+@@ -120,7 +120,7 @@ internal static partial class PluginDashboard
+     }
+ 
+     /// <summary>上传：先渲染找到上传组件和它的限制，按限制读取请求体，再交给处理函数。</summary>
+-    public static Task<PluginPageOutcome<PluginPageEventResponse>> UploadAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<PluginPageEventResponse>> UploadAsync(IDashboardOwner plugin, string pageId,
+         Dictionary<string, string> state, string elementId, string fileName, string contentType, Stream body,
+         long? contentLength,
+         CancellationToken cancellationToken)
+@@ -169,7 +169,7 @@ internal static partial class PluginDashboard
+     }
+ 
+     /// <summary>在插件调用结束前打开宿主拥有的流，文件删除或热卸载不影响正在发送的响应。</summary>
+-    public static Task<PluginPageOutcome<PluginPageFile>> OpenFileAsync(LoadedPluginHandle plugin, string pageId,
++    public static Task<PluginPageOutcome<PluginPageFile>> OpenFileAsync(IDashboardOwner plugin, string pageId,
+         string fileId,
+         CancellationToken cancellationToken)
+     {
+@@ -210,7 +210,7 @@ internal static partial class PluginDashboard
+         return new PluginPageEventResponse(result, next, view);
+     }
+ 
+-    private static async Task<PluginPageOutcome<T>> RunAsync<T>(LoadedPluginHandle plugin, string pageId,
++    private static async Task<PluginPageOutcome<T>> RunAsync<T>(IDashboardOwner plugin, string pageId,
+         string operation,
+         Func<DashboardPageRegistration, Task<PluginPageOutcome<T>>> work)
+     {
 diff --git a/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs b/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs
 index c4d2127..ed586da 100644
 --- a/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs
@@ -78,13 +359,17 @@ index c4d2127..ed586da 100644
  
      // 模拟接收循环和心跳：只登记到 Lifetime，StopAsync 不做清理。宿主没停掉它们的话，
 diff --git a/Tests/Verification/Program.cs b/Tests/Verification/Program.cs
-index d275e02..de6814d 100644
+index d275e02..213d341 100644
 --- a/Tests/Verification/Program.cs
 +++ b/Tests/Verification/Program.cs
-@@ -41,6 +41,10 @@ using ShiroBot.Verification;
+@@ -41,6 +41,14 @@ using ShiroBot.Verification;
  [assembly: ShiroBotApiCompatibility("legacy-ignored", "legacy-ignored")]
  switch (args)
  {
++    case ["--adapter-login-page", var loginAdapterPath]:
++        await AdapterLoginPageVerification.RunAsync(loginAdapterPath);
++        return;
++
 +    case ["--adapter-actions"]:
 +        await AdapterActionsVerification.RunAsync();
 +        return;
@@ -103,6 +388,28 @@ index d275e02..de6814d 100644
      string adapterRoot,
      SharedAssemblyResolver sharedAssemblies,
      ModelPackageRegistry modelPackages,
+@@ -793,7 +793,12 @@
+     /// <summary>每次启动换一个新的生命周期作用域，配置触发的重启也拿到干净的作用域。</summary>
+     internal static Task StartAdapterAsync(IBotAdapter adapter)
+     {
+-        if (adapter is ILifetimeAwareAdapter aware) aware.Lifetime = new PluginLifetimeScope();
++        if (adapter is ILifetimeAwareAdapter aware)
++        {
++            var lifetime = new PluginLifetimeScope();
++            aware.Lifetime = lifetime;
++            RegisterDashboard(adapter, lifetime);
++        }
+         return adapter.StartAsync();
+     }
+ 
+@@ -809,6 +814,7 @@
+         if (scope is null) return;
+         await scope.StopTasksAsync().ConfigureAwait(false);
+         await scope.DisposeResourcesAsync().ConfigureAwait(false);
++        DashboardOwners.Remove(adapter);
+     }
+ 
+     /// <summary>
 --- /dev/null
 +++ b/Core/Adapters/AdapterManager.Actions.cs
 @@ -0,0 +1,43 @@
@@ -148,6 +455,52 @@ index d275e02..de6814d 100644
 +    private static IReadOnlyList<PluginActionDescriptor> ReadActions(IPluginActionProvider? provider) =>
 +        provider?.Actions.Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Label))
 +            .DistinctBy(x => x.Id).ToArray() ?? [];
++}
+--- /dev/null
++++ b/Core/Adapters/AdapterManager.Dashboard.cs
+@@ -0,0 +1,33 @@
++using System.Runtime.CompilerServices;
++using ShiroBot.Plugins;
++using ShiroBot.Plugins.Dashboard;
++using ShiroBot.Plugins.Services;
++using ShiroBot.SDK.Core;
++using ShiroBot.SDK.Dashboard;
++
++namespace ShiroBot.Adapters;
++internal sealed partial class AdapterManager
++{
++    private static readonly ConditionalWeakTable<IBotAdapter, AdapterDashboardOwner> DashboardOwners = new();
++    internal IDashboardOwner? GetDashboardOwner(string id)
++    {
++        lock (_sync)
++            return _entries.TryGetValue(id, out var entry) && entry.Adapter is { } adapter &&
++                DashboardOwners.TryGetValue(adapter, out var owner) ? owner : null;
++    }
++
++    private static void RegisterDashboard(IBotAdapter adapter, PluginLifetimeScope lifetime)
++    {
++        if (adapter.GetExtension<Action<IPluginDashboard>>() is not { } register) return;
++        var dashboard = new PluginDashboardScope(async work =>
++        {
++            if (lifetime.Stopping.IsCancellationRequested) return false;
++            try { await lifetime.Run(_ => work()).ConfigureAwait(false); return true; }
++            catch (ObjectDisposedException) when (lifetime.Stopping.IsCancellationRequested) { return false; }
++        }, lifetime);
++        DashboardOwners.Remove(adapter);
++        DashboardOwners.Add(adapter, new AdapterDashboardOwner(adapter.GetType().Name, dashboard));
++        register(dashboard);
++    }
++    private sealed record AdapterDashboardOwner(string Name, PluginDashboardScope? Dashboard) : IDashboardOwner;
++}
+--- /dev/null
++++ b/Core/Plugins/IDashboardOwner.cs
+@@ -0,0 +1,7 @@
++using ShiroBot.Plugins.Dashboard;
++namespace ShiroBot.Plugins;
++internal interface IDashboardOwner
++{
++    string Name { get; }
++    PluginDashboardScope? Dashboard { get; }
 +}
 --- /dev/null
 +++ b/Core/Hosting/Http/HostHttpServer.Adapters.Actions.cs
@@ -260,5 +613,73 @@ index d275e02..de6814d 100644
 +            await adapters.StopByIdAsync("a");
 +            try { Directory.Delete(root, true); } catch (IOException) { }
 +        }
++    }
++}
+--- /dev/null
++++ b/Tests/Verification/AdapterLoginPageVerification.cs
+@@ -0,0 +1,65 @@
++using System.Runtime.CompilerServices;
++using ShiroBot.Adapters;
++using ShiroBot.Components.Reloading;
++using ShiroBot.Components.Updates;
++using ShiroBot.Configuration;
++using ShiroBot.Hosting.Context;
++using ShiroBot.Hosting.Events;
++using ShiroBot.Hosting.Logging;
++using ShiroBot.Hosting.Runtime;
++using ShiroBot.Packages;
++using ShiroBot.Plugins;
++using ShiroBot.Plugins.Loading;
++using ShiroBot.SDK.Core;
++using ShiroBot.SDK.Models;
++using ProbePlugin = ShiroBot.SharedContractPluginProbe.SharedContractPluginProbe;
++
++namespace ShiroBot.Verification;
++
++internal static class AdapterLoginPageVerification
++{
++    internal static async Task RunAsync(string adapterPath)
++    {
++        var root = Path.Combine(Path.GetTempPath(), "ShiroBot.AdapterActions", Guid.NewGuid().ToString("N"));
++        Directory.CreateDirectory(root);
++        var path = Path.Combine(root, "Probe.dll");
++        File.Copy(adapterPath, path);
++        var shared = new SharedAssemblyResolver();
++        var models = new ModelPackageRegistry(shared);
++        models.RegisterBuiltIn(typeof(ShiroBot.Model.QQ.QFriend).Assembly);
++        var logs = new HostLogHub();
++        var runtime = new HostRuntimeState(DateTimeOffset.UtcNow);
++        var context = new BotContext(null, [], [], new WebHostContext("http://127.0.0.1", false), logs);
++        var dispatcher = new HostEventDispatcher(new Lock(), context.ReplySubscriptions, runtime, logs);
++        var adapters = new AdapterManager(root, shared, models, context, new AdapterEventBridge(dispatcher),
++            runtime, logs);
++        var configPath = Path.Combine(root, "config.toml");
++        AdapterInstanceStore.Write(configPath, [new PackageAdapterInstance { Id = "a", Enabled = true }], true);
++        var instance = new InstalledAdapterInstance("a", "lagrange", path, configPath, true, "Actions");
++        try
++        {
++            await adapters.LoadInstanceAsync(instance);
++            var owner = adapters.GetDashboardOwner("a") ?? throw new Exception("Adapter dashboard owner missing.");
++            var page = ShiroBot.Plugins.PluginDashboard.List(owner).Single();
++            if (page.Id != "login" || page.Web is null) throw new Exception("Login web page not registered.");
++            var html = await ShiroBot.Plugins.PluginDashboard.WebDocumentAsync(owner, "login", CancellationToken.None);
++            if (html.Status != ShiroBot.Plugins.PluginPageStatus.Done || !html.Value!.Contains("账号密码登录"))
++                throw new Exception("Embedded login page could not be read.");
++            page = null!;
++            var state = await ShiroBot.Plugins.PluginDashboard.WebCallAsync(owner, "login", "status", null, CancellationToken.None);
++            if (state.Status != ShiroBot.Plugins.PluginPageStatus.Done || state.Value?["status"]?.GetValue<string>() != "ready")
++                throw new Exception("Login page status call failed.");
++            var invalid = await ShiroBot.Plugins.PluginDashboard.WebCallAsync(owner, "login", "password-login",
++                new System.Text.Json.Nodes.JsonObject { ["uin"] = "invalid", ["password"] = "test-secret" }, CancellationToken.None);
++            if (invalid.Status == ShiroBot.Plugins.PluginPageStatus.Done || File.ReadAllText(configPath).Contains("test-secret"))
++                throw new Exception("Invalid credentials accepted or password persisted.");
++            try { await adapters.StopByIdAsync("a"); }
++            catch (ComponentUnloadPendingException) { Console.WriteLine("Adapter stopped; full assembly collection still requires host restart."); }
++            if (adapters.GetDashboardOwner("a") is not null) throw new Exception("Stopped dashboard still registered.");
++            var stopped = await ShiroBot.Plugins.PluginDashboard.WebCallAsync(owner, "login", "status", null, CancellationToken.None);
++            if (stopped.Status == ShiroBot.Plugins.PluginPageStatus.Done) throw new Exception("Stopped page remained callable.");
++            Console.WriteLine("Adapter login page: registration, embedded HTML, bridge status, input validation and lifetime checks passed.");
++        }
++        finally { await adapters.StopByIdAsync("a"); try { Directory.Delete(root, true); } catch (IOException) { } }
 +    }
 +}

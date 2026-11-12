@@ -1,24 +1,101 @@
 diff --git a/src/views/adapters/components/AdapterDetail.vue b/src/views/adapters/components/AdapterDetail.vue
-index 42b4dc8..561acbf 100644
+index 42b4dc8..cb3d731 100644
 --- a/src/views/adapters/components/AdapterDetail.vue
 +++ b/src/views/adapters/components/AdapterDetail.vue
-@@ -42,6 +42,8 @@
+@@ -42,6 +42,10 @@
        <AdapterMarketFacts :entry="marketEntry" :repository="adapter.repository" />
      </dl>
  
 +    <AdapterActions :id="adapter.id" :loaded="adapter.loaded" :busy="busy" />
 +
++    <AdapterPages :id="adapter.id" :loaded="adapter.loaded" />
++
      <footer class="detail-foot button-group">
        <button type="button" class="md-button tonal" :disabled="busy" @click="emit('config')">
          <MdIcon name="settings" />配置
-@@ -55,6 +57,7 @@
+@@ -55,6 +59,8 @@
  
  <script setup lang="ts">
  import AdapterMarketFacts from './AdapterMarketFacts.vue'
 +import AdapterActions from './AdapterActions.vue'
++import AdapterPages from './AdapterPages.vue'
  import MdIcon from '../../../components/MdIcon.vue'
  import type { AdapterMarketEntry, AdapterStatus } from '../../../api'
  
+diff --git a/src/views/pluginPages/WebPagePanel.vue b/src/views/pluginPages/WebPagePanel.vue
+index 9ddf009..e83572a 100644
+--- a/src/views/pluginPages/WebPagePanel.vue
++++ b/src/views/pluginPages/WebPagePanel.vue
+@@ -11,19 +11,23 @@
+ <script setup lang="ts">
+ import { onBeforeUnmount, ref, watch } from 'vue'
+ import { getPluginWebPage, type PluginPage } from '../../api/plugins/pages'
+-import { getApiErrorMessage } from '../../api/core/http'
++import { getApiErrorMessage, apiRequest, apiBlobRequest, apiPluginResponse } from '../../api/core/http'
++import { serveWebRequest } from './webRequest'
+ import { webPageDocument } from './webBridge'
+ import { createWebBridgeHost } from './webBridgeHost'
+ 
+-const props = defineProps<{ pluginId: string; definition: PluginPage }>()
++const props = defineProps<{ pluginId: string; definition: PluginPage; ownerKind?: 'plugins' | 'adapters' }>()
+ const frame = ref<HTMLIFrameElement>(), document = ref(''), loading = ref(false), error = ref(''), revision = ref(0)
+ let controller: AbortController | undefined, port: MessagePort | undefined, loads = 0, nonce = ''
++function pagePath() { return `/api/v1/adapters/${encodeURIComponent(props.pluginId)}/pages/${encodeURIComponent(props.definition.id)}` }
+ function close() { controller?.abort(); port?.close(); port = undefined }
+ async function load() {
+   close(); document.value = ''; loads = 0; nonce = crypto.randomUUID(); revision.value++; error.value = ''; loading.value = true
+   const request = controller = new AbortController()
+   try {
+-    const result = await getPluginWebPage(props.pluginId, props.definition.id, request.signal)
++    const result = props.ownerKind === 'adapters'
++      ? await apiRequest<{ html: string }>(`${pagePath()}/web`, { signal: request.signal })
++      : await getPluginWebPage(props.pluginId, props.definition.id, request.signal)
+     if (!request.signal.aborted) document.value = webPageDocument(result.html, nonce, props.definition.strict_dom === true)
+   } catch (cause) { if (!request.signal.aborted) error.value = getApiErrorMessage(cause, '网页加载失败。') }
+   finally { if (controller === request) loading.value = false }
+@@ -38,13 +42,19 @@ function connect(event: Event) {
+   const handle = createWebBridgeHost({
+     pluginId: props.pluginId, pageId: props.definition.id, title: props.definition.title,
+     confirmations: props.definition.confirmations, nonce, signal: controller.signal,
++    services: props.ownerKind === 'adapters' ? {
++      call: (_id, _page, action, args, signal) => apiRequest(`${pagePath()}/web/call`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, arguments: args }), signal }),
++      asset: (_id, _page, path, signal) => apiBlobRequest(`${pagePath()}/web/assets?${new URLSearchParams({ path })}`, { signal }),
++      request: (id, page, data, abort, respond, release) => serveWebRequest(id, page, data, abort, respond, release,
++        (_id, _page, path, init) => apiPluginResponse(`${pagePath()}/web/request?${new URLSearchParams({ path })}`, init))
++    } : undefined,
+     post: (message, transfer = []) => port1.postMessage(message, transfer), close: () => port1.close()
+   })
+   port1.onmessage = ({ data }: MessageEvent<unknown>) => void handle(data)
+   port1.start()
+   target.contentWindow.postMessage({ type: 'shirobot-web-init' }, '*', [port2])
+ }
+-watch(() => [props.pluginId, props.definition.id], () => void load(), { immediate: true })
++watch(() => [props.pluginId, props.definition.id, props.ownerKind], () => void load(), { immediate: true })
+ onBeforeUnmount(close)
+ </script>
+ <style scoped>
+diff --git a/src/views/pluginPages/webRequest.ts b/src/views/pluginPages/webRequest.ts
+index 0ffeb86..e4c211f 100644
+--- a/src/views/pluginPages/webRequest.ts
++++ b/src/views/pluginPages/webRequest.ts
+@@ -41,7 +41,7 @@ export function pageRequestInit(data: WebBridgeMessage, signal: AbortSignal): Re
+ 
+ /** Response data is pulled one chunk at a time, transferred rather than buffered as one large postMessage. */
+ export async function serveWebRequest(pluginId: string, pageId: string, data: WebBridgeMessage, controller: AbortController,
+-  respond: (value: object, transfer?: Transferable[]) => void, release: () => void) {
++  respond: (value: object, transfer?: Transferable[]) => void, release: () => void, request = requestPluginWebPage) {
+   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined, port: MessagePort | undefined
+   let finished = false, pulling = false, bytes = 0
+   const finish = () => {
+@@ -52,7 +52,7 @@ export async function serveWebRequest(pluginId: string, pageId: string, data: We
+   const aborted = () => { port?.postMessage({ error: '请求已取消。' }); finish() }
+   controller.signal.addEventListener('abort', aborted, { once: true })
+   try {
+-    const response = await requestPluginWebPage(pluginId, pageId, pageRequestPath(data.path!), pageRequestInit(data, controller.signal))
++    const response = await request(pluginId, pageId, pageRequestPath(data.path!), pageRequestInit(data, controller.signal))
+     if (controller.signal.aborted) { finish(); return }
+     const headers = [...response.headers].filter(([name]) => responseHeaders.has(name) || name.startsWith('x-') && !/auth|token|key/.test(name))
+     if (!response.body || data.method?.toUpperCase() === 'HEAD' || [204, 205, 304].includes(response.status)) {
 --- /dev/null
 +++ b/src/views/adapters/components/AdapterActions.vue
 @@ -0,0 +1,53 @@
@@ -74,4 +151,31 @@ index 42b4dc8..561acbf 100644
 +    if (cause !== 'cancel' && cause !== 'close') ElMessage.error(getApiErrorMessage(cause, '适配器操作失败'))
 +  } finally { running.value = '' }
 +}
++</script>
+--- /dev/null
++++ b/src/views/adapters/components/AdapterPages.vue
+@@ -0,0 +1,24 @@
++<template>
++  <section v-if="loaded && (pages.length || error)">
++    <p v-if="error" role="alert">{{ error }}</p>
++    <div v-if="pages.length > 1" class="button-group"><button v-for="page in pages" :key="page.id" class="md-button tonal" @click="selected = page.id">{{ page.title }}</button></div>
++    <WebPagePanel v-if="active" :key="id + active.id" :plugin-id="id" :definition="active" owner-kind="adapters" />
++  </section>
++</template>
++<script setup lang="ts">
++import { computed, ref, watch } from 'vue'
++import { apiRequest, getApiErrorMessage, type PluginPage } from '../../../api'
++import WebPagePanel from '../../pluginPages/WebPagePanel.vue'
++const props = defineProps<{ id: string; loaded: boolean }>()
++const pages = ref<PluginPage[]>([]), error = ref(''), selected = ref('')
++const active = computed(() => pages.value.find(x => x.id === selected.value) || pages.value[0])
++let generation = 0
++watch(() => [props.id, props.loaded], async () => {
++  const current = ++generation; pages.value = []; error.value = ''
++  if (!props.loaded) return
++  try {
++    const result = await apiRequest<{ pages: PluginPage[] }>(`/api/v1/adapters/${encodeURIComponent(props.id)}/pages`)
++    if (current === generation) pages.value = result.pages.filter(x => x.kind === 'web')
++  } catch (cause) { if (current === generation) error.value = getApiErrorMessage(cause, '适配器页面加载失败。') }
++}, { immediate: true })
 +</script>

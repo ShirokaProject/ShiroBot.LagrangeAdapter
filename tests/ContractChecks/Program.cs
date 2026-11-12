@@ -190,6 +190,16 @@ if (adapter is not ShiroBot.SDK.Config.IConfigurableAdapter ||
     throw new Exception("Adapter must expose the typed config schema.");
 Console.WriteLine("Host configuration key and typed schema checks passed.");
 
+foreach (var property in typeof(LagrangeAdapterConfig).GetProperties())
+{
+    var field = property.GetCustomAttribute<ShiroBot.SDK.Config.ConfigFieldAttribute>();
+    if (field is null || string.IsNullOrWhiteSpace(field.Label) || string.IsNullOrWhiteSpace(field.Description) || string.IsNullOrWhiteSpace(field.Group))
+        throw new Exception($"Missing dashboard config annotation: {property.Name}");
+}
+var registerPage = adapter.GetExtension<Action<ShiroBot.SDK.Dashboard.IPluginDashboard>>();
+if (registerPage is null) throw new Exception("Adapter must expose a Dashboard registration callback.");
+Console.WriteLine("Chinese config annotations and adapter dashboard registration checks passed.");
+
 sealed class SignHandler : HttpMessageHandler
 {
     public bool Checked { get; private set; }
