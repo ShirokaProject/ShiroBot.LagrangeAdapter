@@ -1,6 +1,6 @@
 # QQ 非官方能力对齐状态
 
-基准：ShiroBot.SDK 1.0.2 与 LagrangeDev/Lagrange.Core master `fe789c4a23796fbc82fa09e70a9c44c8a5cf2948`。该仓库 master 是继续维护的 V2；旧 LagrangeV2 仓库停在迁移公告，不再作为能力判断依据。
+基准：ShiroBot.SDK 1.0.3 与 LagrangeDev/Lagrange.Core master `fe789c4a23796fbc82fa09e70a9c44c8a5cf2948`。该仓库 master 是继续维护的 V2；旧 LagrangeV2 仓库停在迁移公告，不再作为能力判断依据。
 
 | SDK 范围 | 已接入 | 缺失或受限 |
 | --- | --- | --- |

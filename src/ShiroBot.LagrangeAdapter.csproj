@@ -2,9 +2,9 @@
   <Import Project="../build/Package.props" />
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
-    <Version>0.1.0</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.1.1</Version>
+    <AssemblyVersion>0.1.1.0</AssemblyVersion>
+    <FileVersion>0.1.1.0</FileVersion>
     <Authors>ShirokaProject</Authors>
     <Company>ShirokaProject</Company>
     <Product>ShiroBot Lagrange V2 Adapter</Product>
@@ -21,8 +21,8 @@
     <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="ShiroBot.SDK" Version="1.0.2" />
-    <PackageReference Include="Net.Codecrete.QrCodeGenerator" Version="3.0.0" />
+    <PackageReference Include="ShiroBot.SDK" Version="1.0.3" />
+    <PackageReference Include="Net.Codecrete.QrCodeGenerator" Version="3.2.1" />
     <ProjectReference Include="../external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
     <EmbeddedResource Include="Dashboard/index.html" LogicalName="dashboard/index.html" />
   </ItemGroup>

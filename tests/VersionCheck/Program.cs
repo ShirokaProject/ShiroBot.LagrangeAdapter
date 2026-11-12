@@ -46,6 +46,8 @@ string AttributeName(CustomAttribute attribute)
     {
         { Kind: HandleKind.TypeReference } => reader.GetString(reader.GetTypeReference((TypeReferenceHandle)type).Name),
         { Kind: HandleKind.TypeDefinition } => reader.GetString(reader.GetTypeDefinition((TypeDefinitionHandle)type).Name),
+        // Generic attributes have TypeSpecification parents and cannot be either attribute checked here.
+        { Kind: HandleKind.TypeSpecification } => string.Empty,
         _ => throw new BadImageFormatException("Unsupported attribute type.")
     };
 }

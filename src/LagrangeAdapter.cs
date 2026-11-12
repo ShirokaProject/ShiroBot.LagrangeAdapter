@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.0")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.1")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.0",
+    Version = "0.1.1",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、扫码与会话快速登录。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -403,7 +403,8 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         context.EventInvoker.RegisterEvent<BotLogEvent>((_, e) =>
         {
             if (e.Level < context.Config.LogLevel) return;
-            var text = $"[Lagrange][{e.Tag}] {e.Message}";
+            var detail = e.Exception is null ? e.Message : $"{e.Message}\n{DescribeLoginFailure(e.Exception, config)}";
+            var text = $"[Lagrange][{e.Tag}] {detail}";
             switch (e.Level)
             {
                 case LogLevel.Critical:

@@ -6,13 +6,24 @@ namespace ShiroBot.LagrangeAdapter;
 
 internal static class LagrangeConnectionOptions
 {
-    internal static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
+    // Equivalent options otherwise share a framework metadata cache across collectible loads.
+    // A resolver owned by this assembly keeps another running instance from pinning our types.
+    internal static readonly JsonSerializerOptions Json = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        TypeInfoResolver = new LagrangeJsonContext()
+    };
+
+    internal static readonly JsonSerializerOptions SessionJson = new()
+    {
+        TypeInfoResolver = new LagrangeJsonContext()
+    };
 
     internal static BotAppInfo ResolveAppInfo(Protocols protocol, JsonObject? overrides)
     {
         if (!BotAppInfo.ProtocolToAppInfo.TryGetValue(protocol, out var defaults))
             throw new ArgumentException($"不支持的协议: {protocol}");
-        var node = JsonSerializer.SerializeToNode(defaults)!.AsObject();
+        var node = JsonSerializer.SerializeToNode(defaults, Json)!.AsObject();
         if (overrides is null)
             return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
         {

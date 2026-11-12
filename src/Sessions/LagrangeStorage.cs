@@ -42,7 +42,7 @@ internal static class LagrangeStorage
             if (stored is not string json) throw new InvalidDataException("session_store 必须是 JSON 字符串。");
             return string.IsNullOrWhiteSpace(json)
                 ? null
-                : JsonSerializer.Deserialize<BotKeystore>(json) ??
+                : JsonSerializer.Deserialize<BotKeystore>(json, LagrangeConnectionOptions.SessionJson) ??
                   throw new InvalidDataException("session_store 内容为空。");
         }
 
@@ -53,17 +53,17 @@ internal static class LagrangeStorage
         BotKeystore? legacy = null;
         if (File.Exists(legacyPath))
         {
-            var saved = JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(legacyPath));
+            var saved = JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(legacyPath), LagrangeConnectionOptions.SessionJson);
             if (saved is not null && (!string.IsNullOrWhiteSpace(config.KeystorePath) ||
                                       config.AccountUin > 0 && saved.Uin == config.AccountUin))
                 legacy = saved;
         }
 
         // An explicit empty value prevents a later deleted session being reimported from a legacy file.
-        context.SetValue("session_store", legacy is null ? "" : JsonSerializer.Serialize(legacy));
+        context.SetValue("session_store", legacy is null ? "" : JsonSerializer.Serialize(legacy, LagrangeConnectionOptions.SessionJson));
         return legacy;
     }
 
     internal static void SaveSession(IConfigContext context, BotKeystore keystore) =>
-        context.SetValue("session_store", JsonSerializer.Serialize(keystore));
+        context.SetValue("session_store", JsonSerializer.Serialize(keystore, LagrangeConnectionOptions.SessionJson));
 }
