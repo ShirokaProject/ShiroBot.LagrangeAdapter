@@ -378,13 +378,10 @@ public sealed class LagrangeAdapterConfig
     [ConfigField("相对适配器配置目录解析，例如 appinfo.example.json。JSON 可只填写需要覆盖的字段。", Label = "AppInfo 文件路径", Group = "protocol", GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 30, Placeholder = "appinfo.example.json")]
     public string? AppInfoPath { get; set; } = "";
 
-    /// <summary>Milky 模式填签名基础地址，Lagrange 模式填完整 POST 端点；留空使用上游默认服务。</summary>
-    [ConfigField("留空使用上游内置服务。Milky 模式填写基础地址；Lagrange 模式填写完整端点。", Label = "签名服务地址", Group = "sign", GroupLabel = "签名服务", GroupOrder = 30, Order = 20, Placeholder = "http://127.0.0.1:8080")]
+    /// <summary>Lagrange V2 签名基础地址，自动追加 api/sign/sec-sign；留空使用上游默认服务。</summary>
+    [ConfigField("填写基础地址，自动追加 /api/sign/sec-sign；留空使用上游内置服务。", Label = "签名服务地址", Group = "sign", GroupLabel = "签名服务", GroupOrder = 30, Order = 20, Placeholder = "http://127.0.0.1:8080")]
     public string? SignServer { get; set; } = "";
 
-    /// <summary>Milky: SignServer 为基础地址，追加 sign/sec-sign；Lagrange: SignServer 为完整 POST 端点。</summary>
-    [ConfigField("Milky：基础地址后追加 sign/sec-sign；Lagrange：使用完整 POST 地址。", Label = "签名接口协议", Group = "sign", GroupLabel = "签名服务", GroupOrder = 30, Order = 10, Type = "select", Options = new[] { "Milky", "Lagrange" })]
-    public string SignApi { get; set; } = "Lagrange";
     /// <summary>签名请求的 Bearer Token，留空不发送 Authorization。</summary>
     [ConfigField("以 Authorization: Bearer 发送。需要同时填写签名服务地址。", Label = "签名服务 Token", Group = "sign", GroupLabel = "签名服务", GroupOrder = 30, Order = 30, Type = "password")]
     public string SignToken { get; set; } = "";
@@ -429,7 +426,6 @@ public sealed class LagrangeAdapterConfig
             throw new ArgumentException($"未知协议: {Protocol}");
         if (!Enum.TryParse<Lagrange.Core.Events.EventArgs.LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
             throw new ArgumentException($"未知日志等级: {LogLevel}");
-        if (SignApi is not ("Lagrange" or "Milky")) throw new ArgumentException("SignApi 必须是 Lagrange 或 Milky。");
         if (SignTimeoutSeconds <= 0 || SignTimeoutSeconds > 600) throw new ArgumentOutOfRangeException(nameof(SignTimeoutSeconds));
         if (HighwayChunkSize == 0 || HighwayChunkSize > 1048576) throw new ArgumentOutOfRangeException(nameof(HighwayChunkSize));
         if (HighwayConcurrent == 0) throw new ArgumentOutOfRangeException(nameof(HighwayConcurrent));

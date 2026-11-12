@@ -13,9 +13,7 @@ protocol = "Linux"
 # 留空保存在本配置文件同目录；相对路径也以本目录解析。
 keystore_path = ""
 
-# 签名服务。留空 sign_server 使用 Lagrange.Core 内置签名服务。
-# Milky：填写基础地址，自动追加 sign/sec-sign；Lagrange：填写完整 POST 端点。
-sign_api = "Milky"
+# Lagrange V2 PC 签名服务，填写基础地址，自动追加 /api/sign/sec-sign。留空 sign_server 使用 Lagrange.Core 内置签名服务。
 sign_server = ""
 sign_token = ""
 sign_proxy_url = ""

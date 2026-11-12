@@ -14,17 +14,13 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
     private readonly CancellationToken _stopping;
     private readonly LagrangeAdapterConfig _options;
 
-    public LagrangeSignProvider(string endpoint, CancellationToken stopping, HttpMessageHandler? handler = null)
-        : this(new LagrangeAdapterConfig { SignServer = endpoint }, stopping, handler) { }
-
     public LagrangeSignProvider(LagrangeAdapterConfig options, CancellationToken stopping, HttpMessageHandler? handler = null)
     {
         options.Validate();
         if (string.IsNullOrWhiteSpace(options.SignServer)) throw new ArgumentException("SignServer 不能为空。");
         _options = options;
         var address = options.SignServer!;
-        _endpoint = options.SignApi == "Milky"
-            ? new Uri(new Uri(address.TrimEnd('/') + "/"), "sign/sec-sign") : new Uri(address);
+        _endpoint = new Uri(new Uri(address.TrimEnd('/') + "/"), "api/sign/sec-sign");
         _stopping = stopping;
         handler ??= string.IsNullOrWhiteSpace(options.SignProxyUrl) ? new HttpClientHandler()
             : new HttpClientHandler { Proxy = new WebProxy(options.SignProxyUrl), UseProxy = true };
@@ -573,17 +569,15 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
 
     public override async Task<SsoSecureInfo?> GetSecSign(long uin, string cmd, int seq, ReadOnlyMemory<byte> body)
     {
-        object payload = _options.SignApi == "Milky"
-            ? new
+        object payload = new
             {
-                uin = uin == 0 ? _options.AccountUin : uin,
+                uin = _options.AccountUin,
                 command = cmd,
                 seq,
                 body = Convert.ToHexString(body.Span).ToLowerInvariant(),
                 guid = Convert.ToHexString(Context.Keystore.Guid).ToLowerInvariant(),
-                qua = Context.AppInfo.Qua
-            }
-            : new { cmd, seq, src = Convert.ToHexString(body.Span) };
+                qua = BuildQua(Context.Config.Protocol, Context.AppInfo)
+            };
         using var response = await _client.PostAsJsonAsync(_endpoint, payload, _stopping);
         if (!response.IsSuccessStatusCode)
         {
@@ -600,22 +594,43 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
             foreach (var secret in new[] { _options.SignToken, _options.Password }.Where(x => !string.IsNullOrEmpty(x)))
                 detail = detail.Replace(secret!, "[已隐藏]", StringComparison.Ordinal);
             if (detail.Length > 1024) detail = detail[..1024];
-            throw new HttpRequestException($"签名服务 HTTP {(int)response.StatusCode} ({_options.SignApi}): {detail}", null, response.StatusCode);
+            throw new HttpRequestException($"签名服务 HTTP {(int)response.StatusCode} (Lagrange V2): {detail}", null, response.StatusCode);
         }
         var root = await response.Content.ReadFromJsonAsync<JsonObject>(_stopping)
             ?? throw new InvalidDataException("签名服务返回空响应。");
         if (root["code"] is JsonValue code && code.GetValue<int>() != 0)
-            throw new InvalidDataException("签名服务返回失败状态。");
-        var value = (root["value"] ?? root["data"]) as JsonObject
-            ?? throw new InvalidDataException("签名服务响应缺少 value/data。");
-        var sign = (value["sec_sign"] ?? value["sign"])?.GetValue<string>();
-        if (string.IsNullOrWhiteSpace(sign)) throw new InvalidDataException("签名服务返回空 sign。");
+        {
+            var detail = root["message"]?.GetValue<string>() ?? "未提供错误说明";
+            foreach (var secret in new[] { _options.SignToken, _options.Password }.Where(x => !string.IsNullOrEmpty(x)))
+                detail = detail.Replace(secret!, "[已隐藏]", StringComparison.Ordinal);
+            throw new InvalidDataException($"签名服务失败 (code={code}): {detail}");
+        }
+        var value = root["value"] as JsonObject
+            ?? throw new InvalidDataException("签名服务响应缺少 value 对象。");
+        string ReadHex(string modern)
+        {
+            var node = value[modern];
+            if (node is not JsonValue field || !field.TryGetValue<string>(out var hex))
+                throw new InvalidDataException($"签名服务响应缺少字符串字段 {modern}。");
+            return hex;
+        }
         return new SsoSecureInfo
         {
-            SecSign = Convert.FromHexString(sign),
-            SecToken = Convert.FromHexString((value["sec_token"] ?? value["token"])?.GetValue<string>() ?? ""),
-            SecExtra = Convert.FromHexString((value["sec_extra"] ?? value["extra"])?.GetValue<string>() ?? "")
+            SecSign = Convert.FromHexString(ReadHex("sec_sign")),
+            SecToken = Convert.FromHexString(ReadHex("sec_token")),
+            SecExtra = Convert.FromHexString(ReadHex("sec_extra"))
         };
+    }
+
+    internal static string BuildQua(Protocols protocol, BotAppInfo info)
+    {
+        var platform = protocol switch
+        {
+            Protocols.Windows => "WIN", Protocols.MacOs => "MAC", Protocols.Linux => "LNX",
+            _ => throw new NotSupportedException("Lagrange V2 PC 签名只支持 Windows、MacOs 和 Linux。")
+        };
+        if (string.IsNullOrWhiteSpace(info.CurrentVersion)) throw new InvalidDataException("AppInfo.CurrentVersion 不能为空。");
+        return $"V1_{platform}_NQ_{info.CurrentVersion.Replace('-', '_')}_GW_B";
     }
 
     public void Dispose() => _client.Dispose();
