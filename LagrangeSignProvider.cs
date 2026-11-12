@@ -576,7 +576,7 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
         object payload = _options.SignApi == "Milky"
             ? new
             {
-                uin = uin == 0 ? _options.Uin : uin,
+                uin = uin == 0 ? _options.AccountUin : uin,
                 command = cmd,
                 seq,
                 body = Convert.ToHexString(body.Span).ToLowerInvariant(),

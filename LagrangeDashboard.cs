@@ -50,8 +50,8 @@ public partial class LagrangeAdapter
                 if (!long.TryParse(account, out var uin) || uin <= 0 || password.Length is 0 or > 256)
                     throw new ArgumentException("请填写有效的 QQ 账号与密码。");
                 await ClearConnectionAsync();
-                var config = Config.Load<LagrangeAdapterConfig>();
-                config.Uin = uin;
+                var config = LoadAdapterConfig(Config);
+                config.Uin = uin.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 config.Password = password; // This page never persists the password.
                 InitializeConnection(config, true);
                 _loginStatus = "logging_in";

@@ -22,11 +22,11 @@ Release 使用 SDK 自带打包器合并协议依赖。将 `bin/Release/net11.0/
 
 ## 配置
 
-首次启动会保存默认配置。建议保持 `Uin = 0`、`Password = null` 使用二维码登录；二维码保存到 keystore 同目录的 `qrcode.png`。首次扫码后保存 keystore，后续尝试恢复登录。
+首次启动会保存默认配置。建议保持 `Uin = ""`、`Password = null` 使用二维码登录；二维码保存到 keystore 同目录的 `qrcode.png`。首次扫码后保存 keystore，后续尝试恢复登录。
 
 ```json
 {
-  "Uin": 0,
+  "Uin": "",
   "Password": null,
   "Protocol": "Linux",
   "KeystorePath": null
@@ -112,3 +112,8 @@ adapter action <实例 ID> qr-login
 协议子模块使用 [ShirokaProject/Lagrange.Core](https://github.com/ShirokaProject/Lagrange.Core) 的 `net11-async2` 分支，基于上游 fe789c4。更新依赖时以子模块 gitlink 固定提交。
 
 许可证为 **GPL-3.0-or-later**，见 [LICENSE](LICENSE)，保留上游来源和作者信息。
+
+
+QQ 账号配置使用字符串（`uin = "123456789"`），界面显示普通文本框；旧的整数 uin 会在加载前迁移，0 转为空值，其他字段保持不变。
+
+兼容旧版平铺 AppInfo：MiscBitmap、MainSigMap、SubSigMap、WtLoginSdk 等字段会转入当前 V2 的 SdkInfo。NTLoginType 在当前 V2 无对应字段，会明确警告后忽略；建议使用完整 V2 模板。显式 SdkInfo 字段优先于旧版平铺字段。

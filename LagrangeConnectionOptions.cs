@@ -13,7 +13,22 @@ internal static class LagrangeConnectionOptions
         if (!BotAppInfo.ProtocolToAppInfo.TryGetValue(protocol, out var defaults))
             throw new ArgumentException($"不支持的协议: {protocol}");
         var node = JsonSerializer.SerializeToNode(defaults)!.AsObject();
-        if (overrides is not null) Merge(node, overrides);
+        if (overrides is not null)
+        {
+            var modern = new JsonObject();
+            foreach (var (key, value) in overrides)
+            {
+                var sdkKey = key.ToLowerInvariant() switch
+                {
+                    "miscbitmap" => "MiscBitMap", "mainsigmap" => "MainSigMap", "subsigmap" => "SubSigMap",
+                    "wtloginsdk" or "sdkversion" => "SdkVersion", "sdkbuildtime" => "SdkBuildTime", _ => null
+                };
+                if (sdkKey is not null)
+                    Merge(node["SdkInfo"]!.AsObject(), new JsonObject { [sdkKey] = value?.DeepClone() });
+                else if (!key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase)) modern[key] = value?.DeepClone();
+            }
+            Merge(node, modern);
+        }
         return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
     }
 

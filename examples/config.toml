@@ -7,7 +7,7 @@ enabled = false
 [instances.config]
 # false：启动后通过适配器 Action 扫码；true：自动恢复 keystore / 密码登录 / 扫码。
 auto_login = false
-uin = 0
+uin = ""
 password = ""
 protocol = "Linux"
 # 留空保存在本配置文件同目录；相对路径也以本目录解析。

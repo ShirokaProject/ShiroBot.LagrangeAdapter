@@ -149,7 +149,7 @@ if (mappedRequest.RequestId != "42" || !mappedRequest.IsInvited || !mappedReques
 Console.WriteLine("File metadata and group request credential mapping checks passed.");
 
 var milkyHandler = new MilkySignHandler();
-var milkyOptions = new LagrangeAdapterConfig { SignApi = "Milky", SignServer = "http://localhost/api", SignToken = "test-token", Uin = 123 };
+var milkyOptions = new LagrangeAdapterConfig { SignApi = "Milky", SignServer = "http://localhost/api", SignToken = "test-token", Uin = "123" };
 using (var signer = (IDisposable)Activator.CreateInstance(signType, [milkyOptions, CancellationToken.None, milkyHandler])!)
 {
     var provider = (Lagrange.Core.Common.BotSignProvider)signer;
@@ -199,6 +199,19 @@ foreach (var property in typeof(LagrangeAdapterConfig).GetProperties())
 var registerPage = adapter.GetExtension<Action<ShiroBot.SDK.Dashboard.IPluginDashboard>>();
 if (registerPage is null) throw new Exception("Adapter must expose a Dashboard registration callback.");
 Console.WriteLine("Chinese config annotations and adapter dashboard registration checks passed.");
+
+if (typeof(LagrangeAdapterConfig).GetProperty("Uin")!.PropertyType != typeof(string) ||
+    typeof(LagrangeAdapterConfig).GetProperty("Uin")!.GetCustomAttribute<ShiroBot.SDK.Config.ConfigFieldAttribute>()!.Type != "string")
+    throw new Exception("QQ account must use a text input, not a numeric stepper.");
+try { new LagrangeAdapterConfig { Uin = "123abc" }.Validate(); throw new Exception("Malformed QQ account accepted."); }
+catch (ArgumentException) { }
+Console.WriteLine("QQ account text input and validation checks passed.");
+
+var legacyApp = (Lagrange.Core.Common.BotAppInfo)resolve.Invoke(null,
+    [Lagrange.Core.Common.Protocols.Linux, System.Text.Json.Nodes.JsonNode.Parse("{\"MiscBitmap\":123,\"WtLoginSdk\":\"legacy-sdk\",\"MainSigMap\":1,\"SubSigMap\":2,\"NTLoginType\":1}")!.AsObject()])!;
+if (legacyApp.SdkInfo.MiscBitMap != 123 || legacyApp.SdkInfo.SdkVersion != "legacy-sdk")
+    throw new Exception("Legacy flat AppInfo fields were not moved into SdkInfo.");
+Console.WriteLine("Legacy AppInfo compatibility checks passed.");
 
 sealed class SignHandler : HttpMessageHandler
 {

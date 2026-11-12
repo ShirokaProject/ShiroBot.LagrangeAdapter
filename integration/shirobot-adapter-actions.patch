@@ -617,7 +617,7 @@ index d275e02..213d341 100644
 +}
 --- /dev/null
 +++ b/Tests/Verification/AdapterLoginPageVerification.cs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,67 @@
 +using System.Runtime.CompilerServices;
 +using ShiroBot.Adapters;
 +using ShiroBot.Components.Reloading;
@@ -654,11 +654,13 @@ index d275e02..213d341 100644
 +        var adapters = new AdapterManager(root, shared, models, context, new AdapterEventBridge(dispatcher),
 +            runtime, logs);
 +        var configPath = Path.Combine(root, "config.toml");
-+        AdapterInstanceStore.Write(configPath, [new PackageAdapterInstance { Id = "a", Enabled = true }], true);
++        AdapterInstanceStore.Write(configPath, [new PackageAdapterInstance { Id = "a", Enabled = true, Config = new() { ["uin"] = 123L, ["auto_login"] = false } }], true);
 +        var instance = new InstalledAdapterInstance("a", "lagrange", path, configPath, true, "Actions");
 +        try
 +        {
 +            await adapters.LoadInstanceAsync(instance);
++            if (AdapterInstanceStore.GetConfig(configPath, "a")["uin"] is not string account || account != "123")
++                throw new Exception("Legacy numeric QQ account was not migrated to a string.");
 +            var owner = adapters.GetDashboardOwner("a") ?? throw new Exception("Adapter dashboard owner missing.");
 +            var page = ShiroBot.Plugins.PluginDashboard.List(owner).Single();
 +            if (page.Id != "login" || page.Web is null) throw new Exception("Login web page not registered.");

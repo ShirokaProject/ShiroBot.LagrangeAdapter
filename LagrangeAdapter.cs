@@ -45,6 +45,25 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     public LagrangeAdapterConfig CurrentConfigValue { get; private set; } = new();
     public ConfigApplyMode ApplyMode => ConfigApplyMode.RestartComponent;
 
+    public async Task<object> InitializeConfigAsync(IConfigContext context, CancellationToken cancellationToken = default)
+    {
+        var config = LoadAdapterConfig(context);
+        await OnConfigLoadedAsync(config, cancellationToken);
+        return config;
+    }
+
+    private static LagrangeAdapterConfig LoadAdapterConfig(IConfigContext context)
+    {
+        // Read the old scalar before typed deserialization; do not rewrite unrelated fields.
+        var raw = context.Load<Dictionary<string, object>>();
+        if (raw.TryGetValue("uin", out var value) && value is long or int or uint or ulong)
+        {
+            var text = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)!;
+            context.SetValue("uin", text == "0" ? "" : text);
+        }
+        return context.Load<LagrangeAdapterConfig>();
+    }
+
     public Task OnConfigLoadedAsync(LagrangeAdapterConfig config, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -88,7 +107,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         try
         {
             if (_started) throw new InvalidOperationException("适配器已经启动。");
-            var config = Config.Load<LagrangeAdapterConfig>();
+            var config = LoadAdapterConfig(Config);
             config.Validate();
             CurrentConfigValue = config;
             Config.Save(config);
@@ -125,6 +144,8 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             appInfo = JsonNode.Parse(File.ReadAllText(ResolveConfigPath(config.AppInfoPath))) as JsonObject
                 ?? throw new InvalidDataException("AppInfo 文件必须是 JSON 对象。");
         }
+        if (appInfo?.Any(x => x.Key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase)) == true)
+            Logger.Warning("AppInfo 中旧版 NTLoginType 字段在当前上游 V2 中没有对应项，已忽略；建议改用 V2 AppInfo 模板。");
         var resolved = LagrangeConnectionOptions.ResolveAppInfo(protocol, appInfo);
         _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime?.Stopping ?? CancellationToken.None);
         if (!string.IsNullOrWhiteSpace(config.SignServer))
@@ -157,9 +178,9 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         var context = _services.Context;
         _loginStatus = qr ? "waiting_scan" : "logging_in";
         Logger.Info($"Lagrange 开始登录(协议: {config.Protocol})...");
-        var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.Uin == 0
+        var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.AccountUin == 0
             ? await context.Login(token)
-            : await context.Login(config.Uin, config.Password, token);
+            : await context.Login(config.AccountUin, config.Password, token);
         if (!success) throw new InvalidOperationException("Lagrange 登录失败，请查看协议日志。");
         _loginStatus = "online";
         Logger.Success($"Lagrange 登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
@@ -173,7 +194,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         {
             if (!_started) return new(false, "请先启动适配器。");
             await ClearConnectionAsync();
-            var config = Config.Load<LagrangeAdapterConfig>();
+            var config = LoadAdapterConfig(Config);
             InitializeConnection(config, true); // Explicit QR login bypasses password and saved tickets.
             _qrReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
             async Task Run(CancellationToken unused)
@@ -384,8 +405,21 @@ public sealed class LagrangeAdapterConfig
     [ConfigField("媒体上传并发数；上传不稳定时可改为 1。", Label = "上传并发数", Group = "upload", GroupLabel = "媒体上传", GroupOrder = 50, Order = 20, Min = 1)]
     public uint HighwayConcurrent { get; set; } = 4;
 
+    internal long AccountUin
+    {
+        get
+        {
+            var value = Uin?.Trim() ?? "";
+            if (value.Length == 0) return 0;
+            if (value.Length > 19 || value.Any(c => !char.IsAsciiDigit(c)) || !long.TryParse(value, out var uin))
+                throw new ArgumentException("QQ 账号只能填写有效的数字账号。");
+            return uin;
+        }
+    }
+
     public void Validate()
     {
+        _ = AccountUin;
         if (!Enum.TryParse<Protocols>(Protocol, true, out var protocol) || !BotAppInfo.ProtocolToAppInfo.ContainsKey(protocol))
             throw new ArgumentException($"未知协议: {Protocol}");
         if (!Enum.TryParse<Lagrange.Core.Events.EventArgs.LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
@@ -416,8 +450,8 @@ public sealed class LagrangeAdapterConfig
     };
 
     /// <summary>QQ 号。配合 Password 使用密码登录;留 0 使用二维码登录。</summary>
-    [ConfigField("自动密码登录使用的 QQ 号；手动登录可在登录页面填写。", Label = "QQ 账号", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 20, Min = 0)]
-    public long Uin { get; set; }
+    [ConfigField("自动密码登录使用的 QQ 号；手动登录可在登录页面填写。", Label = "QQ 账号", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 20, Type = "string", Placeholder = "请输入 QQ 账号")]
+    public string Uin { get; set; } = "";
 
     /// <summary>密码。留空使用二维码登录(推荐,首次扫码后 keystore 自动续期)。</summary>
     [ConfigField("仅自动密码登录需要。建议通过登录页面输入，避免把密码保存到配置。", Label = "登录密码", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 30, Type = "password")]
