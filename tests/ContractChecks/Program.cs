@@ -240,6 +240,26 @@ for (var n = 0; n < 100; n++)
 }
 Console.WriteLine("Default device name format and stability checks passed.");
 
+var renderQr = assembly.GetType("ShiroBot.LagrangeAdapter.LagrangeConsoleQrCode")!
+    .GetMethod("Render", BindingFlags.Static | BindingFlags.NonPublic)!;
+const string qrUrl = "https://example.com/qq-login?token=test";
+var qrText = (string)renderQr.Invoke(null, [qrUrl])!;
+var qrReference = Net.Codecrete.QrCodeGenerator.QrCode.EncodeText(qrUrl, Net.Codecrete.QrCodeGenerator.QrCode.Ecc.Low);
+var qrRows = qrText.Replace("\r", "").TrimEnd('\n').Split('\n');
+if (!new LagrangeAdapterConfig().ConsoleQrCode || qrRows.Any(row => row.Length != qrReference.Size + 8))
+    throw new Exception("Console QR default or quiet zone width is incorrect.");
+for (var row = 0; row < qrRows.Length; row++)
+for (var column = 0; column < qrRows[row].Length; column++)
+{
+    var glyph = qrRows[row][column];
+    var top = glyph is '█' or '▀';
+    var bottom = glyph is '█' or '▄';
+    if (top != qrReference.GetModule(column - 4, row * 2 - 4) ||
+        bottom != qrReference.GetModule(column - 4, row * 2 - 3))
+        throw new Exception("Console QR render changed the encoded login URL.");
+}
+Console.WriteLine("Console QR module fidelity, quiet zone and default checks passed.");
+
 sealed class RejectSignHandler : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) =>

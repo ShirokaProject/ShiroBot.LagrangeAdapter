@@ -176,7 +176,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _qqSystemApi = new LagrangeQqSystemApi(_session);
         _qqMessageApi = new LagrangeQqMessageApi(_session);
 
-        RegisterLifecycleEvents(context, keystorePath);
+        RegisterLifecycleEvents(context, keystorePath, config);
         _eventService.Attach(_session);
 
     }
@@ -272,7 +272,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private string ResolveConfigPath(string path) =>
         Path.GetFullPath(path, Path.GetDirectoryName(Path.GetFullPath(Config.ConfigPath))!);
 
-    private void RegisterLifecycleEvents(BotContext context, string keystorePath)
+    private void RegisterLifecycleEvents(BotContext context, string keystorePath, LagrangeAdapterConfig config)
     {
         context.EventInvoker.RegisterEvent<BotLogEvent>((_, e) =>
         {
@@ -304,6 +304,11 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             _qrImage = e.Image.ToArray();
             _loginStatus = "waiting_scan";
             _qrReady?.TrySetResult(pngPath);
+            if (config.ConsoleQrCode)
+            {
+                try { Logger.Info("请使用手机 QQ 扫描下方二维码：\n" + LagrangeConsoleQrCode.Render(e.Url)); }
+                catch (Exception ex) { Logger.Warning($"控制台二维码输出失败: {ex.Message}，请使用 PNG 或登录页面。"); }
+            }
             Logger.Warning($"请扫码登录 QQ。二维码已保存: {pngPath}");
             Logger.Warning($"或使用链接生成二维码: {e.Url}");
         });
@@ -463,6 +468,9 @@ public sealed class LagrangeAdapterConfig
     /// <summary>QQ 号。配合 Password 使用密码登录;留 0 使用二维码登录。</summary>
     [ConfigField("自动密码登录使用的 QQ 号；手动登录可在登录页面填写。", Label = "QQ 账号", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 20, Type = "string", Placeholder = "请输入 QQ 账号")]
     public string Uin { get; set; } = "";
+
+    [ConfigField("获取登录二维码时，在宿主控制台输出可扫描的字符二维码；页面和 PNG 文件仍正常提供。终端需使用等宽字体并有足够宽度。", Label = "控制台显示二维码", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 36)]
+    public bool ConsoleQrCode { get; set; } = true;
 
     [ConfigField("留空自动生成 Shiro- 加随机 4–8 位数字；自动名称随登录凭据保存，刷新二维码时保持不变。", Label = "设备名称", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 35, Placeholder = "Shiro-123456")]
     public string DeviceName { get; set; } = "";

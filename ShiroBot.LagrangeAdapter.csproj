@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="ShiroBot.SDK" Version="1.0.2" />
+    <PackageReference Include="Net.Codecrete.QrCodeGenerator" Version="3.0.0" />
     <ProjectReference Include="external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
     <EmbeddedResource Include="dashboard/index.html" LogicalName="dashboard/index.html" />
     <Compile Remove="external/**/*.cs;tests/**/*.cs" />

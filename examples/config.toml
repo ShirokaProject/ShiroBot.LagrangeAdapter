@@ -14,6 +14,8 @@ protocol = "Linux"
 keystore_path = ""
 # 留空自动生成 Shiro- 加随机 4–8 位数字，随凭据保存。
 device_name = ""
+# 登录二维码同时以字符形式输出到宿主控制台。
+console_qr_code = true
 
 # Lagrange V2 PC 签名服务，填写基础地址，自动追加 /api/sign/sec-sign。留空 sign_server 使用 Lagrange.Core 内置签名服务。
 sign_server = ""
