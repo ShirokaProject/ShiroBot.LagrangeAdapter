@@ -55,6 +55,9 @@ internal static class LagrangeConnectionOptions
         return "Shiro-" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    internal static bool HasSession(BotKeystore keystore) =>
+        keystore.Uin > 0 && keystore.WLoginSigs is { A2.Length: > 0, D2.Length: > 0 };
+
     private static void Merge(JsonObject target, JsonObject source)
     {
         foreach (var (key, value) in source)

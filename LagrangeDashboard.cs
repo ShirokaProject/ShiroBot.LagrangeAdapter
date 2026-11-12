@@ -44,9 +44,9 @@ public partial class LagrangeAdapter
     private async Task<JsonNode?> HandleLoginPageAsync(string action, JsonNode? arguments, CancellationToken token)
     {
         if (action == "status") return LoginPageState();
-        if (action == "qr-login")
+        if (action is "qr-login" or "quick-login")
         {
-            var result = await ExecuteActionAsync("qr-login", token);
+            var result = await ExecuteActionAsync(action, token);
             if (!result.Ok) _loginError = result.Message;
             return LoginPageState();
         }

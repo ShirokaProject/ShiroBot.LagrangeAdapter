@@ -617,7 +617,7 @@ index d275e02..213d341 100644
 +}
 --- /dev/null
 +++ b/Tests/Verification/AdapterLoginPageVerification.cs
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,85 @@
 +using System.Runtime.CompilerServices;
 +using ShiroBot.Adapters;
 +using ShiroBot.Components.Reloading;
@@ -654,11 +654,24 @@ index d275e02..213d341 100644
 +        var adapters = new AdapterManager(root, shared, models, context, new AdapterEventBridge(dispatcher),
 +            runtime, logs);
 +        var configPath = Path.Combine(root, "config.toml");
-+        AdapterInstanceStore.Write(configPath, [new PackageAdapterInstance { Id = "a", Enabled = true, Config = new() { ["uin"] = 123L, ["auto_login"] = false } }], true);
++        AdapterInstanceStore.Write(configPath, [
++            new PackageAdapterInstance { Id = "a", Enabled = true, Config = new() { ["uin"] = 123L, ["auto_login"] = false } },
++            new PackageAdapterInstance { Id = "b", Enabled = true, Config = new() { ["uin"] = "456", ["auto_login"] = false } }
++        ], true);
 +        var instance = new InstalledAdapterInstance("a", "lagrange", path, configPath, true, "Actions");
 +        try
 +        {
 +            await adapters.LoadInstanceAsync(instance);
++            await adapters.LoadInstanceAsync(new InstalledAdapterInstance("b", "lagrange", path, configPath, true, "Second"));
++            var storageA = (string)AdapterInstanceStore.GetConfig(configPath, "a")["keystore_path"]!;
++            var storageB = (string)AdapterInstanceStore.GetConfig(configPath, "b")["keystore_path"]!;
++            if (storageA == storageB) throw new Exception("Host instances share session storage.");
++            if (!(await adapters.GetActionsAsync("a")).Any(x => x.Id == "quick-login")) throw new Exception("Quick action not exposed.");
++            if ((await adapters.ExecuteActionAsync("a", "quick-login")).Ok) throw new Exception("Missing session login unexpectedly succeeded.");
++            var ownerB = adapters.GetDashboardOwner("b")!;
++            var stateB = await ShiroBot.Plugins.PluginDashboard.WebCallAsync(ownerB, "login", "status", null, CancellationToken.None);
++            if (stateB.Value?["status"]?.GetValue<string>() != "ready") throw new Exception("Instance B state was changed by instance A.");
++            Console.WriteLine("Two host instances: separate persisted keystore paths, quick-login dispatch and independent page state passed.");
 +            if (AdapterInstanceStore.GetConfig(configPath, "a")["uin"] is not string account || account != "123")
 +                throw new Exception("Legacy numeric QQ account was not migrated to a string.");
 +            var owner = adapters.GetDashboardOwner("a") ?? throw new Exception("Adapter dashboard owner missing.");
@@ -682,6 +695,11 @@ index d275e02..213d341 100644
 +            if (stopped.Status == ShiroBot.Plugins.PluginPageStatus.Done) throw new Exception("Stopped page remained callable.");
 +            Console.WriteLine("Adapter login page: registration, embedded HTML, bridge status, input validation and lifetime checks passed.");
 +        }
-+        finally { await adapters.StopByIdAsync("a"); try { Directory.Delete(root, true); } catch (IOException) { } }
++        finally
++        {
++            foreach (var id in new[] { "a", "b" })
++                try { await adapters.StopByIdAsync(id); } catch (ComponentUnloadPendingException) { }
++            try { Directory.Delete(root, true); } catch (IOException) { }
++        }
 +    }
 +}

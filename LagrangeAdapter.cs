@@ -29,6 +29,8 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private TaskCompletionSource<string>? _qrReady;
     private bool _started;
     private string? _automaticDeviceName;
+    private FileStream? _storageLease;
+    private readonly SemaphoreSlim _keystoreWrite = new(1, 1);
     private LagrangeSession? _session;
     private readonly LagrangeSession _services = new();
     private readonly LagrangeEventService _eventService = new();
@@ -62,13 +64,16 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             var text = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)!;
             context.SetValue("uin", text == "0" ? "" : text);
         }
-        return context.Load<LagrangeAdapterConfig>();
+        var config = context.Load<LagrangeAdapterConfig>();
+        if (LagrangeStorage.EnsurePath(config, context.ConfigPath)) context.Save(config);
+        return config;
     }
 
     public Task OnConfigLoadedAsync(LagrangeAdapterConfig config, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         config.Validate();
+        LagrangeStorage.EnsurePath(config, Config.ConfigPath);
         CurrentConfigValue = config;
         Config.Save(config);
         return Task.CompletedTask;
@@ -100,7 +105,10 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         ?? _session?.Context as TService;
 
     public IReadOnlyList<PluginActionDescriptor> Actions { get; } =
-    [new("qr-login", "扫码登录", "重新获取二维码，使用手机 QQ 扫描确认。")];
+    [
+        new("quick-login", "快速登录", "使用上次扫码保存的登录凭据恢复会话，不重新生成二维码。"),
+        new("qr-login", "扫码登录", "重新获取二维码，使用手机 QQ 扫描确认。")
+    ];
 
     public async Task StartAsync()
     {
@@ -154,6 +162,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         var botConfig = config.CreateBotConfig(protocol);
         botConfig.SignProvider = _signProvider;
         Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
+        _storageLease = LagrangeStorage.Acquire(keystorePath);
         var keystore = !fresh && File.Exists(keystorePath)
             ? JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
                 ?? throw new InvalidDataException("Keystore 内容为空。")
@@ -197,6 +206,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
     public async Task<PluginActionResult> ExecuteActionAsync(string actionId, CancellationToken cancellationToken = default)
     {
+        if (actionId == "quick-login") return await QuickLoginAsync(cancellationToken);
         if (actionId != "qr-login") return new(false, $"未知 Action: {actionId}");
         await _lifecycle.WaitAsync(cancellationToken);
         try
@@ -231,6 +241,51 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         finally { _lifecycle.Release(); }
     }
 
+    private async Task<PluginActionResult> QuickLoginAsync(CancellationToken token)
+    {
+        await _lifecycle.WaitAsync(token);
+        try
+        {
+            if (!_started) return new(false, "请先启动适配器。");
+            if (_services.ActiveContext?.IsOnline == true) return new(true, "当前已经登录。");
+            var config = LoadAdapterConfig(Config);
+            var path = ResolveKeystorePath(config);
+            if (!File.Exists(path)) return new(false, "没有上次登录的凭据，请先扫码登录。");
+            var saved = JsonSerializer.Deserialize<BotKeystore>(await File.ReadAllTextAsync(path, token));
+            if (saved is null || !LagrangeConnectionOptions.HasSession(saved))
+                return new(false, "保存的凭据不包含有效会话，请重新扫码登录。");
+            if (config.AccountUin != 0 && config.AccountUin != saved.Uin)
+                return new(false, "配置账号与保存的登录账号不一致，请切换账号或重新扫码。");
+            await ClearConnectionAsync();
+            InitializeConnection(config, false);
+            var context = _services.Context;
+            LagrangeConnectionOptions.ValidatePlatform(context.Config.Protocol, context.AppInfo);
+            _loginStatus = "logging_in";
+            async Task<bool> Resume()
+            {
+                var success = await context.LoginWithSession(_loginCancellation!.Token);
+                if (!success) throw new InvalidOperationException("上次登录凭据已失效，请重新扫码登录。");
+                _loginStatus = "online";
+                Logger.Success($"快速登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
+                return true;
+            }
+            var resume = Resume();
+            _loginTask = resume;
+            await resume.WaitAsync(token);
+            return new(true, $"快速登录成功：{context.BotInfo?.Name} ({context.BotUin})");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var config = CurrentConfigValue;
+            var error = DescribeLoginFailure(ex, config);
+            await ClearConnectionAsync();
+            _loginStatus = "failed";
+            _loginError = error;
+            return new(false, $"快速登录失败：{error}");
+        }
+        finally { _lifecycle.Release(); }
+    }
+
     public async Task StopAsync()
     {
         try { _loginCancellation?.Cancel(); } catch (ObjectDisposedException) { }
@@ -256,6 +311,9 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _session = null;
         _eventService.Detach();
         _services.ActiveContext = null;
+        await _keystoreWrite.WaitAsync();
+        try { _storageLease?.Dispose(); _storageLease = null; }
+        finally { _keystoreWrite.Release(); }
         _services.Clear();
         _qqFriendApi = null;
         _qqGroupApi = null;
@@ -354,9 +412,13 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
         context.EventInvoker.RegisterEvent<BotRefreshKeystoreEvent>(async (_, e) =>
         {
-            if (!ReferenceEquals(_services.ActiveContext, context)) return;
-            Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
-            await File.WriteAllTextAsync(keystorePath, JsonSerializer.Serialize(e.Keystore));
+            await _keystoreWrite.WaitAsync();
+            try
+            {
+                if (!ReferenceEquals(_services.ActiveContext, context)) return;
+                await LagrangeStorage.SaveAsync(keystorePath, e.Keystore);
+            }
+            finally { _keystoreWrite.Release(); }
         });
 
         context.EventInvoker.RegisterEvent<BotOnlineEvent>((_, e) =>
@@ -370,8 +432,8 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             return Path.GetFullPath(config.KeystorePath, Path.GetDirectoryName(Path.GetFullPath(Config.ConfigPath))!);
         }
 
-        var configDir = Path.GetDirectoryName(Config.ConfigPath) ?? AppContext.BaseDirectory;
-        return Path.GetFullPath(Path.Combine(configDir, "lagrange-keystore.json"));
+        if (LagrangeStorage.EnsurePath(config, Config.ConfigPath)) Config.Save(config);
+        return ResolveConfigPath(config.KeystorePath!);
     }
 
 }
@@ -484,6 +546,6 @@ public sealed class LagrangeAdapterConfig
     public string Protocol { get; set; } = "Linux";
 
     /// <summary>keystore 保存路径,留空则保存在适配器配置目录。</summary>
-    [ConfigField("留空保存在适配器配置目录。凭据用于下次恢复会话，不应公开。", Label = "登录凭据路径", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 40)]
+    [ConfigField("留空自动生成独立 sessions 目录并保存到当前实例配置；不同实例不可共用路径。凭据用于快速登录，请勿公开。", Label = "登录凭据路径", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 40)]
     public string? KeystorePath { get; set; } = "";
 }

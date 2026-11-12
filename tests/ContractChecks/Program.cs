@@ -260,6 +260,42 @@ for (var column = 0; column < qrRows[row].Length; column++)
 }
 Console.WriteLine("Console QR module fidelity, quiet zone and default checks passed.");
 
+if (!adapter.Actions.Any(x => x.Id == "quick-login")) throw new Exception("Quick login action missing.");
+if ((await adapter.ExecuteActionAsync("quick-login")).Ok) throw new Exception("Stopped adapter accepted quick login.");
+var sessionCheck = optionsType.GetMethod("HasSession", BindingFlags.Static | BindingFlags.NonPublic)!;
+var savedSession = new Lagrange.Core.Common.BotKeystore { Uin = 123 };
+if ((bool)sessionCheck.Invoke(null, [savedSession])!) throw new Exception("Empty tickets accepted.");
+savedSession.WLoginSigs.A2 = [1]; savedSession.WLoginSigs.D2 = [2];
+if (!(bool)sessionCheck.Invoke(null, [savedSession])!) throw new Exception("Saved session rejected.");
+var storage = assembly.GetType("ShiroBot.LagrangeAdapter.LagrangeStorage")!;
+var ensureStorage = storage.GetMethod("EnsurePath", BindingFlags.NonPublic | BindingFlags.Static)!;
+var rootStorage = Path.Combine(Path.GetTempPath(), "lagrange-storage-check-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(rootStorage);
+try
+{
+    var configFile = Path.Combine(rootStorage, "config.toml");
+    var firstConfig = new LagrangeAdapterConfig(); var secondConfig = new LagrangeAdapterConfig();
+    ensureStorage.Invoke(null, [firstConfig, configFile]); ensureStorage.Invoke(null, [secondConfig, configFile]);
+    var firstPath = firstConfig.KeystorePath!; var secondPath = secondConfig.KeystorePath!;
+    if (firstPath == secondPath || Path.GetDirectoryName(firstPath) == Path.GetDirectoryName(secondPath))
+        throw new Exception("Instance session or QR directories collide.");
+    ensureStorage.Invoke(null, [firstConfig, configFile]);
+    if (firstConfig.KeystorePath != firstPath) throw new Exception("Session storage changed across reload.");
+    var fullPath = Path.Combine(rootStorage, firstPath);
+    var acquire = storage.GetMethod("Acquire", BindingFlags.NonPublic | BindingFlags.Static)!;
+    using (var lease = (IDisposable)acquire.Invoke(null, [fullPath])!)
+    {
+        try { using var duplicate = (IDisposable)acquire.Invoke(null, [fullPath])!; throw new Exception("Duplicate session path was accepted."); }
+        catch (TargetInvocationException ex) when (ex.InnerException is IOException) { }
+        await (Task)storage.GetMethod("SaveAsync", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, [fullPath, savedSession])!;
+    }
+    var persisted = System.Text.Json.JsonSerializer.Deserialize<Lagrange.Core.Common.BotKeystore>(File.ReadAllText(fullPath))!;
+    if (persisted.Uin != 123 || persisted.WLoginSigs.A2[0] != 1) throw new Exception("Session was not saved correctly.");
+    using var reopened = (IDisposable)acquire.Invoke(null, [fullPath])!;
+}
+finally { Directory.Delete(rootStorage, true); }
+Console.WriteLine("Quick login tickets, per-instance storage, atomic save and exclusive path checks passed.");
+
 sealed class RejectSignHandler : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) =>
