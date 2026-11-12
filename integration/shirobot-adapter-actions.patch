@@ -1,0 +1,264 @@
+diff --git a/Core/Hosting/Commands/HostCommandHandler.cs b/Core/Hosting/Commands/HostCommandHandler.cs
+index 965d2d4..21eb62f 100644
+--- a/Core/Hosting/Commands/HostCommandHandler.cs
++++ b/Core/Hosting/Commands/HostCommandHandler.cs
+@@ -29,7 +29,7 @@ internal sealed partial class HostCommandHandler(
+     private static readonly IReadOnlyList<CH.ConsoleCommandOption> ConsoleCommands =
+     [
+         new("plugin", "插件: list|market|refresh|install|load|unload|update|actions|action"),
+-        new("adapter", "适配器: list|market|refresh|install|create|start|stop|reload|config|remove"),
++        new("adapter", "适配器: list|market|refresh|install|create|start|stop|reload|config|remove|actions|action"),
+         new("update", "检查或更新主程序"),
+         new("restart", "重启程序"),
+         new("api", "显示或设置 API 鉴权信息"),
+@@ -203,6 +203,14 @@ internal sealed partial class HostCommandHandler(
+         {
+             switch (input[1].ToLowerInvariant())
+             {
++                case "actions":
++                    return string.Join(Environment.NewLine, (await adapterManager.GetActionsAsync(input[2]))
++                        .Select(x => $"{x.Id}: {x.Label} - {x.Description}"));
++                case "action":
++                    if (input.Length < 4) return "用法: adapter action <实例 ID> <操作 ID>";
++                    var actionResult = await adapterManager.ExecuteActionAsync(input[2], input[3]);
++                    return actionResult.Message + (string.IsNullOrWhiteSpace(actionResult.Details) ? "" : Environment.NewLine + actionResult.Details);
++
+                 case "create":
+                     if (input.Length < 4) return "用法: adapter create <包 ID> <实例 ID>";
+                     var created = await reloadCoordinator.ExecuteAdapterMutationAsync(() =>
+diff --git a/Core/Hosting/Http/HostHttpServer.Adapters.cs b/Core/Hosting/Http/HostHttpServer.Adapters.cs
+index 501df6e..0c36d65 100644
+--- a/Core/Hosting/Http/HostHttpServer.Adapters.cs
++++ b/Core/Hosting/Http/HostHttpServer.Adapters.cs
+@@ -15,6 +15,7 @@ internal sealed partial class HostHttpServer
+     {
+         private void MapAdapters(RouteGroupBuilder api)
+         {
++            MapAdapterActions(api);
+             api.MapGet("/adapter", () => Results.Ok(adapterManager.CreateStatus()));
+ 
+             api.MapGet("/adapters/{id}/config", (string id) =>
+diff --git a/Core/Hosting/Http/HostHttpServer.Endpoints.cs b/Core/Hosting/Http/HostHttpServer.Endpoints.cs
+index 2d0d626..20baf95 100644
+--- a/Core/Hosting/Http/HostHttpServer.Endpoints.cs
++++ b/Core/Hosting/Http/HostHttpServer.Endpoints.cs
+@@ -103,6 +103,7 @@ internal sealed partial class HostHttpServer
+     }
+ 
+     internal sealed partial class ComponentEndpoints(
++        IOptions<ApiHostConfig> options,
+         HostRuntimeState runtimeState,
+         ConfigManager configManager,
+         AdapterManager adapterManager,
+diff --git a/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs b/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs
+index c4d2127..ed586da 100644
+--- a/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs
++++ b/Tests/SharedContractPluginProbe/AdapterLifecycleProbe.cs
+@@ -8,7 +8,7 @@ namespace ShiroBot.SharedContractPluginProbe;
+ // A real collectible adapter for testing the host's load/config/watch/unload boundary.
+ [BotAdapter("lifecycle-probe")]
+ public sealed class AdapterLifecycleProbe : IBotAdapter, IConfigurableAdapter,
+-    IConfigurableComponent<AdapterLifecycleProbeConfig>, ILifetimeAwareAdapter
++    IConfigurableComponent<AdapterLifecycleProbeConfig>, ILifetimeAwareAdapter, IPluginActionProvider
+ {
+     public string Platform => "lifecycle-probe";
+     public IMessageService Message { get; } = new ProbeMessages();
+@@ -20,6 +20,13 @@ public sealed class AdapterLifecycleProbe : IBotAdapter, IConfigurableAdapter,
+     public AdapterLifecycleProbeConfig CurrentConfigValue { get; private set; } = new();
+     public ConfigApplyMode ApplyMode => ConfigApplyMode.Live;
+     public IPluginLifetime Lifetime { get; set; } = null!;
++    public IReadOnlyList<PluginActionDescriptor> Actions =>
++        [new("ping", "Ping"), new("ping", "Duplicate"), new("", "Invalid")];
++    public async Task<PluginActionResult> ExecuteActionAsync(string actionId, CancellationToken cancellationToken = default)
++    {
++        await Task.Delay(50, cancellationToken);
++        return new PluginActionResult(true, actionId) { Details = CurrentConfigValue.Endpoint };
++    }
+     private int _ticks;
+ 
+     // 模拟接收循环和心跳：只登记到 Lifetime，StopAsync 不做清理。宿主没停掉它们的话，
+diff --git a/Tests/Verification/Program.cs b/Tests/Verification/Program.cs
+index d275e02..de6814d 100644
+--- a/Tests/Verification/Program.cs
++++ b/Tests/Verification/Program.cs
+@@ -41,6 +41,10 @@ using ShiroBot.Verification;
+ [assembly: ShiroBotApiCompatibility("legacy-ignored", "legacy-ignored")]
+ switch (args)
+ {
++    case ["--adapter-actions"]:
++        await AdapterActionsVerification.RunAsync();
++        return;
++
+     case ["--plugin-list-benchmark", var fixtures, var requestCount]:
+     {
+         await PluginListBenchmark.RunAsync(fixtures, int.Parse(requestCount));
+--- a/Core/Adapters/AdapterManager.cs
++++ b/Core/Adapters/AdapterManager.cs
+@@ -18,7 +18,7 @@
+ 
+ namespace ShiroBot.Adapters;
+ 
+-internal sealed class AdapterManager(
++internal sealed partial class AdapterManager(
+     string adapterRoot,
+     SharedAssemblyResolver sharedAssemblies,
+     ModelPackageRegistry modelPackages,
+--- /dev/null
++++ b/Core/Adapters/AdapterManager.Actions.cs
+@@ -0,0 +1,43 @@
++using ShiroBot.Hosting.Context;
++using ShiroBot.SDK.Plugin;
++
++namespace ShiroBot.Adapters;
++
++internal sealed partial class AdapterManager
++{
++    public async Task<IReadOnlyList<PluginActionDescriptor>> GetActionsAsync(string id, CancellationToken token = default)
++    {
++        await _gate.WaitAsync(token).ConfigureAwait(false);
++        try { return ReadActions(FindActionProvider(id)); }
++        finally { _gate.Release(); }
++    }
++
++    public async Task<PluginActionResult> ExecuteActionAsync(string id, string actionId, CancellationToken token = default)
++    {
++        // Serialize with stop/reload so an action cannot retain an unloading adapter.
++        await _gate.WaitAsync(token).ConfigureAwait(false);
++        try
++        {
++            var provider = FindActionProvider(id);
++            if (!ReadActions(provider).Any(x => x.Id == actionId))
++                throw new KeyNotFoundException($"Adapter {id} 未提供操作: {actionId}");
++            using var scope = AdapterExecutionContext.Enter(id);
++            return await provider!.ExecuteActionAsync(actionId, token).ConfigureAwait(false);
++        }
++        finally { _gate.Release(); }
++    }
++
++    private IPluginActionProvider? FindActionProvider(string id)
++    {
++        lock (_sync)
++        {
++            if (!_entries.TryGetValue(id, out var entry) || entry.Adapter is null)
++                throw new KeyNotFoundException($"Adapter 实例未运行: {id}");
++            return entry.Adapter as IPluginActionProvider;
++        }
++    }
++
++    private static IReadOnlyList<PluginActionDescriptor> ReadActions(IPluginActionProvider? provider) =>
++        provider?.Actions.Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Label))
++            .DistinctBy(x => x.Id).ToArray() ?? [];
++}
+--- /dev/null
++++ b/Core/Hosting/Http/HostHttpServer.Adapters.Actions.cs
+@@ -0,0 +1,43 @@
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Routing;
++
++namespace ShiroBot.Hosting.Http;
++
++internal sealed partial class HostHttpServer
++{
++    internal sealed partial class ComponentEndpoints
++    {
++        private void MapAdapterActions(RouteGroupBuilder api)
++        {
++            api.MapGet("/adapters/{id}/actions", async (string id, HttpContext context) =>
++            {
++                if (!IsBearerAuthorized(context, options.Value)) return Results.Unauthorized();
++                try
++                {
++                    var actions = await adapterManager.GetActionsAsync(id, context.RequestAborted);
++                    return Results.Ok(new { actions = actions.Select(x => new
++                    {
++                        id = x.Id, label = x.Label, description = x.Description, tone = NormalizePluginActionTone(x.Tone),
++                        requires_confirmation = x.RequiresConfirmation, confirmation_text = x.ConfirmationText
++                    }) });
++                }
++                catch (KeyNotFoundException ex) { return Results.NotFound(new { error = "adapter_not_found", message = ex.Message }); }
++                catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { return Results.StatusCode(499); }
++                catch (Exception ex) { return Results.Json(new { error = "action_provider_failed", message = ex.Message }, statusCode: 500); }
++            });
++            api.MapPost("/adapters/{id}/actions/{actionId}", async (string id, string actionId, HttpContext context) =>
++            {
++                if (!IsBearerAuthorized(context, options.Value)) return Results.Unauthorized();
++                try
++                {
++                    var result = await adapterManager.ExecuteActionAsync(id, actionId, context.RequestAborted);
++                    return Results.Ok(new { ok = result.Ok, message = result.Message, refresh = result.Refresh, title = result.Title, details = result.Details });
++                }
++                catch (KeyNotFoundException ex) { return Results.NotFound(new { error = "action_not_found", message = ex.Message }); }
++                catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { return Results.StatusCode(499); }
++                catch (Exception ex) { return Results.Json(new { ok = false, message = ex.Message, refresh = false }, statusCode: 500); }
++            });
++        }
++    }
++}
+--- /dev/null
++++ b/Tests/Verification/AdapterActionsVerification.cs
+@@ -0,0 +1,64 @@
++using System.Runtime.CompilerServices;
++using ShiroBot.Adapters;
++using ShiroBot.Components.Reloading;
++using ShiroBot.Components.Updates;
++using ShiroBot.Configuration;
++using ShiroBot.Hosting.Context;
++using ShiroBot.Hosting.Events;
++using ShiroBot.Hosting.Logging;
++using ShiroBot.Hosting.Runtime;
++using ShiroBot.Packages;
++using ShiroBot.Plugins;
++using ShiroBot.Plugins.Loading;
++using ShiroBot.SDK.Core;
++using ShiroBot.SDK.Models;
++using ProbePlugin = ShiroBot.SharedContractPluginProbe.SharedContractPluginProbe;
++
++namespace ShiroBot.Verification;
++
++internal static class AdapterActionsVerification
++{
++    internal static async Task RunAsync()
++    {
++        var root = Path.Combine(Path.GetTempPath(), "ShiroBot.AdapterActions", Guid.NewGuid().ToString("N"));
++        Directory.CreateDirectory(root);
++        var path = Path.Combine(root, "Probe.dll");
++        File.Copy(typeof(ProbePlugin).Assembly.Location, path);
++        var shared = new SharedAssemblyResolver();
++        var models = new ModelPackageRegistry(shared);
++        var logs = new HostLogHub();
++        var runtime = new HostRuntimeState(DateTimeOffset.UtcNow);
++        var context = new BotContext(null, [], [], new WebHostContext("http://127.0.0.1", false), logs);
++        var dispatcher = new HostEventDispatcher(new Lock(), context.ReplySubscriptions, runtime, logs);
++        var adapters = new AdapterManager(root, shared, models, context, new AdapterEventBridge(dispatcher),
++            runtime, logs);
++        var configPath = Path.Combine(root, "config.toml");
++        AdapterInstanceStore.Write(configPath, [new PackageAdapterInstance { Id = "a", Enabled = true }], true);
++        var instance = new InstalledAdapterInstance("a", "lifecycle-probe", path, configPath, true, "Actions");
++        try
++        {
++            await adapters.LoadInstanceAsync(instance);
++            var actions = await adapters.GetActionsAsync("a");
++            if (actions.Count != 1 || actions[0].Id != "ping") throw new Exception("Adapter actions were not filtered.");
++            try { await adapters.ExecuteActionAsync("a", "missing"); throw new Exception("Unknown action accepted."); }
++            catch (KeyNotFoundException) { }
++            using var canceled = new CancellationTokenSource();
++            canceled.Cancel();
++            try { await adapters.ExecuteActionAsync("a", "ping", canceled.Token); throw new Exception("Canceled action executed."); }
++            catch (OperationCanceledException) { }
++            var pending = adapters.ExecuteActionAsync("a", "ping");
++            var stop = adapters.StopByIdAsync("a");
++            var result = await pending;
++            if (!result.Ok || result.Message != "ping") throw new Exception("Adapter action result was lost.");
++            await stop;
++            try { await adapters.GetActionsAsync("a"); throw new Exception("Stopped adapter remained callable."); }
++            catch (KeyNotFoundException) { }
++            Console.WriteLine("Adapter actions: filtering, dispatch, cancellation and stop serialization passed.");
++        }
++        finally
++        {
++            await adapters.StopByIdAsync("a");
++            try { Directory.Delete(root, true); } catch (IOException) { }
++        }
++    }
++}

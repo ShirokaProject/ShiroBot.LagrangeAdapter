@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/ShirokaProject/ShiroBot.LagrangeAdapter</RepositoryUrl>
+  </PropertyGroup>
+</Project>

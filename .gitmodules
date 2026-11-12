@@ -1,0 +1,4 @@
+[submodule "external/LagrangeV2"]
+	path = external/LagrangeV2
+	url = https://github.com/ShirokaProject/Lagrange.Core.git
+	branch = net11-async2

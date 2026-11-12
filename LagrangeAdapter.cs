@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Lagrange.Core;
 using Lagrange.Core.Common;
 using Lagrange.Core.Common.Interface;
@@ -9,16 +10,25 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
+[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
+
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "LagrangeAdapter",
-    Version = "0.1.0",
+    Version = "0.2.0",
     Description = "In-process QQ adapter powered by LagrangeV2 (Lagrange.Core)",
     Protocol = "lagrange-v2")]
-public class LagrangeAdapter : IBotAdapter
+public class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPluginActionProvider
 {
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private CancellationTokenSource? _loginCancellation;
+    private Task? _loginTask;
+    private LagrangeSignProvider? _signProvider;
+    private TaskCompletionSource<string>? _qrReady;
+    private bool _started;
     private LagrangeSession? _session;
+    private readonly LagrangeSession _services = new();
     private readonly LagrangeEventService _eventService = new();
 
     private IMessageService? _message;
@@ -31,11 +41,13 @@ public class LagrangeAdapter : IBotAdapter
     private LagrangeQqSystemApi? _qqSystemApi;
     private LagrangeQqMessageApi? _qqMessageApi;
 
+    public IPluginLifetime Lifetime { get; set; } = null!;
+
     public string Platform => LagrangeMapper.PlatformId;
 
-    public IMessageService Message => _message ?? throw NotStarted();
-    public IChannelService Channel => _channel ?? throw NotStarted();
-    public IUserService User => _user ?? throw NotStarted();
+    public IMessageService Message => _message ??= new LagrangeMessageService(_services);
+    public IChannelService Channel => _channel ??= new LagrangeChannelService(_services);
+    public IUserService User => _user ??= new LagrangeUserService(_services);
     public IEventService Event => _eventService;
     public IConfigContext Config { get; set; } = null!;
     public IConsoleLogger Logger { get; set; } = null!;
@@ -50,27 +62,61 @@ public class LagrangeAdapter : IBotAdapter
         ?? _qqMessageApi as TService
         ?? _session?.Context as TService;
 
+    public IReadOnlyList<PluginActionDescriptor> Actions { get; } =
+    [new("qr-login", "扫码登录", "重新获取二维码，使用手机 QQ 扫描确认。")];
+
     public async Task StartAsync()
     {
-        var config = Config.Load<LagrangeAdapterConfig>();
-        Config.Save(config);
-
-        var keystorePath = ResolveKeystorePath(config);
-        var botConfig = new BotConfig
+        await _lifecycle.WaitAsync();
+        try
         {
-            Protocol = Enum.TryParse<Protocols>(config.Protocol, ignoreCase: true, out var protocol)
-                ? protocol
-                : Protocols.Linux,
-            AutoReconnect = true,
-            AutoReLogin = true
-        };
+            if (_started) throw new InvalidOperationException("适配器已经启动。");
+            var config = Config.Load<LagrangeAdapterConfig>();
+            Config.Save(config);
+            InitializeConnection(config, false);
+            _started = true;
+            Lifetime?.Defer(() => new ValueTask(StopAsync()));
+            if (config.AutoLogin)
+            {
+                _loginTask = LoginAsync(config, false, _loginCancellation!.Token);
+                await _loginTask;
+            }
+            else Logger.Info("Lagrange 已准备就绪，请通过适配器的扫码登录 Action 登录。");
+        }
+        catch
+        {
+            await ClearConnectionAsync();
+            _started = false;
+            throw;
+        }
+        finally { _lifecycle.Release(); }
+    }
 
-        var context = File.Exists(keystorePath)
-            ? BotFactory.Create(botConfig, JsonSerializer.Deserialize<BotKeystore>(
-                await File.ReadAllTextAsync(keystorePath))!)
-            : BotFactory.Create(botConfig);
-
-        _session = new LagrangeSession { Context = context };
+    private void InitializeConnection(LagrangeAdapterConfig config, bool fresh)
+    {
+        var keystorePath = ResolveKeystorePath(config);
+        if (!Enum.TryParse<Protocols>(config.Protocol, true, out var protocol))
+            throw new ArgumentException($"未知 Lagrange 协议: {config.Protocol}");
+        JsonObject? appInfo = string.IsNullOrWhiteSpace(config.AppInfo) ? null
+            : JsonNode.Parse(config.AppInfo) as JsonObject ?? throw new InvalidDataException("AppInfo 必须是 JSON 对象。");
+        if (!string.IsNullOrWhiteSpace(config.AppInfoPath))
+        {
+            if (appInfo is not null) throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
+            appInfo = JsonNode.Parse(File.ReadAllText(ResolveConfigPath(config.AppInfoPath))) as JsonObject
+                ?? throw new InvalidDataException("AppInfo 文件必须是 JSON 对象。");
+        }
+        var resolved = LagrangeConnectionOptions.ResolveAppInfo(protocol, appInfo);
+        _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime?.Stopping ?? CancellationToken.None);
+        if (!string.IsNullOrWhiteSpace(config.SignServer))
+            _signProvider = new LagrangeSignProvider(config.SignServer, _loginCancellation.Token);
+        var botConfig = new BotConfig { Protocol = protocol, AutoReconnect = true, AutoReLogin = true, SignProvider = _signProvider };
+        Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
+        var context = !fresh && File.Exists(keystorePath)
+            ? BotFactory.Create(botConfig, JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath))
+                ?? throw new InvalidDataException("Keystore 内容为空。"), resolved)
+            : BotFactory.Create(botConfig, resolved);
+        _services.ActiveContext = context;
+        _session = _services;
         _message = new LagrangeMessageService(_session);
         _channel = new LagrangeChannelService(_session);
         _user = new LagrangeUserService(_session);
@@ -83,38 +129,88 @@ public class LagrangeAdapter : IBotAdapter
         RegisterLifecycleEvents(context, keystorePath);
         _eventService.Attach(_session);
 
-        Logger.Info($"Lagrange 开始登录(协议: {botConfig.Protocol})...");
+    }
 
-        var success = string.IsNullOrWhiteSpace(config.Password) || config.Uin == 0
-            ? await context.Login()          // 二维码 或 已有 keystore session
-            : await context.Login(config.Uin, config.Password);
-
-        if (!success)
-        {
-            Logger.Error("Lagrange 登录失败,请查看上方日志(二维码/验证码/密码错误)。");
-            throw new InvalidOperationException("Lagrange 登录失败。");
-        }
-
-        LagrangeMapper.SelfId = context.BotUin.ToString();
+    private async Task LoginAsync(LagrangeAdapterConfig config, bool qr, CancellationToken token)
+    {
+        var context = _services.Context;
+        Logger.Info($"Lagrange 开始登录(协议: {config.Protocol})...");
+        var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.Uin == 0
+            ? await context.Login(token)
+            : await context.Login(config.Uin, config.Password, token);
+        if (!success) throw new InvalidOperationException("Lagrange 登录失败，请查看协议日志。");
         Logger.Success($"Lagrange 登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
+    }
+
+    public async Task<PluginActionResult> ExecuteActionAsync(string actionId, CancellationToken cancellationToken = default)
+    {
+        if (actionId != "qr-login") return new(false, $"未知 Action: {actionId}");
+        await _lifecycle.WaitAsync(cancellationToken);
+        try
+        {
+            if (!_started) return new(false, "请先启动适配器。");
+            await ClearConnectionAsync();
+            var config = Config.Load<LagrangeAdapterConfig>();
+            InitializeConnection(config, true); // Explicit QR login bypasses password and saved tickets.
+            _qrReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            async Task Run(CancellationToken unused)
+            {
+                try { await LoginAsync(config, true, _loginCancellation!.Token); }
+                catch (OperationCanceledException) { _qrReady?.TrySetCanceled(); }
+                catch (Exception ex) { _qrReady?.TrySetException(ex); Logger.Error($"Lagrange 登录失败: {ex.Message}"); }
+            }
+            _loginTask = Lifetime is null ? Run(CancellationToken.None) : Lifetime.Run(Run);
+            try
+            {
+                var path = await _qrReady.Task.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+                return new(true, "二维码已生成，请使用手机 QQ 扫码。") { Details = path, Title = "扫码登录" };
+            }
+            catch (TimeoutException) { return new(true, "正在获取二维码，请查看日志中的二维码路径。"); }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await ClearConnectionAsync();
+            return new(false, $"扫码登录失败: {ex.Message}");
+        }
+        finally { _lifecycle.Release(); }
     }
 
     public async Task StopAsync()
     {
-        if (_session is { Context: var context })
-        {
-            try
-            {
-                await context.Logout();
-            }
-            catch
-            {
-                // 登出失败不阻塞停止流程
-            }
-
-            context.Dispose();
-        }
+        try { _loginCancellation?.Cancel(); } catch (ObjectDisposedException) { }
+        await _lifecycle.WaitAsync();
+        try { _started = false; await ClearConnectionAsync(); }
+        finally { _lifecycle.Release(); }
     }
+
+    private async Task ClearConnectionAsync()
+    {
+        _loginCancellation?.Cancel();
+        if (_loginTask is not null)
+        {
+            try { await _loginTask; } catch (Exception ex) { Logger?.Warning($"登录任务结束: {ex.Message}"); }
+        }
+        _loginTask = null;
+        _qrReady = null;
+        var context = _session?.ActiveContext;
+        _session = null;
+        _eventService.Detach();
+        _services.ActiveContext = null;
+        _services.Clear();
+        _qqFriendApi = null;
+        _qqGroupApi = null;
+        _qqFileApi = null;
+        _qqSystemApi = null;
+        _qqMessageApi = null;
+        context?.Dispose();
+        _signProvider?.Dispose();
+        _signProvider = null;
+        _loginCancellation?.Dispose();
+        _loginCancellation = null;
+    }
+
+    private string ResolveConfigPath(string path) =>
+        Path.GetFullPath(path, Path.GetDirectoryName(Path.GetFullPath(Config.ConfigPath))!);
 
     private void RegisterLifecycleEvents(BotContext context, string keystorePath)
     {
@@ -133,14 +229,16 @@ public class LagrangeAdapter : IBotAdapter
                 case Lagrange.Core.Events.EventArgs.LogLevel.Information:
                     Logger.Info(text);
                     break;
-                // Debug/Trace 不刷屏
+                    // Debug/Trace 不刷屏
             }
         });
 
         context.EventInvoker.RegisterEvent<BotQrCodeEvent>(async (_, e) =>
         {
+            if (!ReferenceEquals(_services.ActiveContext, context)) return;
             var pngPath = Path.Combine(Path.GetDirectoryName(keystorePath)!, "qrcode.png");
             await File.WriteAllBytesAsync(pngPath, e.Image);
+            _qrReady?.TrySetResult(pngPath);
             Logger.Warning($"请扫码登录 QQ。二维码已保存: {pngPath}");
             Logger.Warning($"或使用链接生成二维码: {e.Url}");
         });
@@ -153,7 +251,7 @@ public class LagrangeAdapter : IBotAdapter
             }
             else if (e.State == BotQrCodeQueryEvent.TransEmpState.CodeExpired)
             {
-                Logger.Warning("二维码已过期,请重启适配器重新获取。");
+                Logger.Warning("二维码已过期,请重新执行扫码登录 Action。");
             }
         });
 
@@ -165,6 +263,7 @@ public class LagrangeAdapter : IBotAdapter
 
         context.EventInvoker.RegisterEvent<BotRefreshKeystoreEvent>(async (_, e) =>
         {
+            if (!ReferenceEquals(_services.ActiveContext, context)) return;
             Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
             await File.WriteAllTextAsync(keystorePath, JsonSerializer.Serialize(e.Keystore));
         });
@@ -177,19 +276,29 @@ public class LagrangeAdapter : IBotAdapter
     {
         if (!string.IsNullOrWhiteSpace(config.KeystorePath))
         {
-            return config.KeystorePath;
+            return Path.GetFullPath(config.KeystorePath, Path.GetDirectoryName(Path.GetFullPath(Config.ConfigPath))!);
         }
 
         var configDir = Path.GetDirectoryName(Config.ConfigPath) ?? AppContext.BaseDirectory;
-        return Path.Combine(configDir, "lagrange-keystore.json");
+        return Path.GetFullPath(Path.Combine(configDir, "lagrange-keystore.json"));
     }
 
-    private static InvalidOperationException NotStarted() =>
-        new("Lagrange 适配器尚未启动。");
 }
 
 public sealed class LagrangeAdapterConfig
 {
+    /// <summary>启动后自动恢复会话或登录；false 时由 Action 触发扫码。</summary>
+    public bool AutoLogin { get; set; } = true;
+
+    /// <summary>覆盖当前协议内置 AppInfo 的字段，可只提供需要修改的字段。</summary>
+    public string? AppInfo { get; set; }
+
+    /// <summary>AppInfo JSON 文件路径，相对于适配器配置目录。与 AppInfo 互斥。</summary>
+    public string? AppInfoPath { get; set; }
+
+    /// <summary>完整签名 POST 端点，留空使用 Lagrange 默认签名服务。</summary>
+    public string? SignServer { get; set; }
+
     /// <summary>QQ 号。配合 Password 使用密码登录;留 0 使用二维码登录。</summary>
     public long Uin { get; set; }
 

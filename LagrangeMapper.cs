@@ -2,7 +2,7 @@ using Lagrange.Core.Common;
 using Lagrange.Core.Common.Entity;
 using Lagrange.Core.Message;
 using Lagrange.Core.Message.Entities;
-using ShiroBot.Qq.Model;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
 using Sdk = ShiroBot.SDK.Models;
 
@@ -10,29 +10,28 @@ namespace ShiroBot.LagrangeAdapter;
 
 /// <summary>
 /// Lagrange.Core 模型 ↔ ShiroBot 核心模型 + 通用 QQ 模型的映射。
-/// 与 Milky/OneBot 适配器保持同构:Raw 携带 Qq.Model 类型,PlatformEvent Kind 复用 QqEventKinds。
+/// 与 Milky/OneBot 适配器保持同构:Raw 携带 Qq.Model 类型,PlatformEvent Kind 复用 QEventKinds。
 /// </summary>
 public static class LagrangeMapper
 {
     public const string PlatformId = "qq";
 
-    internal static string? SelfId { get; set; }
 
     // ─── 实体 ───
 
-    public static QqFriend ToQq(BotFriend friend) => new()
+    public static QFriend ToQq(BotFriend friend) => new()
     {
-        UserId = friend.Uin,
+        UserId = (friend.Uin).ToString(),
         Nickname = friend.Nickname,
         Sex = ToQqSex(friend.Gender),
         Qid = string.IsNullOrEmpty(friend.Qid) ? null : friend.Qid,
         Remark = string.IsNullOrEmpty(friend.Remarks) ? null : friend.Remarks,
-        Category = new QqFriendCategory(friend.Category.Id, friend.Category.Name)
+        Category = new QFriendCategory(friend.Category.Id, friend.Category.Name)
     };
 
-    public static QqGroup ToQq(BotGroup group) => new()
+    public static QGroup ToQq(BotGroup group) => new()
     {
-        GroupId = group.GroupUin,
+        GroupId = (group.GroupUin).ToString(),
         GroupName = group.GroupName,
         MemberCount = group.MemberCount,
         MaxMemberCount = group.MaxMember,
@@ -41,39 +40,96 @@ public static class LagrangeMapper
         Announcement = group.Announcement
     };
 
-    public static QqGroupMember ToQq(BotGroupMember member) => new()
+    public static QGroupMember ToQq(BotGroupMember member) => new()
     {
-        UserId = member.Uin,
+        UserId = (member.Uin).ToString(),
         Nickname = member.Nickname,
-        GroupId = member.Group.GroupUin,
+        GroupId = (member.Group.GroupUin).ToString(),
         Card = string.IsNullOrEmpty(member.MemberCard) ? null : member.MemberCard,
         Title = string.IsNullOrEmpty(member.SpecialTitle) ? null : member.SpecialTitle,
         Level = member.GroupLevel,
         Role = member.Permission switch
         {
-            GroupMemberPermission.Owner => QqGroupRole.Owner,
-            GroupMemberPermission.Admin => QqGroupRole.Admin,
-            _ => QqGroupRole.Member
+            GroupMemberPermission.Owner => QGroupRole.Owner,
+            GroupMemberPermission.Admin => QGroupRole.Admin,
+            _ => QGroupRole.Member
         },
         JoinTime = ToOffset(member.JoinTime),
         LastSentTime = ToOffset(member.LastMsgTime),
-        ShutUpEndTime = member.ShutUpTimestamp > DateTime.UtcNow ? ToOffset(member.ShutUpTimestamp) : null
+        ShutUpEndTime = member.ShutUpTimestamp > DateTimeOffset.UtcNow.ToUnixTimeSeconds() ? ToOffset(member.ShutUpTimestamp) : null
     };
 
-    private static QqSex ToQqSex(BotGender gender) => gender switch
+    private static QSex ToQqSex(BotGender gender) => gender switch
     {
-        BotGender.Male => QqSex.Male,
-        BotGender.Female => QqSex.Female,
-        _ => QqSex.Unknown
+        BotGender.Male => QSex.Male,
+        BotGender.Female => QSex.Female,
+        _ => QSex.Unknown
     };
 
-    private static DateTimeOffset? ToOffset(DateTime time) =>
-        time == default ? null : new DateTimeOffset(time.ToUniversalTime());
+    public static QGroupFile ToQq(BotFileEntry file, string groupId) => new()
+    {
+        GroupId = groupId,
+        FileId = file.FileId,
+        FileName = file.FileName,
+        ParentFolderId = file.ParentDirectory,
+        FileSize = checked((long)file.FileSize),
+        UploadedTime = ToOffset(file.UploadedTime),
+        ExpireTime = ToOffset(file.ExpireTime),
+        UploaderId = file.UploaderUin.ToString(),
+        DownloadedTimes = checked((int)file.DownloadedTimes)
+    };
+
+    public static QGroupFolder ToQq(BotFolderEntry folder, string groupId) => new()
+    {
+        GroupId = groupId,
+        FolderId = folder.FolderId,
+        FolderName = folder.FolderName,
+        ParentFolderId = folder.ParentFolderId,
+        CreatedTime = ToOffset(folder.CreateTime),
+        LastModifiedTime = ToOffset(folder.ModifiedTime),
+        CreatorId = folder.CreatorUin.ToString(),
+        FileCount = checked((int)folder.TotalFileCount)
+    };
+
+    internal static QGroupJoinRequest? ToJoinRequest(BotGroupNotificationBase notification) => notification switch
+    {
+        BotGroupJoinNotification join => new QGroupJoinRequest
+        {
+            GroupId = join.GroupUin.ToString(),
+            UserId = join.TargetUin.ToString(),
+            RequestId = join.Sequence.ToString(),
+            Comment = join.Comment,
+            IsFiltered = join.IsFiltered,
+            State = ToRequestState(join.State)
+        },
+        BotGroupInviteNotification invite => new QGroupJoinRequest
+        {
+            GroupId = invite.GroupUin.ToString(),
+            UserId = invite.TargetUin.ToString(),
+            RequestId = invite.Sequence.ToString(),
+            InviterId = invite.InviterUin.ToString(),
+            IsInvited = true,
+            IsFiltered = invite.IsFiltered,
+            State = ToRequestState(invite.State)
+        },
+        _ => null
+    };
+
+    private static QRequestState ToRequestState(BotGroupNotificationState state) => state switch
+    {
+        BotGroupNotificationState.Accept => QRequestState.Accepted,
+        BotGroupNotificationState.Reject => QRequestState.Rejected,
+        _ => QRequestState.Pending
+    };
+
+    private static DateTimeOffset? ToOffset(long time) =>
+        time == default ? null : DateTimeOffset.FromUnixTimeSeconds(time);
 
     // ─── 入站消息 ───
 
-    public static MessageEvent ToMessageEvent(BotMessage message)
+    public static MessageEvent ToMessageEvent(BotMessage message, string? selfId = null)
     {
+        var directPeer = message.Contact.Uin.ToString() == selfId ? message.Receiver : message.Contact;
         var (channel, sender, member, qqMessage) = message.Contact switch
         {
             BotGroupMember groupMember => (
@@ -94,39 +150,39 @@ public static class LagrangeMapper
                     },
                     JoinedAt = ToOffset(groupMember.JoinTime)
                 },
-                (QqIncomingMessage)new QqGroupMessage
+                (QIncomingMessage)new QGroupMessage
                 {
-                    PeerId = groupMember.Group.GroupUin,
-                    MessageSeq = (long)message.Sequence,
-                    SenderId = groupMember.Uin,
-                    Time = new DateTimeOffset(message.Time.ToUniversalTime()),
+                    PeerId = (groupMember.Group.GroupUin).ToString(),
+                    MessageId = ((long)message.Sequence).ToString(),
+                    SenderId = (groupMember.Uin).ToString(),
+                    Time = DateTimeOffset.FromUnixTimeSeconds(message.Time),
                     Segments = ToQqSegments(message.Entities),
                     Group = ToQq(groupMember.Group),
                     GroupMember = ToQq(groupMember)
                 }),
             BotFriend friend => (
-                Sdk.Channel.Direct(friend.Uin.ToString()),
+                Sdk.Channel.Direct(directPeer.Uin.ToString()),
                 new Sdk.User(friend.Uin.ToString()) { Name = friend.Nickname },
                 (Member?)null,
-                (QqIncomingMessage)new QqFriendMessage
+                (QIncomingMessage)new QFriendMessage
                 {
-                    PeerId = friend.Uin,
-                    MessageSeq = (long)message.Sequence,
-                    SenderId = friend.Uin,
-                    Time = new DateTimeOffset(message.Time.ToUniversalTime()),
+                    PeerId = directPeer.Uin.ToString(),
+                    MessageId = ((long)message.Sequence).ToString(),
+                    SenderId = (friend.Uin).ToString(),
+                    Time = DateTimeOffset.FromUnixTimeSeconds(message.Time),
                     Segments = ToQqSegments(message.Entities),
-                    Friend = ToQq(friend)
+                    Friend = ToQq(directPeer as BotFriend ?? friend)
                 }),
             _ => (
                 new Sdk.Channel(message.Contact.Uin.ToString(), ChannelType.Other),
                 new Sdk.User(message.Contact.Uin.ToString()) { Name = message.Contact.Nickname },
                 (Member?)null,
-                (QqIncomingMessage)new QqTempMessage
+                (QIncomingMessage)new QTempMessage
                 {
-                    PeerId = message.Contact.Uin,
-                    MessageSeq = (long)message.Sequence,
-                    SenderId = message.Contact.Uin,
-                    Time = new DateTimeOffset(message.Time.ToUniversalTime()),
+                    PeerId = (message.Contact.Uin).ToString(),
+                    MessageId = ((long)message.Sequence).ToString(),
+                    SenderId = (message.Contact.Uin).ToString(),
+                    Time = DateTimeOffset.FromUnixTimeSeconds(message.Time),
                     Segments = ToQqSegments(message.Entities)
                 })
         };
@@ -134,14 +190,14 @@ public static class LagrangeMapper
         return new MessageEvent
         {
             Platform = PlatformId,
-            SelfId = SelfId,
+            SelfId = selfId,
             Raw = qqMessage,
             MessageId = message.Sequence.ToString(),
             Channel = channel,
             Sender = sender,
             Member = member,
             Segments = ToSegments(message.Entities),
-            Timestamp = new DateTimeOffset(message.Time.ToUniversalTime())
+            Timestamp = DateTimeOffset.FromUnixTimeSeconds(message.Time)
         };
     }
 
@@ -152,6 +208,7 @@ public static class LagrangeMapper
 
     private static MessageSegment ToSegment(IMessageEntity entity) => entity switch
     {
+        FaceEntity face => new RawSegment(PlatformId, "face", new QIncomingFace(face.FaceId.ToString(), face.IsLarge)),
         TextEntity text => new TextSegment(text.Text),
         MentionEntity { Uin: 0 } => new MentionAllSegment(),
         MentionEntity mention => new MentionSegment(mention.Uin.ToString()) { DisplayName = mention.Display },
@@ -179,38 +236,41 @@ public static class LagrangeMapper
             FileSize = file.FileSize
         },
         MultiMsgEntity multi => new RawSegment(PlatformId, "forward",
-            new QqForwardIncoming(multi.ResId ?? string.Empty)),
+            new QIncomingForward(multi.ResId ?? string.Empty)),
         LightAppEntity lightApp => new RawSegment(PlatformId, "light_app",
-            new QqLightAppIncoming(lightApp.AppName, lightApp.Payload)),
+            new QIncomingLightApp(lightApp.AppName, lightApp.Payload)),
         _ => new RawSegment(PlatformId, entity.GetType().Name, entity)
     };
 
     // ─── 段:Lagrange → Qq.Model(用于 Raw) ───
 
-    public static IReadOnlyList<QqIncomingSegment> ToQqSegments(MessageChain chain) =>
+    public static IReadOnlyList<QIncomingSegment> ToQqSegments(MessageChain chain) =>
         chain.Select(ToQqSegment).ToArray();
 
-    private static QqIncomingSegment ToQqSegment(IMessageEntity entity) => entity switch
+    private static QIncomingSegment ToQqSegment(IMessageEntity entity) => entity switch
     {
-        TextEntity text => new QqTextIncoming(text.Text),
-        MentionEntity { Uin: 0 } => new QqMentionAllIncoming(),
-        MentionEntity mention => new QqMentionIncoming(mention.Uin, mention.Display ?? string.Empty),
-        ReplyEntity reply => new QqReplyIncoming((long)reply.SrcSequence),
-        ImageEntity image => new QqImageIncoming(image.FileUuid ?? string.Empty, image.FileUrl ?? string.Empty)
+        FaceEntity face => new QIncomingFace(face.FaceId.ToString(), face.IsLarge),
+        MarketFaceEntity face => new QIncomingMarketFace(face.EmojiId, face.Url)
+        { EmojiPackageId = face.EmojiPackageId, Key = face.Key, Summary = face.Summary },
+        TextEntity text => new QIncomingText(text.Text),
+        MentionEntity { Uin: 0 } => new QIncomingMentionAll(),
+        MentionEntity mention => new QIncomingMention(mention.Uin.ToString(), mention.Display ?? string.Empty),
+        ReplyEntity reply => new QIncomingReply(reply.SrcSequence.ToString()),
+        ImageEntity image => new QIncomingImage(image.FileUuid ?? string.Empty, image.FileUrl ?? string.Empty)
         {
             Width = (int)image.ImageSize.X,
             Height = (int)image.ImageSize.Y,
             Summary = image.Summary
         },
-        RecordEntity record => new QqRecordIncoming(record.FileUuid ?? string.Empty, record.FileUrl ?? string.Empty)
+        RecordEntity record => new QIncomingRecord(record.FileUuid ?? string.Empty, record.FileUrl ?? string.Empty)
         {
             Duration = TimeSpan.FromSeconds(record.RecordLength)
         },
-        VideoEntity video => new QqVideoIncoming(video.FileUuid ?? string.Empty, video.FileUrl ?? string.Empty),
-        GroupFileEntity file => new QqFileIncoming(file.FileId, file.FileName, file.FileSize),
-        MultiMsgEntity multi => new QqForwardIncoming(multi.ResId ?? string.Empty),
-        LightAppEntity lightApp => new QqLightAppIncoming(lightApp.AppName, lightApp.Payload),
-        _ => new QqTextIncoming(string.Empty)
+        VideoEntity video => new QIncomingVideo(video.FileUuid ?? string.Empty, video.FileUrl ?? string.Empty),
+        GroupFileEntity file => new QIncomingFile(file.FileId, file.FileName, file.FileSize),
+        MultiMsgEntity multi => new QIncomingForward(multi.ResId ?? string.Empty),
+        LightAppEntity lightApp => new QIncomingLightApp(lightApp.AppName, lightApp.Payload),
+        _ => new QIncomingText(string.Empty)
     };
 
     // ─── 段:核心/Qq → Lagrange(出站) ───
@@ -244,7 +304,7 @@ public static class LagrangeMapper
                     }
                     break;
                 case EmojiSegment:
-                    // Lagrange.Core 暂无 FaceEntity
+                    // 上游 FaceEntity.Build 尚未实现，当前仅支持入站表情。
                     throw Unsupported("QQ 表情段(FaceEntity)");
                 case ImageSegment image:
                     chain.Add(new ImageEntity(await OpenResourceAsync(image.Uri).ConfigureAwait(false),
@@ -260,14 +320,14 @@ public static class LagrangeMapper
                         video.ThumbnailUri is null ? null : await OpenResourceAsync(video.ThumbnailUri).ConfigureAwait(false),
                         disposeOnCompletion: true));
                     break;
-                case RawSegment { Payload: QqOutgoingSegment qqOutgoing }:
+                case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
                     await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted).ConfigureAwait(false);
                     break;
                 case RawSegment { Payload: IMessageEntity lagrangeEntity }:
                     chain.Add(lagrangeEntity);
                     break;
                 case Sdk.FileSegment:
-                    throw Unsupported("消息内文件段(请使用 IQqFileApi.UploadGroupFileAsync/UploadPrivateFileAsync)");
+                    throw Unsupported("消息内文件段(请使用 IQFileApi.UploadGroupFileAsync/UploadPrivateFileAsync)");
                 default:
                     throw Unsupported(segment.GetType().Name);
             }
@@ -278,47 +338,47 @@ public static class LagrangeMapper
 
     public static async Task AppendQqSegmentAsync(
         MessageChain chain,
-        QqOutgoingSegment segment,
+        QOutgoingSegment segment,
         Func<string, Task<BotMessage?>> resolveQuoted)
     {
         switch (segment)
         {
-            case QqTextOutgoing text:
+            case QOutgoingText text:
                 chain.Add(new TextEntity(text.Text));
                 break;
-            case QqMentionAllOutgoing:
+            case QOutgoingMentionAll:
                 chain.Add(new MentionEntity(0, "@全体成员"));
                 break;
-            case QqMentionOutgoing mention:
-                chain.Add(new MentionEntity(mention.UserId, null));
+            case QOutgoingMention mention:
+                chain.Add(new MentionEntity(ParseId(mention.UserId, "UserId"), null));
                 break;
-            case QqReplyOutgoing reply:
-                var quoted = await resolveQuoted(reply.MessageSeq.ToString()).ConfigureAwait(false);
+            case QOutgoingReply reply:
+                var quoted = await resolveQuoted(reply.MessageId.ToString()).ConfigureAwait(false);
                 if (quoted is not null)
                 {
                     chain.Add(new ReplyEntity(quoted));
                 }
                 break;
-            case QqImageOutgoing image:
+            case QOutgoingImage image:
                 chain.Add(new ImageEntity(await OpenResourceAsync(image.Uri).ConfigureAwait(false),
                     image.Summary ?? "[图片]", disposeOnCompletion: true));
                 break;
-            case QqRecordOutgoing record:
+            case QOutgoingRecord record:
                 chain.Add(new RecordEntity(await OpenResourceAsync(record.Uri).ConfigureAwait(false),
                     disposeOnCompletion: true));
                 break;
-            case QqVideoOutgoing video:
+            case QOutgoingVideo video:
                 chain.Add(new VideoEntity(
                     await OpenResourceAsync(video.Uri).ConfigureAwait(false),
                     video.ThumbUri is null ? null : await OpenResourceAsync(video.ThumbUri).ConfigureAwait(false),
                     disposeOnCompletion: true));
                 break;
-            case QqLightAppOutgoing lightApp:
+            case QOutgoingLightApp lightApp:
                 chain.Add(new LightAppEntity(lightApp.JsonPayload));
                 break;
-            case QqFaceOutgoing:
+            case QOutgoingFace:
                 throw Unsupported("QQ 表情段(FaceEntity)");
-            case QqForwardOutgoing forward:
+            case QOutgoingForward forward:
                 chain.Add(await ToMultiMsgAsync(forward, resolveQuoted).ConfigureAwait(false));
                 break;
             default:
@@ -328,7 +388,7 @@ public static class LagrangeMapper
 
     /// <summary>合并转发 → MultiMsgEntity(伪造消息)。</summary>
     public static async Task<MultiMsgEntity> ToMultiMsgAsync(
-        QqForwardOutgoing forward,
+        QOutgoingForward forward,
         Func<string, Task<BotMessage?>> resolveQuoted)
     {
         var messages = new List<BotMessage>();
@@ -342,9 +402,9 @@ public static class LagrangeMapper
 
             messages.Add(BotMessage.CreateCustomGroup(
                 0,
-                message.UserId,
+                ParseId(message.UserId, "UserId"),
                 message.SenderName,
-                (message.Time ?? DateTimeOffset.Now).LocalDateTime,
+                (message.Time ?? DateTimeOffset.Now).ToUnixTimeSeconds(),
                 chain));
         }
 
