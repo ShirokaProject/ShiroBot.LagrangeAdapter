@@ -213,6 +213,23 @@ if (legacyApp.SdkInfo.MiscBitMap != 123 || legacyApp.SdkInfo.SdkVersion != "lega
     throw new Exception("Legacy flat AppInfo fields were not moved into SdkInfo.");
 Console.WriteLine("Legacy AppInfo compatibility checks passed.");
 
+var rejectedSigner = (IDisposable)Activator.CreateInstance(signType,
+    [new LagrangeAdapterConfig { SignServer = "http://localhost/sign", SignToken = "secret-test" }, CancellationToken.None, new RejectSignHandler()])!;
+using (rejectedSigner)
+{
+    try
+    {
+        await ((Lagrange.Core.Common.BotSignProvider)rejectedSigner).GetSecSign(1, "wtlogin.login", 1, new byte[] { 1 });
+        throw new Exception("Signing rejection was accepted.");
+    }
+    catch (HttpRequestException ex)
+    {
+        if (!ex.Message.Contains("HTTP 400") || !ex.Message.Contains("签名参数无效") || ex.Message.Contains("secret-test"))
+            throw new Exception("Signing errors must be readable and redact tokens.");
+    }
+}
+Console.WriteLine("Signing failure reporting and token redaction checks passed.");
+
 sealed class SignHandler : HttpMessageHandler
 {
     public bool Checked { get; private set; }
@@ -237,4 +254,11 @@ sealed class MilkySignHandler : HttpMessageHandler
             !string.IsNullOrEmpty(body["guid"]!.GetValue<string>()) && !string.IsNullOrEmpty(body["qua"]!.GetValue<string>());
         return new(System.Net.HttpStatusCode.OK) { Content = new StringContent("{\"code\":0,\"value\":{\"sec_sign\":\"aabb\",\"sec_token\":\"cc\",\"sec_extra\":\"dd\"}}", System.Text.Encoding.UTF8, "application/json") };
     }
+}
+
+sealed class RejectSignHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) =>
+        Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+        { Content = new StringContent("{\"message\":\"签名参数无效 secret-test\"}", System.Text.Encoding.UTF8, "application/json") });
 }

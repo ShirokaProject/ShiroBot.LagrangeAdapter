@@ -176,6 +176,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private async Task LoginAsync(LagrangeAdapterConfig config, bool qr, CancellationToken token)
     {
         var context = _services.Context;
+        LagrangeConnectionOptions.ValidatePlatform(context.Config.Protocol, context.AppInfo);
         _loginStatus = qr ? "waiting_scan" : "logging_in";
         Logger.Info($"Lagrange 开始登录(协议: {config.Protocol})...");
         var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.AccountUin == 0
@@ -201,7 +202,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             {
                 try { await LoginAsync(config, true, _loginCancellation!.Token); }
                 catch (OperationCanceledException) { _qrReady?.TrySetCanceled(); }
-                catch (Exception ex) { _loginStatus = "failed"; _qrReady?.TrySetException(ex); Logger.Error($"Lagrange 登录失败: {ex.Message}"); }
+                catch (Exception ex) { _loginStatus = "failed"; _loginError = DescribeLoginFailure(ex, config); _qrReady?.TrySetException(ex); Logger.Error($"Lagrange 登录失败: {_loginError}"); }
             }
             _loginTask = Lifetime is null ? Run(CancellationToken.None) : Lifetime.Run(Run);
             try
@@ -213,8 +214,11 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            var error = _loginError ?? ex.GetBaseException().Message;
             await ClearConnectionAsync();
-            return new(false, $"扫码登录失败: {ex.Message}");
+            _loginStatus = "failed";
+            _loginError = error;
+            return new(false, $"扫码登录失败: {error}");
         }
         finally { _lifecycle.Release(); }
     }
@@ -237,6 +241,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _loginTask = null;
         _qrReady = null;
         _qrImage = null;
+        _loginError = null;
         _verificationUrl = null;
         _loginStatus = "ready";
         var context = _session?.ActiveContext;

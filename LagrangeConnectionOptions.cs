@@ -32,6 +32,19 @@ internal static class LagrangeConnectionOptions
         return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
     }
 
+    internal static void ValidatePlatform(Protocols protocol, BotAppInfo info)
+    {
+        var os = info.Os?.ToLowerInvariant();
+        var mismatch = protocol switch
+        {
+            Protocols.Linux => os != "linux",
+            Protocols.MacOs => os is not ("mac" or "macos" or "osx"),
+            Protocols.Windows => os is not ("windows" or "win"),
+            _ => false
+        };
+        if (mismatch) throw new ArgumentException($"客户端平台 {protocol} 与 AppInfo.Os={info.Os} 不一致，请使用同一平台的 AppInfo 和签名服务。");
+    }
+
     private static void Merge(JsonObject target, JsonObject source)
     {
         foreach (var (key, value) in source)

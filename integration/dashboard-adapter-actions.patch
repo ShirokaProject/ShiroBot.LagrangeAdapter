@@ -1,27 +1,102 @@
+diff --git a/src/api/plugins/pages.ts b/src/api/plugins/pages.ts
+index 560dd44..c421d79 100644
+--- a/src/api/plugins/pages.ts
++++ b/src/api/plugins/pages.ts
+@@ -30,8 +30,8 @@ export function pluginPagesPath(pluginId: string) {
+ export function pluginPagePath(pluginId: string, pageId: string) {
+   return `${pluginPagesPath(pluginId)}/${encodeURIComponent(pageId)}`
+ }
+-export function getPluginPages(pluginId: string, signal?: AbortSignal) {
+-  return apiRequest<{ pages: PluginPage[] }>(pluginPagesPath(pluginId), { signal })
++export function getPluginPages(pluginId: string, signal?: AbortSignal, kind: 'plugins' | 'adapters' = 'plugins') {
++  return apiRequest<{ pages: PluginPage[] }>(kind === 'adapters' ? `/api/v1/adapters/${encodeURIComponent(pluginId)}/pages` : pluginPagesPath(pluginId), { signal })
+ }
+ export function getPluginPageData(pluginId: string, pageId: string, page: number, pageSize: number,
+   filters: Record<string, string>, signal?: AbortSignal) {
 diff --git a/src/views/adapters/components/AdapterDetail.vue b/src/views/adapters/components/AdapterDetail.vue
-index 42b4dc8..cb3d731 100644
+index 42b4dc8..561acbf 100644
 --- a/src/views/adapters/components/AdapterDetail.vue
 +++ b/src/views/adapters/components/AdapterDetail.vue
-@@ -42,6 +42,10 @@
+@@ -42,6 +42,8 @@
        <AdapterMarketFacts :entry="marketEntry" :repository="adapter.repository" />
      </dl>
  
 +    <AdapterActions :id="adapter.id" :loaded="adapter.loaded" :busy="busy" />
 +
-+    <AdapterPages :id="adapter.id" :loaded="adapter.loaded" />
-+
      <footer class="detail-foot button-group">
        <button type="button" class="md-button tonal" :disabled="busy" @click="emit('config')">
          <MdIcon name="settings" />配置
-@@ -55,6 +59,8 @@
+@@ -55,6 +57,7 @@
  
  <script setup lang="ts">
  import AdapterMarketFacts from './AdapterMarketFacts.vue'
 +import AdapterActions from './AdapterActions.vue'
-+import AdapterPages from './AdapterPages.vue'
  import MdIcon from '../../../components/MdIcon.vue'
  import type { AdapterMarketEntry, AdapterStatus } from '../../../api'
  
+diff --git a/src/views/pluginConfig/PluginConfig.vue b/src/views/pluginConfig/PluginConfig.vue
+index f67ca40..bc8f8a1 100644
+--- a/src/views/pluginConfig/PluginConfig.vue
++++ b/src/views/pluginConfig/PluginConfig.vue
+@@ -73,7 +73,7 @@
+           :show-listeners="hasRoutes && listeners !== undefined"
+         />
+         <div class="page-main">
+-          <PluginPagePanel v-if="activePage" :key="`${pluginId}:${activePage.id}`" :plugin-id="pluginId" :definition="activePage" />
++          <PluginPagePanel v-if="activePage" :key="`${pluginId}:${activePage.id}`" :plugin-id="pluginId" :definition="activePage" :owner-kind="target === 'adapter' ? 'adapters' : 'plugins'" />
+           <PluginConfigForm v-else
+             v-model:route-groups="routeGroups"
+             :view="view"
+@@ -222,7 +222,7 @@ async function switchTo(kind: ConfigTarget, id: string) {
+ 
+ // Current category: a group key or ROUTES_VIEW; reset per target, first group once loaded.
+ const view = ref('')
+-const pageNavigation = usePluginPages(pluginId, () => target.value === 'plugin')
++const pageNavigation = usePluginPages(pluginId, () => true, () => target.value)
+ const activePage = computed(() => selectedPluginPage(pageNavigation.pages.value, view.value))
+ let pendingPage = typeof route.query.page === 'string' ? route.query.page : ''
+ watch([pluginId, target, () => route.query.page], () => {
+diff --git a/src/views/pluginConfig/components/PluginConfigDialog.vue b/src/views/pluginConfig/components/PluginConfigDialog.vue
+index ab345b5..db304d6 100644
+--- a/src/views/pluginConfig/components/PluginConfigDialog.vue
++++ b/src/views/pluginConfig/components/PluginConfigDialog.vue
+@@ -37,7 +37,7 @@
+         :show-listeners="state.hasRoutes.value && state.listeners.value !== undefined"
+       />
+       <div class="ws-content">
+-        <PluginPagePanel v-if="activePage" :key="`${pluginId}:${activePage.id}`" :plugin-id="pluginId" :definition="activePage" />
++        <PluginPagePanel v-if="activePage" :key="`${pluginId}:${activePage.id}`" :plugin-id="pluginId" :definition="activePage" :owner-kind="target === 'adapter' ? 'adapters' : 'plugins'" />
+         <PluginConfigForm v-else
+           v-model:instance="instanceDraft"
+           :instance-error="instanceDirty ? idError : ''"
+@@ -102,7 +102,7 @@ const state = usePluginConfig(activeId, () => props.target)
+ 
+ // Current category: a group key or ROUTES_VIEW. Starts on the first group each time.
+ const view = ref('')
+-const pageNavigation = usePluginPages(activeId, () => props.visible && props.target === 'plugin')
++const pageNavigation = usePluginPages(activeId, () => props.visible, () => props.target)
+ const activePage = computed(() => selectedPluginPage(pageNavigation.pages.value, view.value))
+ watch(() => state.groups.value, groups => {
+   // Still loading: leave the choice for when the groups arrive.
+diff --git a/src/views/pluginPages/PluginPagePanel.vue b/src/views/pluginPages/PluginPagePanel.vue
+index 4fbe46a..ca4029f 100644
+--- a/src/views/pluginPages/PluginPagePanel.vue
++++ b/src/views/pluginPages/PluginPagePanel.vue
+@@ -1,5 +1,5 @@
+ <template>
+-  <WebPagePanel v-if="definition.kind === 'web'" :plugin-id="pluginId" :definition="definition" />
++  <WebPagePanel v-if="definition.kind === 'web'" :plugin-id="pluginId" :definition="definition" :owner-kind="ownerKind" />
+   <LegacyPluginPagePanel v-else-if="legacyDefinition" :plugin-id="pluginId" :definition="legacyDefinition" />
+   <ComponentPagePanel v-else :plugin-id="pluginId" :definition="definition" />
+ </template>
+@@ -9,6 +9,6 @@ import type { PluginPage, LegacyPluginPage } from '../../api'
+ import LegacyPluginPagePanel from './LegacyPluginPagePanel.vue'
+ import ComponentPagePanel from './ComponentPagePanel.vue'
+ import WebPagePanel from './WebPagePanel.vue'
+-const props = defineProps<{ pluginId: string; definition: PluginPage }>()
++const props = defineProps<{ pluginId: string; definition: PluginPage; ownerKind?: 'plugins' | 'adapters' }>()
+ const legacyDefinition = computed(() => props.definition.kind ? props.definition as LegacyPluginPage : null)
+ </script>
 diff --git a/src/views/pluginPages/WebPagePanel.vue b/src/views/pluginPages/WebPagePanel.vue
 index 9ddf009..e83572a 100644
 --- a/src/views/pluginPages/WebPagePanel.vue
@@ -74,6 +149,37 @@ index 9ddf009..e83572a 100644
  onBeforeUnmount(close)
  </script>
  <style scoped>
+diff --git a/src/views/pluginPages/usePluginPages.ts b/src/views/pluginPages/usePluginPages.ts
+index a4a230b..4912061 100644
+--- a/src/views/pluginPages/usePluginPages.ts
++++ b/src/views/pluginPages/usePluginPages.ts
+@@ -7,7 +7,7 @@ export const pluginPageView = (id: string) => PAGE_VIEW_PREFIX + encodeURICompon
+ export const selectedPluginPage = (pages: PluginPage[], view: string) => pages.find(page => pluginPageView(page.id) === view)
+ 
+ /** Page navigation is separate from configuration schema and does not enter config save payloads. */
+-export function usePluginPages(pluginId: MaybeRefOrGetter<string>, enabled: MaybeRefOrGetter<boolean>) {
++export function usePluginPages(pluginId: MaybeRefOrGetter<string>, enabled: MaybeRefOrGetter<boolean>, target: MaybeRefOrGetter<string> = 'plugin') {
+   const pages = ref<PluginPage[]>([])
+   const loading = ref(false)
+   const error = ref('')
+@@ -19,7 +19,7 @@ export function usePluginPages(pluginId: MaybeRefOrGetter<string>, enabled: Mayb
+     const controller = request = new AbortController()
+     loading.value = true
+     try {
+-      const response = await getPluginPages(id, controller.signal)
++      const response = await getPluginPages(id, controller.signal, toValue(target) === 'adapter' ? 'adapters' : 'plugins')
+       if (!controller.signal.aborted) pages.value = response.pages ?? []
+     } catch (cause) {
+       // Older hosts and unloaded plugins have no page endpoint; configuration still works.
+@@ -27,7 +27,7 @@ export function usePluginPages(pluginId: MaybeRefOrGetter<string>, enabled: Mayb
+         error.value = getApiErrorMessage(cause, '插件页面加载失败。')
+     } finally { if (!controller.signal.aborted) loading.value = false }
+   }
+-  watch(() => [toValue(pluginId), toValue(enabled)], () => void load(), { immediate: true })
++  watch(() => [toValue(pluginId), toValue(enabled), toValue(target)], () => void load(), { immediate: true })
+   onScopeDispose(() => request?.abort())
+   return { pages, loading, error, load }
+ }
 diff --git a/src/views/pluginPages/webRequest.ts b/src/views/pluginPages/webRequest.ts
 index 0ffeb86..e4c211f 100644
 --- a/src/views/pluginPages/webRequest.ts
@@ -151,31 +257,4 @@ index 0ffeb86..e4c211f 100644
 +    if (cause !== 'cancel' && cause !== 'close') ElMessage.error(getApiErrorMessage(cause, '适配器操作失败'))
 +  } finally { running.value = '' }
 +}
-+</script>
---- /dev/null
-+++ b/src/views/adapters/components/AdapterPages.vue
-@@ -0,0 +1,24 @@
-+<template>
-+  <section v-if="loaded && (pages.length || error)">
-+    <p v-if="error" role="alert">{{ error }}</p>
-+    <div v-if="pages.length > 1" class="button-group"><button v-for="page in pages" :key="page.id" class="md-button tonal" @click="selected = page.id">{{ page.title }}</button></div>
-+    <WebPagePanel v-if="active" :key="id + active.id" :plugin-id="id" :definition="active" owner-kind="adapters" />
-+  </section>
-+</template>
-+<script setup lang="ts">
-+import { computed, ref, watch } from 'vue'
-+import { apiRequest, getApiErrorMessage, type PluginPage } from '../../../api'
-+import WebPagePanel from '../../pluginPages/WebPagePanel.vue'
-+const props = defineProps<{ id: string; loaded: boolean }>()
-+const pages = ref<PluginPage[]>([]), error = ref(''), selected = ref('')
-+const active = computed(() => pages.value.find(x => x.id === selected.value) || pages.value[0])
-+let generation = 0
-+watch(() => [props.id, props.loaded], async () => {
-+  const current = ++generation; pages.value = []; error.value = ''
-+  if (!props.loaded) return
-+  try {
-+    const result = await apiRequest<{ pages: PluginPage[] }>(`/api/v1/adapters/${encodeURIComponent(props.id)}/pages`)
-+    if (current === generation) pages.value = result.pages.filter(x => x.kind === 'web')
-+  } catch (cause) { if (current === generation) error.value = getApiErrorMessage(cause, '适配器页面加载失败。') }
-+}, { immediate: true })
 +</script>

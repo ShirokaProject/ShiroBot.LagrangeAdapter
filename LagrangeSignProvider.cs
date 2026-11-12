@@ -585,7 +585,23 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
             }
             : new { cmd, seq, src = Convert.ToHexString(body.Span) };
         using var response = await _client.PostAsJsonAsync(_endpoint, payload, _stopping);
-        response.EnsureSuccessStatusCode();
+        if (!response.IsSuccessStatusCode)
+        {
+            var bodyText = await response.Content.ReadAsStringAsync(_stopping);
+            string detail;
+            try
+            {
+                var error = JsonNode.Parse(bodyText);
+                var message = error?["message"] ?? error?["error"] ?? error?["detail"];
+                detail = message is JsonValue errorValue && errorValue.TryGetValue<string>(out var text) ? text
+                    : message?.ToJsonString() ?? "服务未提供错误说明";
+            }
+            catch { detail = "签名服务返回非 JSON 错误响应"; }
+            foreach (var secret in new[] { _options.SignToken, _options.Password }.Where(x => !string.IsNullOrEmpty(x)))
+                detail = detail.Replace(secret!, "[已隐藏]", StringComparison.Ordinal);
+            if (detail.Length > 1024) detail = detail[..1024];
+            throw new HttpRequestException($"签名服务 HTTP {(int)response.StatusCode} ({_options.SignApi}): {detail}", null, response.StatusCode);
+        }
         var root = await response.Content.ReadFromJsonAsync<JsonObject>(_stopping)
             ?? throw new InvalidDataException("签名服务返回空响应。");
         if (root["code"] is JsonValue code && code.GetValue<int>() != 0)

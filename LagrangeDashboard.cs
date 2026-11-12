@@ -9,6 +9,16 @@ public partial class LagrangeAdapter
     private byte[]? _qrImage;
     private string _loginStatus = "ready";
     private string? _verificationUrl;
+    private string? _loginError;
+
+    private static string DescribeLoginFailure(Exception exception, LagrangeAdapterConfig config)
+    {
+        var root = exception.GetBaseException();
+        var text = $"{root.GetType().Name}: {root.Message}";
+        foreach (var secret in new[] { config.Password, config.SignToken }.Where(x => !string.IsNullOrEmpty(x)))
+            text = text.Replace(secret!, "[已隐藏]", StringComparison.Ordinal);
+        return text;
+    }
 
     private void RegisterDashboard(IPluginDashboard dashboard) => dashboard.AddWebPage("login", "QQ 登录",
         new DashboardWebPage(typeof(LagrangeAdapter).Assembly, "dashboard/")
@@ -26,6 +36,7 @@ public partial class LagrangeAdapter
             ["status"] = context?.IsOnline == true ? "online" : _loginStatus,
             ["uin"] = context?.BotUin.ToString(), ["name"] = context?.BotInfo?.Name,
             ["qr"] = _qrImage is { } image ? Convert.ToBase64String(image) : null,
+            ["error"] = _loginError,
             ["verificationUrl"] = _verificationUrl
         };
     }
@@ -36,7 +47,7 @@ public partial class LagrangeAdapter
         if (action == "qr-login")
         {
             var result = await ExecuteActionAsync("qr-login", token);
-            if (!result.Ok) throw new InvalidOperationException(result.Message);
+            if (!result.Ok) _loginError = result.Message;
             return LoginPageState();
         }
         await _lifecycle.WaitAsync(token);
@@ -60,7 +71,7 @@ public partial class LagrangeAdapter
                 {
                     try { await LoginAsync(config, false, stopping); }
                     catch (OperationCanceledException) { }
-                    catch (Exception) { _loginStatus = "failed"; Logger.Error("账号密码登录失败，请检查协议日志或改用扫码登录。"); }
+                    catch (Exception ex) { _loginStatus = "failed"; _loginError = DescribeLoginFailure(ex, config); Logger.Error($"账号密码登录失败: {_loginError}"); }
                     finally { config.Password = ""; }
                 }
                 _loginTask = Lifetime is null ? Run(CancellationToken.None) : Lifetime.Run(Run);
