@@ -22,7 +22,7 @@ git submodule update --remote external/LagrangeV2
 
 ## 配置
 
-首次启动会保存默认配置。PC 协议可保持 `Uin = ""`、`Password = null` 使用二维码登录；AndroidPhone / AndroidPad 使用账号密码登录。二维码保存到 keystore 同目录的 `qrcode.png`。成功后会话凭据保存到当前实例的 session_store，后续可快速登录。
+首次启动会保存默认配置。PC 协议可保持 `Uin = ""`、`Password = null` 使用二维码登录；AndroidPhone / AndroidPad 可使用账号密码登录，或在控制台尝试实验性的免密码短信入口。二维码保存到 keystore 同目录的 `qrcode.png`。成功后会话凭据保存到当前实例的 session_store，后续可快速登录。
 
 ```json
 {
@@ -74,8 +74,8 @@ fetch_app_info = true
 
 签名服务必须支持流程实际使用的模块：密码 `810_9`、滑块 `810_2`、短信发码的 TLV553 `810_8`、短信提交 `810_7`。服务只实现 `810_9` 时，不能据此宣称滑块或短信流程已可真实登录；适配器会保留可读错误，不用空签名冒充成功。
 
-**免密码、仅短信验证码登录尚未实现。** 当前 Lagrange 内核只有密码登录触发后的短信二次验证，没有独立的检查账号、发码与短信换取登录票据入口；`SubmitSMSCode` 不等于独立短信登录。Android 扫码和 AndroidWatch 登录也未由该内核实现。
+AndroidPhone / AndroidPad 另提供实验性的免密码短信入口：输入 QQ 号后依次检查账号、请求发码、提交验证码并换取登录票据。短期校验材料只在当前尝试内保存，结束后清理；账号不匹配、取消和超时会终止流程。此分支已通过离线状态机检查，尚未完成腾讯实际免密码短信登录验证，不能据此声称所有账号均可登录；Android 扫码和 AndroidWatch 仍未由该内核实现。
 
-构建会在固定的 LagrangeV2 子模块上幂等应用 [登录挑战补丁](patches/lagrange-login-challenges.patch)：兼容直接返回的短信挑战、保留发码后省略的验证资料、提前建立提交等待任务并响应取消。子模块 gitlink 不变，补丁源文件随本仓库管理；更新子模块若补丁冲突会停止构建。
+构建会在固定的 LagrangeV2 子模块上幂等应用 [登录挑战补丁](patches/lagrange-login-challenges.patch)：兼容直接返回的短信挑战、保留发码后省略的验证资料、提前建立提交等待任务并响应取消，并添加独立短信账号/发码/校验/票据交换入口。子模块 gitlink 不变，补丁源文件随本仓库管理；更新子模块若补丁冲突会停止构建。
 
 验证包含 Android/PC HTTP 契约、两种 Token 方式、AppInfo、错误响应、验证提交与旧请求拒绝、现有宿主契约及卸载回归。离线测试不会联系腾讯，不代替真实账号登录验证。

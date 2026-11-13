@@ -12,7 +12,7 @@ async function run() {
     removeAttribute(name) { delete this[name]; }
   }]));
   const requests = [];
-  const state = { protocol: 'AndroidPad', qrSupported: false, status: 'sms', verificationId: 'first',
+  const state = { protocol: 'AndroidPad', qrSupported: false, status: 'sms', passwordlessSmsSupported: true, verificationId: 'first',
     verificationUrl: 'https://example.com/verify', verificationPhone: '+86-138****0000' };
   const context = vm.createContext({
     URL, console, setTimeout() {}, navigator: {},
@@ -34,6 +34,7 @@ async function run() {
   await flush();
   assert.equal(elements.scan.disabled, true);
   assert.equal(elements.sms.hidden, false);
+  assert.equal(elements['sms-login'].hidden, false);
   assert.equal(elements.phone.textContent, state.verificationPhone);
   assert.equal(elements['open-url'].href, state.verificationUrl);
   assert.equal(elements['open-url'].hidden, false);

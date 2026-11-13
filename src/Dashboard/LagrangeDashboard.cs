@@ -12,6 +12,7 @@ public partial class LagrangeAdapter
     private string? _verificationPhone;
     private string? _verificationId;
     private string? _loginError;
+    private DateTimeOffset _smsLoginNotBefore;
 
     private static string DescribeLoginFailure(Exception exception, LagrangeAdapterConfig config)
     {
@@ -42,7 +43,7 @@ public partial class LagrangeAdapter
             ["verificationId"] = _verificationId,
             ["protocol"] = CurrentConfigValue.Protocol,
             ["qrSupported"] = !CurrentConfigValue.Protocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase),
-            ["passwordlessSmsSupported"] = false
+            ["passwordlessSmsSupported"] = CurrentConfigValue.Protocol is "AndroidPhone" or "AndroidPad"
         };
     }
 
@@ -70,8 +71,6 @@ public partial class LagrangeAdapter
         {
             case "status":
                 return LoginPageState();
-            case "sms-login":
-                throw new NotSupportedException("当前 Lagrange 内核未实现免密码短信发码与登录；短信二次验证请在登录请求出现后提交。");
             case "qr-login":
             case "quick-login":
                 var result = await ExecuteActionAsync(action, token);
@@ -83,16 +82,23 @@ public partial class LagrangeAdapter
         try
         {
             if (!_started) throw new InvalidOperationException("请先启动适配器实例。");
-            if (action == "password-login")
+            if (action is "password-login" or "sms-login")
             {
                 var account = arguments?["uin"]?.GetValue<string>() ?? "";
                 var password = arguments?["password"]?.GetValue<string>() ?? "";
-                if (!long.TryParse(account, out var uin) || uin <= 0 || password.Length is 0 or > 256)
-                    throw new ArgumentException("请填写有效的 QQ 账号与密码。");
+                var smsOnly = action == "sms-login";
+                if (!long.TryParse(account, out var uin) || uin <= 0 || uin > uint.MaxValue ||
+                    (!smsOnly && password.Length is 0 or > 256))
+                    throw new ArgumentException("请填写有效的 QQ 账号；密码登录还需要密码。");
+                var selected = LoadAdapterConfig(Config);
+                if (smsOnly && selected.Protocol is not ("AndroidPhone" or "AndroidPad"))
+                    throw new NotSupportedException("独立短信登录仅支持 AndroidPhone / AndroidPad。");
+                if (smsOnly && _smsLoginNotBefore > DateTimeOffset.UtcNow)
+                    throw new InvalidOperationException("短信请求过于频繁，请一分钟后再试。");
                 await ClearConnectionAsync();
-                var config = LoadAdapterConfig(Config);
+                var config = selected;
                 config.Uin = uin.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                config.Password = password; // This page never persists the password.
+                config.Password = smsOnly ? "" : password; // This page never persists the password.
                 try { await InitializeConnectionAsync(config, true); }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -105,6 +111,7 @@ public partial class LagrangeAdapter
                 }
                 _loginStatus = "logging_in";
                 var stopping = _loginCancellation!.Token;
+                if (smsOnly) _smsLoginNotBefore = DateTimeOffset.UtcNow.AddMinutes(1);
                 _loginTask = Lifetime.Run(Run);
                 return LoginPageState();
 
@@ -112,16 +119,35 @@ public partial class LagrangeAdapter
                 {
                     try
                     {
-                        await LoginAsync(config, false, stopping);
+                        if (smsOnly)
+                        {
+                            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stopping);
+                            timeout.CancelAfter(TimeSpan.FromMinutes(5));
+                            var context = _services.Context;
+                            if (!await context.LoginWithSms(config.AccountUin, timeout.Token))
+                                throw new InvalidOperationException("短信登录失败，请查看协议日志。");
+                            await PersistSessionAsync(context, ResolveKeystorePath(config));
+                            _loginStatus = "online";
+                        }
+                        else await LoginAsync(config, false, stopping);
                     }
+                    catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
                     catch (OperationCanceledException)
                     {
+                        ClearVerification();
+                        _loginStatus = "failed";
+                        _loginError = "登录验证已超时，请重新发起登录。";
+                    }
+                    catch (Lagrange.Core.Exceptions.SmsLoginVerificationException ex)
+                    {
+                        SetVerification(_services.Context, "device", ex.Url);
+                        _loginError = DescribeLoginFailure(ex, config);
                     }
                     catch (Exception ex)
                     {
                         _loginStatus = "failed";
                         _loginError = DescribeLoginFailure(ex, config);
-                        Logger.Error($"账号密码登录失败: {_loginError}");
+                        Logger.Error($"QQ 登录失败: {_loginError}");
                     }
                     finally
                     {
@@ -130,7 +156,7 @@ public partial class LagrangeAdapter
                 }
             }
 
-            if (action is "captcha" or "sms" &&
+            if ((action is "captcha" or "sms") &&
                 (_verificationId is null || arguments?["verificationId"]?.GetValue<string>() != _verificationId))
                 throw new ArgumentException("验证请求已更新，请刷新状态后重试。");
             var previousStatus = _loginStatus;

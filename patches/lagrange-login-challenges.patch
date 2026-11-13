@@ -1,5 +1,58 @@
+diff --git a/Lagrange.Core/Common/Interface/BotExt.cs b/Lagrange.Core/Common/Interface/BotExt.cs
+index 0f8ffb8e..4e9f140d 100644
+--- a/Lagrange.Core/Common/Interface/BotExt.cs
++++ b/Lagrange.Core/Common/Interface/BotExt.cs
+@@ -11,6 +11,10 @@ public static class BotExt
+     public static Task<bool> Login(this BotContext context, CancellationToken token = default) =>
+         context.EventContext.GetLogic<WtExchangeLogic>().Login(0, null, token);
+ 
++    /// <summary>Start Android SMS login without supplying the QQ password.</summary>
++    public static Task<bool> LoginWithSms(this BotContext context, long uin, CancellationToken token = default) =>
++        context.EventContext.GetLogic<WtExchangeLogic>().LoginWithSms(uin, token);
++
+     /// <summary>Restore saved session tickets without falling back to password or QR login.</summary>
+     public static Task<bool> LoginWithSession(this BotContext context, CancellationToken token = default) =>
+         context.EventContext.GetLogic<WtExchangeLogic>().Login(0, null, token, sessionOnly: true);
+@@ -29,4 +33,4 @@ public static class BotExt
+ 
+     public static ValueTask<BotSsoPacket> SendPacket(this BotContext context, BotSsoPacket packet, RequestType requestType = RequestType.D2Auth, EncryptType encryptType = EncryptType.EncryptD2Key)
+         => context.EventContext.GetLogic<OperationLogic>().SendPacket(packet, requestType, encryptType);
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs b/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
+index fca8f082..6f29a00c 100644
+--- a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
++++ b/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
+@@ -9,7 +9,10 @@ internal class LoginEventReq(LoginEventReq.Command cmd, string password = "") :
+         Tgtgt = 0x09,
+         Captcha = 0x02,
+         FetchSMSCode = 0x08,
+-        SubmitSMSCode = 0x07
++        SubmitSMSCode = 0x07,
++        SmsLoginAccount = 0x11,
++        SmsLoginVerify = 0x12,
++        SmsLoginSend = 0x13
+     }
+     
+     public Command Cmd { get; } = cmd;
+@@ -19,6 +22,7 @@ internal class LoginEventReq(LoginEventReq.Command cmd, string password = "") :
+     public string Ticket { get; init; } = string.Empty;
+     
+     public string Code { get; init; } = string.Empty;
++    public Lagrange.Core.Internal.Logic.SmsLoginSession? Sms { get; init; }
+ }
+ 
+ internal class LoginEventResp : ProtocolEvent
+@@ -64,4 +68,4 @@ internal class LoginEventResp : ProtocolEvent
+         PreventByHighRiskOfEnvironment = 237,
+         Unknown = 240,
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
-index 70fcb9e9..cbba1573 100644
+index 70fcb9e9..15dce0ca 100644
 --- a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
 +++ b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
 @@ -1,4 +1,4 @@
@@ -17,69 +70,179 @@ index 70fcb9e9..cbba1573 100644
          {
              _transEmpSource?.TrySetCanceled();
              _captchaSource?.TrySetCanceled();
-@@ -199,11 +199,11 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -118,6 +118,121 @@ internal class WtExchangeLogic : ILogic, IDisposable
+         return true;
+     }
  
-                     string captchaUrl = Encoding.UTF8.GetString(result.Tlvs[0x192]);
-                     _context.LogInfo(Tag, "Captcha required, URL: {0}", captchaUrl);
-+                    var captcha = new TaskCompletionSource<(string, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
-+                    _captchaSource = captcha;
-                     _context.EventInvoker.PostEvent(new BotCaptchaEvent(captchaUrl));
--
--                    _captchaSource = new TaskCompletionSource<(string, string)>();
--                    var (ticket, _) = await _captchaSource.Task;
--                    _context.LogInfo(Tag, "Captcha ticket: {0}, try to login", ticket);
-+                    var (ticket, _) = await captcha.Task.WaitAsync(_token ?? default);
-+                    _context.LogInfo(Tag, "Captcha submitted, try to login");
++    private async Task<bool> CompleteAndroidLogin(LoginEventResp result)
++    {
++    if (result.State == LoginEventResp.States.CaptchaVerify)
++    {
++        if (result.Tlvs.TryGetValue(0x104, out var tlv104))
++        {
++            _context.Keystore.State.Tlv104 = tlv104;
++            _context.LogDebug(Tag, "Tlv104 received, length: {0}", tlv104.Length);
++        }
++
++        if (result.Tlvs.TryGetValue(0x546, out var tlv546))
++        {
++            _context.Keystore.State.Tlv547 = PowProvider.GenerateTlv547(tlv546);
++            _context.LogDebug(Tag, "Tlv546 received, calculated Tlv547 with length {0}", _context.Keystore.State.Tlv547.Length);
++        }
++
++        string captchaUrl = Encoding.UTF8.GetString(result.Tlvs[0x192]);
++        _context.LogInfo(Tag, "Captcha required, URL: {0}", captchaUrl);
++        var captcha = new TaskCompletionSource<(string, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
++        _captchaSource = captcha;
++        _context.EventInvoker.PostEvent(new BotCaptchaEvent(captchaUrl));
++        var (ticket, _) = await captcha.Task.WaitAsync(_token ?? default);
++        _context.LogInfo(Tag, "Captcha submitted, try to login");
++
++        _token?.ThrowIfCancellationRequested();
++        result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Captcha) { Ticket = ticket });
++    }
++
++    if (result.State == LoginEventResp.States.DeviceLockViaSmsNewArea)
++    {
++        SaveSmsTokens(result);
++        var challenge = result;
++        _token?.ThrowIfCancellationRequested();
++        result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.FetchSMSCode));
++        // FetchSMSCode may return only changed TLVs. Preserve the
++        // original phone/URL/session tokens without losing updates.
++        PreserveSmsChallenge(result, challenge);
++    }
++
++    // State 160 can also be returned directly by password/captcha.
++    if (result.State == LoginEventResp.States.SmsRequired)
++    {
++        SaveSmsTokens(result);
++        string? url = result.Tlvs.TryGetValue(0x204, out var tlv204) ? Encoding.UTF8.GetString(tlv204) : null;
++        string phone = "";
++        if (result.Tlvs.TryGetValue(0x178, out var tlv178Bytes))
++        {
++            var tlv178 = new BinaryPacket(tlv178Bytes.AsSpan());
++            string countryCode = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
++            phone = countryCode + "-" + tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
++        }
++
++        var sms = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
++        _smsSource = sms;
++        _context.EventInvoker.PostEvent(new BotSMSEvent(url, phone));
++        string code = await sms.Task.WaitAsync(_token ?? default);
++        result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.SubmitSMSCode) { Code = code });
++    }
++
++    void SaveSmsTokens(LoginEventResp challenge)
++    {
++        if (challenge.Tlvs.TryGetValue(0x104, out var tlv104)) _context.Keystore.State.Tlv104 = tlv104;
++        if (challenge.Tlvs.TryGetValue(0x174, out var tlv174)) _context.Keystore.State.Tlv174 = tlv174;
++    }
++
++    if (result.State == LoginEventResp.States.Success)
++    {
++        ReadWLoginSigs(result.Tlvs);
++
++        _context.EventInvoker.PostEvent(new BotLoginEvent(0, null));
++        _context.EventInvoker.PostEvent(new BotRefreshKeystoreEvent(_context.Keystore));
++
++        return await Online();
++    }
++    else
++    {
++        _context.LogError(Tag, "Login failed: {0} | Message: {1}", null, result.RetCode, result.Error);
++        _context.EventInvoker.PostEvent(new BotLoginEvent(result.RetCode, result.Error));
++    }
++        return false;
++    }
++
++    public async Task<bool> LoginWithSms(long uin, CancellationToken token)
++    {
++        if (_context.Config.Protocol is not (Protocols.AndroidPhone or Protocols.AndroidPad))
++            throw new NotSupportedException("Independent SMS login requires AndroidPhone or AndroidPad.");
++        token.ThrowIfCancellationRequested();
++        using var session = new SmsLoginSession(uin);
++        _token = token;
++        _context.Keystore.Uin = 0; // Account identity is resolved by the verified SMS response.
++        _context.Keystore.WLoginSigs.TgtgtKey = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
++        if (!_context.SocketContext.Connected)
++        {
++            await _context.SocketContext.Connect();
++            token.ThrowIfCancellationRequested();
++            _timers[HeartBeatTag].Change(0, 2000);
++        }
++        var result = await SmsLoginFlow.Run(session,
++            async request =>
++            {
++                if (request.Cmd == LoginEventReq.Command.Tgtgt) _context.Keystore.Uin = session.Uin;
++                return await _context.EventContext.SendEvent<LoginEventResp>(request);
++            }, AskCode, token);
++        return await CompleteAndroidLogin(result);
++
++        async Task<string> AskCode(string? url, string phone)
++        {
++            var pending = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
++            _smsSource = pending;
++            _context.EventInvoker.PostEvent(new BotSMSEvent(url, phone));
++            try { return await pending.Task.WaitAsync(token); }
++            finally { if (ReferenceEquals(_smsSource, pending)) _smsSource = null; }
++        }
++    }
++
+     private async Task<bool> ManualLogin(long uin, string? password)
+     {
+         if (string.IsNullOrEmpty(password) && _context.Config.Protocol.IsAndroid())
+@@ -183,86 +298,7 @@ internal class WtExchangeLogic : ILogic, IDisposable
  
-                     _token?.ThrowIfCancellationRequested();
-                     result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Captcha) { Ticket = ticket });
-@@ -211,42 +211,39 @@ internal class WtExchangeLogic : ILogic, IDisposable
+                 var result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Tgtgt, password));
  
-                 if (result.State == LoginEventResp.States.DeviceLockViaSmsNewArea)
-                 {
+-                if (result.State == LoginEventResp.States.CaptchaVerify)
+-                {
 -                    if (result.Tlvs.TryGetValue(0x104, out var tlv104))
 -                    {
 -                        _context.Keystore.State.Tlv104 = tlv104;
 -                        _context.LogDebug(Tag, "Tlv104 received, length: {0}", tlv104.Length);
 -                    }
-+                    SaveSmsTokens(result);
-+                    var challenge = result;
-+                    _token?.ThrowIfCancellationRequested();
-+                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.FetchSMSCode));
-+                    // FetchSMSCode may return only changed TLVs. Preserve the
-+                    // original phone/URL/session tokens without losing updates.
-+                    PreserveSmsChallenge(result, challenge);
-+                }
- 
+-
+-                    if (result.Tlvs.TryGetValue(0x546, out var tlv546))
+-                    {
+-                        _context.Keystore.State.Tlv547 = PowProvider.GenerateTlv547(tlv546);
+-                        _context.LogDebug(Tag, "Tlv546 received, calculated Tlv547 with length {0}", _context.Keystore.State.Tlv547.Length);
+-                    }
+-
+-                    string captchaUrl = Encoding.UTF8.GetString(result.Tlvs[0x192]);
+-                    _context.LogInfo(Tag, "Captcha required, URL: {0}", captchaUrl);
+-                    _context.EventInvoker.PostEvent(new BotCaptchaEvent(captchaUrl));
+-
+-                    _captchaSource = new TaskCompletionSource<(string, string)>();
+-                    var (ticket, _) = await _captchaSource.Task;
+-                    _context.LogInfo(Tag, "Captcha ticket: {0}, try to login", ticket);
+-
+-                    _token?.ThrowIfCancellationRequested();
+-                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Captcha) { Ticket = ticket });
+-                }
+-
+-                if (result.State == LoginEventResp.States.DeviceLockViaSmsNewArea)
+-                {
+-                    if (result.Tlvs.TryGetValue(0x104, out var tlv104))
+-                    {
+-                        _context.Keystore.State.Tlv104 = tlv104;
+-                        _context.LogDebug(Tag, "Tlv104 received, length: {0}", tlv104.Length);
+-                    }
+-
 -                    if (result.Tlvs.TryGetValue(0x174, out var tlv174))
-+                // State 160 can also be returned directly by password/captcha.
-+                if (result.State == LoginEventResp.States.SmsRequired)
-+                {
-+                    SaveSmsTokens(result);
-+                    string? url = result.Tlvs.TryGetValue(0x204, out var tlv204) ? Encoding.UTF8.GetString(tlv204) : null;
-+                    string phone = "";
-+                    if (result.Tlvs.TryGetValue(0x178, out var tlv178Bytes))
-                     {
+-                    {
 -                        _context.Keystore.State.Tlv174 = tlv174;
 -                        _context.LogDebug(Tag, "Tlv174 received, length: {0}", tlv174.Length);
-+                        var tlv178 = new BinaryPacket(tlv178Bytes.AsSpan());
-+                        string countryCode = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
-+                        phone = countryCode + "-" + tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
-                     }
- 
+-                    }
+-
 -                    string? url = null;
 -                    if (result.Tlvs.TryGetValue(0x204, out var tlv204)) url = Encoding.UTF8.GetString(tlv204);
 -
 -                    var tlv178 = new BinaryPacket(result.Tlvs[0x178].AsSpan());
 -                    string countryCode = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
 -                    string phone = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
-+                    var sms = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-+                    _smsSource = sms;
-+                    _context.EventInvoker.PostEvent(new BotSMSEvent(url, phone));
-+                    string code = await sms.Task.WaitAsync(_token ?? default);
-+                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.SubmitSMSCode) { Code = code });
-+                }
- 
+-
 -                    _token?.ThrowIfCancellationRequested();
 -                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.FetchSMSCode));
 -                    if (result.State == LoginEventResp.States.SmsRequired)
@@ -97,14 +260,27 @@ index 70fcb9e9..cbba1573 100644
 -                        string code = await _smsSource.Task;
 -                        result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.SubmitSMSCode) { Code = code });
 -                    }
-+                void SaveSmsTokens(LoginEventResp challenge)
-+                {
-+                    if (challenge.Tlvs.TryGetValue(0x104, out var tlv104)) _context.Keystore.State.Tlv104 = tlv104;
-+                    if (challenge.Tlvs.TryGetValue(0x174, out var tlv174)) _context.Keystore.State.Tlv174 = tlv174;
-                 }
- 
-                 if (result.State == LoginEventResp.States.Success)
-@@ -283,11 +280,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+-                }
+-
+-                if (result.State == LoginEventResp.States.Success)
+-                {
+-                    ReadWLoginSigs(result.Tlvs);
+-
+-                    _context.EventInvoker.PostEvent(new BotLoginEvent(0, null));
+-                    _context.EventInvoker.PostEvent(new BotRefreshKeystoreEvent(_context.Keystore));
+-
+-                    return await Online();
+-                }
+-                else
+-                {
+-                    _context.LogError(Tag, "Login failed: {0} | Message: {1}", null, result.RetCode, result.Error);
+-                    _context.EventInvoker.PostEvent(new BotLoginEvent(result.RetCode, result.Error));
+-                }
++                return await CompleteAndroidLogin(result);
+             }
+             else
+             {
+@@ -283,11 +319,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
                          case NTLoginRetCode.LOGIN_ERROR_PROOF_WATER:
                              _context.LogInfo(Tag, "Captcha required, URL: {0}", result.JumpingUrl);
  
@@ -121,7 +297,7 @@ index 70fcb9e9..cbba1573 100644
                              result = await _context.EventContext.SendEvent<PasswordLoginEventResp>(new PasswordLoginEventReq(password, (ticket, randStr, sid)));
                              break;
                          case NTLoginRetCode.LOGIN_ERROR_NEW_DEVICE:
-@@ -364,6 +363,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -364,6 +402,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
          return (success, result.Message);
      }
  
@@ -135,3 +311,367 @@ index 70fcb9e9..cbba1573 100644
      public bool SubmitCaptcha(string ticket, string randStr)
      {
          if (_captchaSource == null) return false;
+diff --git a/Lagrange.Core/Internal/Packets/Login/Tlv.cs b/Lagrange.Core/Internal/Packets/Login/Tlv.cs
+index 8b847e50..2347d6de 100644
+--- a/Lagrange.Core/Internal/Packets/Login/Tlv.cs
++++ b/Lagrange.Core/Internal/Packets/Login/Tlv.cs
+@@ -126,16 +126,23 @@ internal ref struct Tlv : IDisposable
+         _writer.ExitLengthBarrier<short>(false);
+     }
+ 
+-    public void Tlv106Pwd(string password)
++    public void Tlv106Pwd(string password) =>
++        Tlv106Credential(MD5.HashData(Encoding.UTF8.GetBytes(password)), (uint)_keystore.Uin, 1);
++
++    public void Tlv106Sms(Lagrange.Core.Internal.Logic.SmsLoginSession session)
+     {
+-        WriteTlv(0x106);
++        if (!session.Verified || session.Uin != _keystore.Uin) throw new InvalidOperationException("SMS proof has not been verified for this account.");
++        Tlv106Credential(session.PasswordHash, session.Salt, 3);
++    }
+ 
+-        var md5 = MD5.HashData(Encoding.UTF8.GetBytes(password));
++    private void Tlv106Credential(byte[] md5, ulong salt, int loginType)
++    {
++        WriteTlv(0x106);
++        if (md5.Length != 16) throw new ArgumentException("Credential digest must be 16 bytes.");
+         
+         var keyWriter = new BinaryPacket(stackalloc byte[16 + 4 + 4]);
+         keyWriter.Write(md5);
+-        keyWriter.Write(0); // empty 4 bytes
+-        keyWriter.Write((uint)_keystore.Uin);
++        keyWriter.Write(salt);
+         var key = MD5.HashData(keyWriter.CreateReadOnlySpan());
+         
+         var plainWriter = new BinaryPacket(stackalloc byte[100]);
+@@ -154,7 +161,7 @@ internal ref struct Tlv : IDisposable
+         plainWriter.Write<byte>(1); // guidAvailable
+         plainWriter.Write(_keystore.Guid);
+         plainWriter.Write(_appInfo.SubAppId);
+-        plainWriter.Write(1); // flag
++        plainWriter.Write(loginType); // 1=password, 3=verified SMS
+         plainWriter.Write(_keystore.Uin.ToString(), Prefix.Int16 | Prefix.LengthOnly);
+         plainWriter.Write<short>(0);
+         _writer.Write(TeaProvider.Encrypt(plainWriter.CreateReadOnlySpan(), key));
+@@ -679,6 +686,37 @@ internal ref struct Tlv : IDisposable
+         _writer.ExitLengthBarrier<short>(false);
+     }
+ 
++    public void Tlv108(byte[] ksid)
++    {
++        WriteTlv(0x108);
++        _writer.Write(ksid);
++        _writer.ExitLengthBarrier<short>(false);
++    }
++
++    public void Tlv127(string code, byte[] nonce)
++    {
++        WriteTlv(0x127);
++        _writer.Write<ushort>(0);
++        _writer.Write(code, Prefix.Int16 | Prefix.LengthOnly);
++        _writer.Write(nonce, Prefix.Int16 | Prefix.LengthOnly);
++        _writer.ExitLengthBarrier<short>(false);
++    }
++
++    public void Tlv184(byte[] saltedHash)
++    {
++        if (saltedHash.Length != 16) throw new ArgumentException("Salted proof must be 16 bytes.");
++        WriteTlv(0x184);
++        _writer.Write(saltedHash);
++        _writer.ExitLengthBarrier<short>(false);
++    }
++
++    public void Tlv185()
++    {
++        WriteTlv(0x185);
++        _writer.Write<byte>(1);
++        _writer.ExitLengthBarrier<short>(false);
++    }
++
+     public ReadOnlySpan<byte> CreateReadOnlySpan()
+     {
+         _writer.Write(_count, _prefixed ? 2 : 0);
+diff --git a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
+index b56130a4..5cb25ca9 100644
+--- a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
++++ b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
+@@ -161,7 +161,7 @@ internal class WtLogin : StructBase
+         return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
+     }
+     
+-    public async Task<ReadOnlyMemory<byte>> BuildOicq09Android(string password)
++    public async Task<ReadOnlyMemory<byte>> BuildOicq09Android(string password, Lagrange.Core.Internal.Logic.SmsLoginSession? sms = null)
+     {
+         var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
+         var energy = await sign.GetEnergy(_context.BotUin, "810_9");
+@@ -171,10 +171,12 @@ internal class WtLogin : StructBase
+         
+         tlvs.Tlv018Android();
+         tlvs.Tlv001();
+-        tlvs.Tlv106Pwd(password);
++        if (sms is null) tlvs.Tlv106Pwd(password);
++        else tlvs.Tlv106Sms(sms);
+         tlvs.Tlv116();
+         tlvs.Tlv100Android((uint)AppInfo.SdkInfo.MainSigMap);
+         tlvs.Tlv107Android();
++        if (sms is not null) tlvs.Tlv104(sms.Token);
+         tlvs.Tlv142();
+         tlvs.Tlv144Report(false);
+         tlvs.Tlv145();
+@@ -187,6 +189,7 @@ internal class WtLogin : StructBase
+         tlvs.Tlv188();
+         tlvs.Tlv191(0x82);
+         tlvs.Tlv177();
++        if (sms is not null) tlvs.Tlv185();
+         tlvs.Tlv516();
+         tlvs.Tlv521Android();
+         tlvs.Tlv525();
+@@ -199,6 +202,55 @@ internal class WtLogin : StructBase
+         return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
+     }
+ 
++    public async Task<ReadOnlyMemory<byte>> BuildSmsAccount(Lagrange.Core.Internal.Logic.SmsLoginSession session)
++    {
++        var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
++        var attach = await sign.GetDebugXwid(session.Uin, "810_11");
++        using var tlvs = new Tlv(0x11, _context);
++        tlvs.Tlv100Android((uint)AppInfo.SdkInfo.MainSigMap);
++        if (Keystore.WLoginSigs.Ksid.Length != 0) tlvs.Tlv108(Keystore.WLoginSigs.Ksid);
++        tlvs.Tlv109();
++        tlvs.Tlv52D();
++        tlvs.Tlv008();
++        tlvs.Tlv142();
++        tlvs.Tlv145();
++        tlvs.Tlv154();
++        tlvs.Tlv112(session.Uin.ToString(global::System.Globalization.CultureInfo.InvariantCulture));
++        tlvs.Tlv116();
++        tlvs.Tlv521Android();
++        tlvs.Tlv553(attach);
++        return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
++    }
++
++    public async Task<ReadOnlyMemory<byte>> BuildSmsSend(Lagrange.Core.Internal.Logic.SmsLoginSession session)
++    {
++        var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
++        var attach = await sign.GetDebugXwid(session.Uin, "810_13");
++        using var tlvs = new Tlv(0x13, _context);
++        tlvs.Tlv104(session.Token);
++        tlvs.Tlv008();
++        tlvs.Tlv116();
++        tlvs.Tlv521Android();
++        tlvs.Tlv553(attach);
++        return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
++    }
++
++    public async Task<ReadOnlyMemory<byte>> BuildSmsVerify(Lagrange.Core.Internal.Logic.SmsLoginSession session, string code)
++    {
++        var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
++        var attach = await sign.GetDebugXwid(session.Uin, "810_12");
++        using var tlvs = new Tlv(0x12, _context);
++        tlvs.Tlv104(session.Token);
++        tlvs.Tlv008();
++        tlvs.Tlv127(code, session.Nonce);
++        tlvs.Tlv184(session.SaltedHash());
++        tlvs.Tlv116();
++        tlvs.Tlv521Android();
++        tlvs.Tlv142();
++        tlvs.Tlv553(attach);
++        return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
++    }
++
+     public async Task<ReadOnlyMemory<byte>> BuildOicq02Android(string ticket)
+     {
+         var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
+diff --git a/Lagrange.Core/Internal/Services/Login/LoginService.cs b/Lagrange.Core/Internal/Services/Login/LoginService.cs
+index c48a4146..a6f6a763 100644
+--- a/Lagrange.Core/Internal/Services/Login/LoginService.cs
++++ b/Lagrange.Core/Internal/Services/Login/LoginService.cs
+@@ -48,10 +48,13 @@ internal class LoginServiceAndroid : BaseService<LoginEventReq, LoginEventResp>
+ 
+         return input.Cmd switch
+         {
+-            LoginEventReq.Command.Tgtgt =>  await _packet.Value.BuildOicq09Android(input.Password),
++            LoginEventReq.Command.Tgtgt =>  await _packet.Value.BuildOicq09Android(input.Password, input.Sms),
+             LoginEventReq.Command.Captcha => await _packet.Value.BuildOicq02Android(input.Ticket),
+             LoginEventReq.Command.FetchSMSCode => await _packet.Value.BuildOicq08Android(),
+             LoginEventReq.Command.SubmitSMSCode => await _packet.Value.BuildOicq07Android(input.Code),
++            LoginEventReq.Command.SmsLoginAccount => await _packet.Value.BuildSmsAccount(input.Sms ?? throw new InvalidOperationException("SMS session missing")),
++            LoginEventReq.Command.SmsLoginSend => await _packet.Value.BuildSmsSend(input.Sms ?? throw new InvalidOperationException("SMS session missing")),
++            LoginEventReq.Command.SmsLoginVerify => await _packet.Value.BuildSmsVerify(input.Sms ?? throw new InvalidOperationException("SMS session missing"), input.Code),
+             _ => throw new ArgumentOutOfRangeException(nameof(input), $"Unknown command: {input.Cmd}")
+         };
+     }
+diff --git a/Lagrange.Core/Internal/Logic/SmsLoginSession.cs b/Lagrange.Core/Internal/Logic/SmsLoginSession.cs
+new file mode 100644
+--- /dev/null
++++ b/Lagrange.Core/Internal/Logic/SmsLoginSession.cs
+@@ -0,0 +1,157 @@
++using System.Buffers.Binary;
++using System.Security.Cryptography;
++using System.Text;
++using Lagrange.Core.Exceptions;
++using Lagrange.Core.Internal.Events.Login;
++
++namespace Lagrange.Core.Internal.Logic;
++
++/// <summary>Transient proof for 810_11/13/12 and the subsequent 810_9 exchange.</summary>
++internal sealed class SmsLoginSession : IDisposable
++{
++    public long Uin { get; }
++    public byte[] PasswordHash { get; }
++    public byte[] Token { get; private set; } = [];
++    public byte[] Nonce { get; private set; } = [];
++    public ulong Salt { get; private set; }
++    public bool Verified { get; private set; }
++    public string? Url { get; private set; }
++    public string Phone { get; private set; } = "";
++    private bool _checked;
++    private bool _sent;
++
++    public SmsLoginSession(long uin)
++    {
++        if (uin is <= 0 or > uint.MaxValue) throw new ArgumentOutOfRangeException(nameof(uin));
++        Uin = uin;
++        // A fresh 16-character secret, never the QQ password. The server learns
++        // its salted hash only after the user supplies the SMS challenge proof.
++        var secret = RandomNumberGenerator.GetBytes(12);
++        try { PasswordHash = MD5.HashData(Encoding.ASCII.GetBytes(Convert.ToBase64String(secret))); }
++        finally { CryptographicOperations.ZeroMemory(secret); }
++    }
++
++    public void AccountChecked(LoginEventResp reply)
++    {
++        if (_checked || _sent) throw new InvalidOperationException("SMS login account check was already consumed.");
++        Require(reply, 208, "账号检查");
++        Update(reply);
++        if (Token.Length == 0 || Nonce.Length == 0 || !reply.Tlvs.ContainsKey(0x183))
++            throw new InvalidDataException("短信登录账号检查缺少会话 Token、随机挑战或 salt。");
++        _checked = true;
++    }
++
++    public void Sent(LoginEventResp reply)
++    {
++        if (!_checked || _sent) throw new InvalidOperationException("SMS login send is out of sequence.");
++        if (reply.RetCode is not (0 or 208)) Fail(reply, "发码");
++        Update(reply);
++        _sent = true;
++    }
++
++    public void Accept(LoginEventResp reply)
++    {
++        if (!_sent || Verified) throw new InvalidOperationException("SMS login verification is out of sequence.");
++        Require(reply, 0, "验证码验证");
++        Update(reply);
++        if (!reply.Tlvs.TryGetValue(0x113, out var account) || account.Length != 4 ||
++            BinaryPrimitives.ReadUInt32BigEndian(account) != Uin)
++            throw new InvalidDataException("短信登录返回的 QQ 账号与请求不一致。");
++        if (!reply.Tlvs.TryGetValue(0x104, out var proof) || proof.Length == 0)
++            throw new InvalidDataException("短信登录验证缺少换票据凭证。");
++        Verified = true;
++    }
++
++    public byte[] SaltedHash()
++    {
++        if (!_checked || !_sent) throw new InvalidOperationException("SMS proof requested before sending the challenge.");
++        Span<byte> input = stackalloc byte[24];
++        PasswordHash.CopyTo(input);
++        BinaryPrimitives.WriteUInt64BigEndian(input[16..], Salt);
++        return MD5.HashData(input);
++    }
++
++    private void Update(LoginEventResp reply)
++    {
++        if (reply.Tlvs.TryGetValue(0x104, out var token))
++        {
++            if (token.Length is 0 or > 4096) throw new InvalidDataException("短信会话 Token 长度无效。");
++            CryptographicOperations.ZeroMemory(Token);
++            Token = [.. token];
++        }
++        if (reply.Tlvs.TryGetValue(0x126, out var nonce))
++        {
++            if (nonce.Length < 4) throw new InvalidDataException("短信随机挑战无效。");
++            var length = BinaryPrimitives.ReadUInt16BigEndian(nonce.AsSpan(2));
++            if (length is 0 or > 4096 || length > nonce.Length - 4) throw new InvalidDataException("短信随机挑战长度无效。");
++            CryptographicOperations.ZeroMemory(Nonce);
++            Nonce = nonce.AsSpan(4, length).ToArray();
++        }
++        if (reply.Tlvs.TryGetValue(0x183, out var salt))
++        {
++            if (salt.Length != 8) throw new InvalidDataException("短信 salt 长度无效。");
++            Salt = BinaryPrimitives.ReadUInt64BigEndian(salt);
++        }
++        Url = ReadUrl(reply) ?? Url;
++        if (reply.Tlvs.TryGetValue(0x178, out var phone) && phone.Length >= 4)
++        {
++            var countryLength = BinaryPrimitives.ReadUInt16BigEndian(phone);
++            if (countryLength <= phone.Length - 4)
++            {
++                var position = 2 + countryLength;
++                var numberLength = BinaryPrimitives.ReadUInt16BigEndian(phone.AsSpan(position));
++                if (numberLength <= phone.Length - position - 2)
++                    Phone = Encoding.UTF8.GetString(phone, 2, countryLength) + "-" + Encoding.UTF8.GetString(phone, position + 2, numberLength);
++            }
++        }
++    }
++
++    private static void Require(LoginEventResp reply, int expected, string stage)
++    {
++        if (reply.RetCode != expected) Fail(reply, stage);
++    }
++
++    private static void Fail(LoginEventResp reply, string stage)
++    {
++        if (ReadUrl(reply) is { } url)
++            throw new SmsLoginVerificationException($"短信登录{stage}需要网页验证，完成后重新发起登录。", url);
++        throw new InvalidOperationException($"短信登录{stage}失败（code={reply.RetCode}）。");
++    }
++
++    private static string? ReadUrl(LoginEventResp reply)
++    {
++        foreach (ushort key in new ushort[] { 0x204, 0x192 })
++            if (reply.Tlvs.TryGetValue(key, out var value) && value.Length <= 8192 &&
++                Uri.TryCreate(Encoding.UTF8.GetString(value), UriKind.Absolute, out var uri) &&
++                uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0) return uri.AbsoluteUri;
++        return null;
++    }
++
++    public void Dispose()
++    {
++        CryptographicOperations.ZeroMemory(PasswordHash);
++        CryptographicOperations.ZeroMemory(Token);
++        CryptographicOperations.ZeroMemory(Nonce);
++        Salt = 0;
++        Verified = false;
++    }
++}
++
++internal static class SmsLoginFlow
++{
++    public static async Task<LoginEventResp> Run(SmsLoginSession session,
++        Func<LoginEventReq, Task<LoginEventResp>> send, Func<string?, string, Task<string>> requestCode,
++        CancellationToken token)
++    {
++        token.ThrowIfCancellationRequested();
++        session.AccountChecked(await send(new(LoginEventReq.Command.SmsLoginAccount) { Sms = session }).WaitAsync(token));
++        token.ThrowIfCancellationRequested();
++        session.Sent(await send(new(LoginEventReq.Command.SmsLoginSend) { Sms = session }).WaitAsync(token));
++        var code = await requestCode(session.Url, session.Phone).WaitAsync(token);
++        if (code.Length is < 4 or > 8 || code.Any(c => !char.IsAsciiDigit(c))) throw new ArgumentException("短信验证码无效。");
++        token.ThrowIfCancellationRequested();
++        session.Accept(await send(new(LoginEventReq.Command.SmsLoginVerify) { Sms = session, Code = code }).WaitAsync(token));
++        token.ThrowIfCancellationRequested();
++        return await send(new(LoginEventReq.Command.Tgtgt) { Sms = session }).WaitAsync(token);
++    }
++}
+diff --git a/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
+new file mode 100644
+--- /dev/null
++++ b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
+@@ -0,0 +1,7 @@
++namespace Lagrange.Core.Exceptions;
++
++/// <summary>The server requires a web verification before a new SMS login attempt.</summary>
++public sealed class SmsLoginVerificationException(string message, string url) : Exception(message)
++{
++    public string Url { get; } = url;
++}

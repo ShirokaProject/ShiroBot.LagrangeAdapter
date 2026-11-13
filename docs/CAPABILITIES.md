@@ -30,5 +30,6 @@
 - PC：二维码、密码及会话恢复；AndroidPhone / AndroidPad：密码及会话恢复。
 - Android 签名：独立的 AndroidBotSignProvider，完整转发 sign、energy 和 TLV553；AppInfo 可从同一服务获取。
 - 登录挑战：滑块 ticket / randstr、短信验证码、新设备验证链接；页面可打开或复制安全的 HTTP(S) 链接。验证需要签名服务支持对应模块。
-- 未实现：免密码独立短信登录、Android 扫码、AndroidWatch。不会把短信二次验证标为免密码登录。
+- 实验性独立短信登录：Android 检查账号 → 发码 → 校验 → 登录票据交换；临时校验材料随尝试清理。离线状态机、账号不匹配、取消和清理检查通过；尚无腾讯实际免密码登录成功证据。
+- 未实现：Android 扫码、AndroidWatch。密码登录的短信二次验证与独立免密码入口分开处理。
 - 本次为离线构建/契约验证，无真实 QQ 登录结论。

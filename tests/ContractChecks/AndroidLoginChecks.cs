@@ -137,8 +137,8 @@ internal static class AndroidLoginChecks
         if ((await captcha.Task).Item1 != "synthetic-ticket") throw new Exception("Android captcha was not submitted.");
         set.Invoke(adapter, [bot, "device", "javascript:alert(1)", null]);
         if ((await Call("status"))["verificationUrl"] is not null) throw new Exception("Unsafe verification URL accepted.");
-        try { await Call("sms-login"); throw new Exception("Unsupported passwordless SMS was reported as started."); }
-        catch (NotSupportedException) { }
+        try { await Call("sms-login", new JsonObject { ["uin"] = "not-an-account" }); throw new Exception("Invalid SMS account accepted."); }
+        catch (ArgumentException) { }
         // Keep synthetic context ownership local; no socket/login task was started.
         session.GetType().GetProperty("ActiveContext")!.SetValue(session, null);
     }

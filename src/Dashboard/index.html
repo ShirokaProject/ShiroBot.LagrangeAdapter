@@ -8,7 +8,7 @@
 <div class="top"><div><h1>连接 QQ</h1><p id="account">选择一种方式登录当前适配器实例</p></div><span class="status" id="status" role="status">正在读取状态</span></div>
 <section class="card"><h2>恢复上次登录</h2><p class="hint">使用上次扫码保存的会话，无需再次扫码。凭据失效时请重新扫码登录。</p><button id="quick" type="button">快速登录</button></section>
 <div class="grid"><section class="card"><h2>扫码登录</h2><div id="empty">点击下方按钮获取二维码</div><img id="qr" alt="QQ 登录二维码" hidden><p class="hint" id="scan-hint">使用手机 QQ 扫码，并在手机上确认登录。</p><button id="scan" type="button">获取二维码</button></section>
-<section class="card"><h2>账号密码登录</h2><form id="login"><label for="uin">QQ 账号</label><input id="uin" inputmode="numeric" pattern="[0-9]+" autocomplete="username" required><label for="password">QQ 密码</label><input id="password" type="password" autocomplete="current-password" maxlength="256" required><button type="submit">登录</button></form><p class="hint">密码仅用于本次登录，不写入配置；登录成功后保存会话凭据。短信或滑块验证会在下方显示。</p><p class="hint">当前内核暂不支持免密码短信登录。</p></section></div>
+<section class="card"><h2>账号密码登录</h2><form id="login"><label for="uin">QQ 账号</label><input id="uin" inputmode="numeric" pattern="[0-9]+" autocomplete="username" required><label for="password">QQ 密码</label><input id="password" type="password" autocomplete="current-password" maxlength="256" required><button type="submit">登录</button></form><p class="hint">密码仅用于本次登录，不写入配置；登录成功后保存会话凭据。短信或滑块验证会在下方显示。</p><form id="sms-login" hidden><h2>短信登录（实验）</h2><label for="sms-uin">QQ 账号</label><input id="sms-uin" inputmode="numeric" pattern="[0-9]+" autocomplete="username" required><button type="submit">获取短信验证码</button><p class="hint">验证码发送到该 QQ 绑定的手机，无需 QQ 密码。</p></form></section></div>
 <p id="message" role="alert"></p>
 <section class="card" id="verify" hidden><h2 id="verify-title">完成登录验证</h2><p id="phone"></p><p id="url"></p><div class="verify-actions"><a id="open-url" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" hidden>打开验证链接</a><button id="copy-url" type="button" hidden>复制链接</button></div><p class="hint" id="verify-hint"></p>
 <form id="captcha" hidden><label for="captcha-result">粘贴滑块验证结果（JSON，可选）</label><textarea id="captcha-result" autocomplete="off" maxlength="12000" spellcheck="false"></textarea><label for="ticket">ticket</label><input id="ticket" required maxlength="8192" autocomplete="off"><label for="randstr">randstr</label><input id="randstr" maxlength="1024" autocomplete="off"><button>提交滑块验证</button></form>
@@ -22,6 +22,7 @@ function render(s){
   $('status').textContent=labels[s.status]||'待登录';
   $('account').textContent=s.online?`${s.name||'QQ'} · ${s.uin}`:`${s.protocol||'QQ'} · 选择登录方式`;
   qrSupported=s.qrSupported!==false;
+  $('sms-login').hidden=!s.passwordlessSmsSupported;
   const show=!!s.qr&&!s.online&&s.status!=='expired';
   $('qr').hidden=!show;$('empty').hidden=show;
   if(show&&lastImage!==s.qr){lastImage=s.qr;$('qr').src='data:image/png;base64,'+s.qr}
@@ -48,6 +49,7 @@ async function call(action,args){
 }
 $('quick').onclick=()=>call('quick-login');$('scan').onclick=()=>call('qr-login');
 $('login').onsubmit=e=>{e.preventDefault();const password=$('password').value;$('password').value='';void call('password-login',{uin:$('uin').value.trim(),password})};
+$('sms-login').onsubmit=e=>{e.preventDefault();void call('sms-login',{uin:$('sms-uin').value.trim()})};
 $('captcha-result').oninput=()=>{try{const value=JSON.parse($('captcha-result').value),data=value.data||value;if(typeof data.ticket==='string')$('ticket').value=data.ticket;if(typeof data.randstr==='string')$('randstr').value=data.randstr}catch{}};
 $('captcha').onsubmit=e=>{e.preventDefault();void call('captcha',{ticket:$('ticket').value.trim(),randstr:$('randstr').value.trim(),verificationId:challenge?.id})};
 $('sms').onsubmit=e=>{e.preventDefault();void call('sms',{code:$('code').value.trim(),verificationId:challenge?.id})};

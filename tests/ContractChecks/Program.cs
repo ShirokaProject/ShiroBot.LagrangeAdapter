@@ -12,7 +12,7 @@ if (args is ["--export-appinfo", var output])
 
 var assembly = typeof(LagrangeAdapter).Assembly;
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.2" ||
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.3" ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)
@@ -428,6 +428,7 @@ finally
 Console.WriteLine("Login completion inline persistence and QR file/memory cleanup checks passed.");
 
 await AndroidLoginChecks.Run(assembly);
+await SmsLoginChecks.Run();
 UnloadChecks.Run(typeof(LagrangeAdapter).Assembly.Location);
 
 internal sealed class RejectSignHandler : HttpMessageHandler
