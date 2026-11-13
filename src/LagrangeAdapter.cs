@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.4")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.5")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.4",
+    Version = "0.1.5",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -595,6 +595,10 @@ public sealed class LagrangeAdapterConfig
         GroupOrder = 10, Order = 10)]
     public bool AutoLogin { get; set; } = false;
 
+    [ConfigField("独立 Ticket helper 的基础地址，可部署到自己的 HTTPS 站点；本机测试默认端口 18130。", Label = "验证码辅助页面", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 50,
+        Placeholder = "https://captcha.example.com/")]
+    public string CaptchaHelperUrl { get; set; } = "http://127.0.0.1:18130/";
+
     /// <summary>覆盖当前协议内置 AppInfo 的字段，可只提供需要修改的字段。</summary>
     [ConfigField("JSON 格式的局部覆盖值；与 AppInfo 文件路径二选一。留空使用平台默认值。", Label = "内联 AppInfo", Group = "protocol",
         GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 20, Type = "textarea",
@@ -673,6 +677,10 @@ public sealed class LagrangeAdapterConfig
 
     public void Validate()
     {
+        if (!Uri.TryCreate(CaptchaHelperUrl, UriKind.Absolute, out var helper) ||
+            helper.UserInfo.Length != 0 || helper.Query.Length != 0 || helper.Fragment.Length != 0 ||
+            !(helper.Scheme == "https" || helper.Scheme == "http" && helper.IsLoopback))
+            throw new ArgumentException("CaptchaHelperUrl 必须为 HTTPS 基础地址；本机地址也支持 HTTP，不能含鉴权、查询参数或片段。");
         _ = AccountUin;
         if (DeviceName.Length > 64 || DeviceName.Any(char.IsControl))
             throw new ArgumentException("设备名称最多 64 个字符，不能包含控制字符。");

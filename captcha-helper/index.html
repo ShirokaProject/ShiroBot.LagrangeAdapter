@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Ticket</title>
+<style>
+:root{font-family:system-ui,sans-serif;color-scheme:light dark;background:#f6f6f4;color:#222;--card:#fff;--line:#ddd;--accent:#35634a;--on:#fff;--error:#a32929}
+@media(prefers-color-scheme:dark){:root{background:#141615;color:#eee;--card:#1e211f;--line:#404640;--accent:#add6ba;--on:#163323;--error:#ffb4ab}}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding:24px;min-height:100vh;display:grid;place-items:center}main{width:min(100%,580px);padding:28px;background:var(--card);border:1px solid var(--line);border-radius:20px}h1{font-size:22px;margin:0 0 20px}h2{font-size:16px}input,textarea,button{font:inherit}input,textarea{width:100%;padding:12px;background:transparent;color:inherit;border:1px solid var(--line);border-radius:10px}textarea{min-height:120px;resize:vertical;overflow-wrap:anywhere}button{background:var(--accent);color:var(--on);border:0;border-radius:20px;padding:10px 18px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}input:focus-visible,textarea:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}form{display:grid;gap:12px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}#captcha{width:300px;max-width:100%;margin:auto}#error{color:var(--error);overflow-wrap:anywhere}#status{font-size:14px}label{display:block;margin:12px 0 8px}.muted{opacity:.7;font-size:13px}
+</style></head>
+<body><main><h1>Ticket</h1>
+<form id="source-form"><label for="source">验证链接</label><input id="source" type="url" placeholder="https://ti.qq.com/…" autocomplete="off" required><button type="submit">开始验证</button></form>
+<p id="status" role="status">粘贴登录时的验证链接。</p><p id="error" role="alert"></p>
+<div id="captcha"></div>
+<section id="result" hidden><label for="ticket">Ticket</label><textarea id="ticket" readonly spellcheck="false"></textarea><div class="actions"><button id="copy" type="button">复制 Ticket</button><button id="copy-json" type="button">复制 JSON</button></div><p class="muted">返回登录页粘贴并提交。</p></section>
+<button id="retry" type="button" hidden>重新加载验证</button>
+</main><script>
+(() => {
+  'use strict';
+  const $=id=>document.getElementById(id);
+  let instance=null, result=null, loader=null, generation=0;
+  function parameters(search){
+    const input=new URLSearchParams(search), q=new URLSearchParams();
+    for(const key of ['aid','sid','uin','cap_cd','login_appid','clientype','apptype','fromOldPc']){
+      const value=input.get(key);if(value!==null){if(value.length>8192)throw new Error('验证参数过长。');q.set(key,value)}
+    }
+    for(const key of ['aid','sid','uin','login_appid'])if(q.has(key)&&!/^\d{1,24}$/.test(q.get(key)))throw new Error('验证参数无效：'+key);
+    if(!q.has('sid')&&!q.has('cap_cd'))throw new Error('验证链接缺少 sid 或 cap_cd。');
+    return q;
+  }
+  function loadScript(src){return new Promise((resolve,reject)=>{
+    const script=document.createElement('script'), timer=setTimeout(()=>{script.remove();reject(new Error('验证码组件加载超时。'))},15000);
+    script.src=src;script.onload=()=>{clearTimeout(timer);resolve()};script.onerror=()=>{clearTimeout(timer);script.remove();reject(new Error('验证码组件加载失败。'))};document.head.appendChild(script);
+  })}
+  async function sdk(){
+    if(typeof window.TencentCaptcha==='function')return;
+    if(!loader)loader=(async()=>{try{await loadScript('https://captcha.gtimg.com/TCaptcha.js')}catch{await loadScript('https://ssl.captcha.qq.com/TCaptcha.js')}if(typeof window.TencentCaptcha!=='function')throw new Error('验证码组件不可用。')})().catch(error=>{loader=null;throw error});
+    return loader;
+  }
+  function fail(message){$('status').textContent='未完成验证';$('error').textContent=message;$('retry').hidden=false}
+  function completed(value,attempt){
+    if(attempt!==generation)return;
+    if(!value||value.ret!==0||typeof value.ticket!=='string'||!value.ticket||value.ticket.length>8192||/^terror_/i.test(value.ticket)||value.errorCode){
+      fail(value?.ret===2?'验证已取消。':'验证码未完成或加载失败，请重新加载。');return;
+    }
+    result={ticket:value.ticket,randstr:typeof value.randstr==='string'?value.randstr:''};
+    $('ticket').value=result.ticket;$('result').hidden=false;$('retry').hidden=true;$('captcha').hidden=true;$('error').textContent='';$('status').textContent='验证完成';
+  }
+  async function start(q){
+    const attempt=++generation;result=null;$('ticket').value='';$('result').hidden=true;$('error').textContent='';$('status').textContent='正在加载验证…';$('source-form').hidden=true;$('retry').hidden=true;
+    instance?.destroy?.();instance=null;$('captcha').replaceChildren();$('captcha').hidden=false;
+    try{
+      await sdk();if(attempt!==generation)return;
+      const uin=q.get('uin')||'', sid=q.get('sid')||'', aid=q.get('aid')||(q.has('fromOldPc')?'1':'2081081773');
+      instance=new window.TencentCaptcha($('captcha'),aid,value=>completed(value,attempt),{
+        type:'embed',showHeader:true,captchaWidth:300,enableAged:true,bizState:{uin},uin,sid,
+        cap_cd:q.get('cap_cd')||'',login_appid:q.get('login_appid')||''
+      });instance.show();$('status').textContent='请完成验证';
+    }catch(error){if(attempt===generation)fail(error.message||'验证码加载失败。')}
+  }
+  async function copy(text){
+    try{await navigator.clipboard.writeText(text);$('status').textContent='已复制'}catch{$('ticket').focus();$('ticket').select();$('status').textContent='请手动复制选中内容'}
+  }
+  $('copy').onclick=()=>result&&copy(result.ticket);
+  $('copy-json').onclick=()=>result&&copy(JSON.stringify(result));
+  $('retry').onclick=()=>{try{void start(parameters(location.search))}catch(error){fail(error.message)}};
+  $('source-form').onsubmit=event=>{
+    event.preventDefault();try{
+      const url=new URL($('source').value.trim());
+      if(url.protocol!=='https:'||url.username||url.password||!['ti.qq.com','yogurt-captcha.ntqqrev.org',location.hostname].includes(url.hostname))throw new Error('请使用登录时提供的 HTTPS 验证链接。');
+      const q=parameters(url.search);history.replaceState(null,'',location.pathname+'?'+q.toString());void start(q);
+    }catch(error){fail(error.message)}
+  };
+  // No automatic upload, analytics, local/session storage, or password/sign Token.
+  if(location.search){try{void start(parameters(location.search))}catch(error){fail(error.message)}}
+})();
+</script></body></html>

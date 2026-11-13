@@ -34,6 +34,8 @@ jobs:
         run: dotnet run --project tests/ContractChecks --configuration Debug -p:ShiroBotPrepareDevelopmentHost=false
       - name: Check login page JavaScript contracts
         run: node tests/DashboardChecks/login-page.cjs
+      - name: Check standalone Ticket helper
+        run: node tests/DashboardChecks/ticket-helper.cjs
       - name: Build .NET 11 async2 release
         run: dotnet build src/ShiroBot.LagrangeAdapter.csproj --configuration Release -p:ContinuousIntegrationBuild=true
       - name: Verify release assembly version

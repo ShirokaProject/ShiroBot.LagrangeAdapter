@@ -49,6 +49,11 @@ async function run() {
   vm.runInContext('render(testState)', context);
   assert.equal(elements.captcha.hidden, false);
   assert.equal(elements.randstr.required, false);
+  elements.ticket.value = 'terror_1006_synthetic';
+  elements.captcha.onsubmit({ preventDefault() {} });
+  await flush();
+  assert.equal(requests.filter(x => x.action === 'captcha').length, 0, 'Invalid helper result was submitted');
+  assert.ok(elements.message.textContent.includes('加载失败'));
   elements['captcha-result'].value = '{"ret":0,"ticket":"synthetic-ticket","randstr":"synthetic-rand"}';
   elements['captcha-result'].oninput();
   assert.equal(elements.ticket.value, 'synthetic-ticket');

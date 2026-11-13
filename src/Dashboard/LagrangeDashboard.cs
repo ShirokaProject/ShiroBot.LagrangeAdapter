@@ -59,10 +59,25 @@ public partial class LagrangeAdapter
         if (!ReferenceEquals(_services.ActiveContext, context)) return;
         _verificationUrl = Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0
             ? uri.AbsoluteUri : null;
+        if (status == "captcha" && context.Config.Protocol is Lagrange.Core.Common.Protocols.AndroidPhone or Lagrange.Core.Common.Protocols.AndroidPad)
+            _verificationUrl = AndroidCaptchaHelperUrl(_verificationUrl, context.BotUin, CurrentConfigValue.CaptchaHelperUrl);
         _verificationPhone = phone;
         _verificationId = Guid.NewGuid().ToString("N");
         _loginError = null;
         _loginStatus = status;
+    }
+
+    // Same helper/query handoff as Yogurt: the native QQ page otherwise sends
+    // its ticket to the mobile app bridge instead of displaying it in a browser.
+    private static string? AndroidCaptchaHelperUrl(string? url, long uin, string helperUrl)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
+            !uri.Host.Equals("ti.qq.com", StringComparison.OrdinalIgnoreCase) ||
+            !uri.AbsolutePath.StartsWith("/safe/tools/captcha/", StringComparison.Ordinal)) return url;
+        var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+        if (query["uin"] == "0" && uin > 0)
+            query["uin"] = uin.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return helperUrl.TrimEnd('?') + "?" + query;
     }
 
     private async Task<JsonNode?> HandleLoginPageAsync(string action, JsonNode? arguments, CancellationToken token)
@@ -129,7 +144,12 @@ public partial class LagrangeAdapter
                             await PersistSessionAsync(context, ResolveKeystorePath(config));
                             _loginStatus = "online";
                         }
-                        else await LoginAsync(config, false, stopping);
+                        else
+                        {
+                            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stopping);
+                            timeout.CancelAfter(TimeSpan.FromMinutes(5));
+                            await LoginAsync(config, false, timeout.Token);
+                        }
                     }
                     catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
                     catch (OperationCanceledException)
@@ -177,6 +197,8 @@ public partial class LagrangeAdapter
                         if (ticket.Length is 0 or > 8192 || randstr.Length > 1024 ||
                             (randstr.Length == 0 && !_services.Context.Config.Protocol.ToString().StartsWith("Android", StringComparison.Ordinal)) || _loginStatus != "captcha")
                             throw new ArgumentException("当前无滑块验证请求，或验证结果无效。");
+                        if (ticket.StartsWith("terror_", StringComparison.OrdinalIgnoreCase))
+                            throw new ArgumentException("验证码页面加载失败，请重新打开验证链接；terror_ 不是有效 Ticket。");
                         ClearVerification();
                         _loginStatus = "logging_in";
                         if (!_services.Context.SubmitCaptcha(ticket, randstr))

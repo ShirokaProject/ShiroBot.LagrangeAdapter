@@ -81,6 +81,9 @@ internal static class AndroidLoginChecks
         foreach (var config in new[] {
             new LagrangeAdapterConfig { FetchAppInfo = true },
             new LagrangeAdapterConfig { FetchAppInfo = true, SignServer = "http://localhost", AppInfo = "{}" },
+            new LagrangeAdapterConfig { CaptchaHelperUrl = "http://captcha.example.com/" },
+            new LagrangeAdapterConfig { CaptchaHelperUrl = "https://user:secret@captcha.example.com/" },
+            new LagrangeAdapterConfig { CaptchaHelperUrl = "https://captcha.example.com/?redirect=evil" },
             new LagrangeAdapterConfig { SignServer = "http://localhost/android/v/ss_synthetic", SignToken = "duplicate" },
             new LagrangeAdapterConfig { SignServer = "http://localhost/?token=synthetic" } })
         {
@@ -136,6 +139,22 @@ internal static class AndroidLoginChecks
         state = await Call("status");
         await Call("captcha", new JsonObject { ["ticket"] = "synthetic-ticket", ["randstr"] = "", ["verificationId"] = state["verificationId"]!.GetValue<string>() });
         if ((await captcha.Task).Item1 != "synthetic-ticket") throw new Exception("Android captcha was not submitted.");
+        bot.Keystore.Uin = 123456789;
+        set.Invoke(adapter, [bot, "captcha", "https://ti.qq.com/safe/tools/captcha/sms-verify-login?aid=16&sid=123&uin=0&cap_cd=abc%2Bdef%2A%2A", null]);
+        state = await Call("status");
+        var helper = new Uri(state["verificationUrl"]!.GetValue<string>());
+        var query = System.Web.HttpUtility.ParseQueryString(helper.Query);
+        if (helper.AbsolutePath != "/" || helper.Host != "127.0.0.1" || helper.Port != 18130 || query["uin"] != "123456789" ||
+            query["sid"] != "123" || query["cap_cd"] != "abc+def**")
+            throw new Exception("Android captcha helper lost account or challenge parameters.");
+        try { await Call("captcha", new JsonObject { ["ticket"] = "terror_1006_synthetic", ["verificationId"] = state["verificationId"]!.GetValue<string>() }); throw new Exception("Failed helper ticket accepted."); }
+        catch (ArgumentException) { }
+        if ((await Call("status"))["verificationId"]!.GetValue<string>() != state["verificationId"]!.GetValue<string>())
+            throw new Exception("Invalid ticket consumed the current challenge.");
+        adapter.CurrentConfigValue.CaptchaHelperUrl = "https://captcha.example.test/tools/ticket/";
+        set.Invoke(adapter, [bot, "captcha", "https://ti.qq.com/safe/tools/captcha/sms-verify-login?aid=16&sid=123&uin=0", null]);
+        if (!(await Call("status"))["verificationUrl"]!.GetValue<string>().StartsWith("https://captcha.example.test/tools/ticket/?", StringComparison.Ordinal))
+            throw new Exception("Configured self-hosted helper path was ignored.");
         set.Invoke(adapter, [bot, "device", "javascript:alert(1)", null]);
         if ((await Call("status"))["verificationUrl"] is not null) throw new Exception("Unsafe verification URL accepted.");
         try { await Call("sms-login", new JsonObject { ["uin"] = "not-an-account" }); throw new Exception("Invalid SMS account accepted."); }

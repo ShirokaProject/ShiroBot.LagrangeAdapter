@@ -12,7 +12,7 @@ if (args is ["--export-appinfo", var output])
 
 var assembly = typeof(LagrangeAdapter).Assembly;
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.4" ||
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.5" ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)
