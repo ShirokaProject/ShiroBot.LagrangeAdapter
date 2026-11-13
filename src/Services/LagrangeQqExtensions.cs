@@ -6,8 +6,8 @@ using ShiroBot.Model.QQ;
 namespace ShiroBot.LagrangeAdapter.Services;
 
 /// <summary>
-/// IQq*Api 的 Lagrange 实现。Lagrange.Core 尚未提供的能力保留接口默认实现
-/// (NotSupportedException),插件通过能力探测降级。
+/// QQ SDK 实现，复用 Lagrange.Core 并补充 Yogurt 对应的协议与 Web 接口。
+/// SDK 额外策略能力未实现时保留明确的 NotSupportedException。
 /// </summary>
 internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
 {
@@ -24,49 +24,80 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
-        if (isFiltered) throw LagrangeMapper.Unsupported("过滤好友请求列表，上游没有过滤参数");
-        var requests = await session.Context.FetchFriendRequests().WaitAsync(cancellationToken);
-        var result = new List<QFriendRequest>();
-        foreach (var request in requests.OrderByDescending(x => x.Time).Take(limit))
+        if (isFiltered)
         {
-            var initiator = await session.Context.FetchStranger(request.SourceUin).WaitAsync(cancellationToken);
-            result.Add(new QFriendRequest
+            var data = await new LagrangeProtocol(session.Context).Oidb(0xd69, 0,
+                new ProtoWire().UInt(1, 1).Message(2, new ProtoWire().UInt(1, (ulong)limit)), cancellationToken);
+            var filtered = new List<QFriendRequest>();
+            foreach (var raw in ProtoWire.Child(data, 2).Where(f => f.Number == 1 && f.Wire == 2).Take(limit))
             {
-                InitiatorId = request.SourceUin.ToString(),
-                InitiatorUid = initiator.Uid,
-                TargetUserId = request.TargetUin.ToString(),
-                Time = DateTimeOffset.FromUnixTimeSeconds(request.Time),
-                Comment = request.Comment,
-                Via = request.Source,
-                State = request.EventState switch
-                {
-                    BotFriendRequest.State.Approved => QRequestState.Accepted,
-                    BotFriendRequest.State.Disapproved => QRequestState.Rejected,
-                    _ => QRequestState.Pending
-                }
-            });
+                var item = ProtoWire.Parse(raw.Bytes); var uid = ProtoWire.String(item, 1);
+                var user = await session.Context.FetchStrangerByUid(uid).WaitAsync(cancellationToken);
+                filtered.Add(new QFriendRequest { InitiatorId = user.Uin.ToString(), InitiatorUid = uid,
+                    TargetUserId = session.Context.BotUin.ToString(), Time = DateTimeOffset.FromUnixTimeSeconds((long)ProtoWire.Number(item, 8)),
+                    Comment = ProtoWire.String(item, 5), Via = ProtoWire.String(item, 6), State = QRequestState.Pending, IsFiltered = true });
+            }
+            return filtered;
+        }
+        var dataNormal = await new LagrangeProtocol(session.Context).Oidb(0x5cf, 11,
+            new ProtoWire().UInt(1, 1).UInt(3, 6).Text(4, session.Context.Keystore.Uid).UInt(5, 0)
+                .UInt(6, (ulong)limit).UInt(8, 2).UInt(9, 0).UInt(12, 1).UInt(22, 1), cancellationToken);
+        var result = new List<QFriendRequest>();
+        foreach (var raw in ProtoWire.Child(dataNormal, 3).Where(f => f.Number == 7 && f.Wire == 2).Take(limit))
+        {
+            var item = ProtoWire.Parse(raw.Bytes); var sourceUid = ProtoWire.String(item, 2); var targetUid = ProtoWire.String(item, 1);
+            var source = await session.Context.FetchStrangerByUid(sourceUid).WaitAsync(cancellationToken);
+            var target = targetUid == session.Context.Keystore.Uid ? session.Context.BotUin :
+                (await session.Context.FetchStrangerByUid(targetUid).WaitAsync(cancellationToken)).Uin;
+            result.Add(new QFriendRequest { InitiatorId = source.Uin.ToString(), InitiatorUid = sourceUid,
+                TargetUserId = target.ToString(), Time = DateTimeOffset.FromUnixTimeSeconds((long)ProtoWire.Number(item, 4)),
+                Comment = ProtoWire.String(item, 5), Via = ProtoWire.String(item, 6),
+                State = ProtoWire.Number(item, 3) switch { 3 => QRequestState.Accepted, 7 => QRequestState.Rejected, _ => QRequestState.Pending } });
         }
 
         return result;
     }
 
-    public Task SendProfileLikeAsync(string userId, int count = 1, CancellationToken cancellationToken = default)
+    public async Task SendProfileLikeAsync(string userId, int count = 1, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("名片点赞(Lagrange.Core 未提供 API)");
+        if (count is < 1 or > 20) throw new ArgumentOutOfRangeException(nameof(count));
+        var uid = await LagrangeProtocol.Uid(session.Context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
+        await new LagrangeProtocol(session.Context).Like(uid, count, cancellationToken);
     }
 
-    public Task DeleteFriendAsync(string userId, CancellationToken cancellationToken = default)
+    public async Task DeleteFriendAsync(string userId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("删除好友(Lagrange.Core 未提供 API)");
+        var uid = await LagrangeProtocol.Uid(session.Context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
+        await new LagrangeProtocol(session.Context).DeleteFriend(uid, cancellationToken);
     }
 
-    // 好友请求列表/处理:Lagrange.Core 只有事件,无处理 API — 走接口默认 NotSupported
+    public Task AcceptFriendRequestAsync(string initiatorUid, bool isFiltered = false, CancellationToken cancellationToken = default) =>
+        HandleRequest(initiatorUid, true, isFiltered, null, cancellationToken);
+    public Task RejectFriendRequestAsync(string initiatorUid, bool isFiltered = false, string? reason = null, CancellationToken cancellationToken = default) =>
+        HandleRequest(initiatorUid, false, isFiltered, reason, cancellationToken);
+    private async Task HandleRequest(string uid, bool accept, bool filtered, string? reason, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(uid);
+        if (!string.IsNullOrEmpty(reason)) throw new ArgumentException("腾讯好友审批接口不支持拒绝原因。", nameof(reason));
+        // Match Yogurt: filtered requests are accepted explicitly; rejecting one is a no-op.
+        if (filtered && !accept) return;
+        await new LagrangeProtocol(session.Context).FriendRequest(session.Context.Keystore.Uid, uid, accept, filtered, token);
+    }
+
 }
 
 internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
 {
+    public QGroupCapabilities Capabilities => QGroupCapabilities.Rename | QGroupCapabilities.Avatar |
+        QGroupCapabilities.MemberCard | QGroupCapabilities.MemberTitle | QGroupCapabilities.MemberAdmin |
+        QGroupCapabilities.MemberMute | QGroupCapabilities.WholeMute | QGroupCapabilities.Kick |
+        QGroupCapabilities.Quit | QGroupCapabilities.Nudge | QGroupCapabilities.Reaction |
+        QGroupCapabilities.Announcement | QGroupCapabilities.Essence | QGroupCapabilities.JoinRequests |
+        QGroupCapabilities.Notifications | QGroupCapabilities.Invitations | QGroupCapabilities.BatchMute |
+        QGroupCapabilities.GroupList | QGroupCapabilities.GroupInfo | QGroupCapabilities.Members;
     public Task<IReadOnlyList<QGroup>> GetGroupListAsync(bool noCache = false,
         CancellationToken cancellationToken = default)
     {
@@ -312,18 +343,19 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
         _ => QRequestState.Pending
     };
 
-    // 不支持项(Lagrange.Core 未提供 API):
-    public Task SetGroupAvatarAsync(string groupId, string imageUri, CancellationToken cancellationToken = default)
+    public async Task SetGroupAvatarAsync(string groupId, string imageUri, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("设置群头像(Lagrange.Core 未提供 API)");
+        await using var source = await LagrangeMapper.OpenResourceAsync(imageUri);
+        await LagrangeOperations.RequireSuccessAsync(session.Context.SetGroupAvatar(LagrangeMapper.ParseId(groupId, nameof(groupId)), source), "设置群头像", cancellationToken);
     }
 
-    public Task SetMemberAdminAsync(string groupId, string userId, bool isSet = true,
+    public async Task SetMemberAdminAsync(string groupId, string userId, bool isSet = true,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("设置群管理员(Lagrange.Core 未提供 API)");
+        var uid = await LagrangeProtocol.Uid(session.Context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
+        await new LagrangeProtocol(session.Context).SetAdmin((ulong)LagrangeMapper.ParseId(groupId, nameof(groupId)), uid, isSet, cancellationToken);
     }
 
     public Task MuteMemberAsync(string groupId, string userId, TimeSpan duration,
@@ -355,28 +387,41 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
+        _ = LagrangeMapper.ParseId(groupId, nameof(groupId));
+        return new LagrangeGroupWeb(session.Context).Announcements(groupId, cancellationToken);
     }
 
     public Task SendAnnouncementAsync(string groupId, string content, string? imageUri = null,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
+        _ = LagrangeMapper.ParseId(groupId, nameof(groupId)); ArgumentException.ThrowIfNullOrWhiteSpace(content);
+        return new LagrangeGroupWeb(session.Context).Announce(groupId, content, imageUri, cancellationToken);
     }
 
     public Task DeleteAnnouncementAsync(string groupId, string announcementId,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("群公告(Lagrange.Core 未提供 API)");
+        _ = LagrangeMapper.ParseId(groupId, nameof(groupId)); ArgumentException.ThrowIfNullOrWhiteSpace(announcementId);
+        return new LagrangeGroupWeb(session.Context).Delete(groupId, announcementId, cancellationToken);
     }
 
-    public Task<IReadOnlyList<QEssenceMessage>> GetEssenceMessagesAsync(string groupId, int pageIndex, int pageSize,
+    public async Task<IReadOnlyList<QEssenceMessage>> GetEssenceMessagesAsync(string groupId, int pageIndex, int pageSize,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("精华消息(Lagrange.Core 未提供 API)");
+        return (await GetEssenceMessagesPageAsync(groupId, pageIndex, pageSize, cancellationToken)).Messages;
+    }
+
+    public Task<(IReadOnlyList<QEssenceMessage> Messages, bool IsEnd)> GetEssenceMessagesPageAsync(string groupId, int pageIndex, int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _ = LagrangeMapper.ParseId(groupId, nameof(groupId));
+        ArgumentOutOfRangeException.ThrowIfNegative(pageIndex);
+        if (pageSize is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        return new LagrangeGroupWeb(session.Context).Essence(groupId, pageIndex, pageSize, cancellationToken);
     }
 
     public async Task SetEssenceMessageAsync(string groupId, string messageId, bool isSet = true,
@@ -394,14 +439,16 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("处理他人邀请自身入群(Lagrange.Core 未提供 API)");
+        return new LagrangeProtocol(session.Context).Invitation((ulong)LagrangeMapper.ParseId(groupId, nameof(groupId)),
+            ulong.Parse(invitationSeq), true, cancellationToken);
     }
 
     public Task RejectInvitationAsync(string groupId, string invitationSeq,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("处理他人邀请自身入群(Lagrange.Core 未提供 API)");
+        return new LagrangeProtocol(session.Context).Invitation((ulong)LagrangeMapper.ParseId(groupId, nameof(groupId)),
+            ulong.Parse(invitationSeq), false, cancellationToken);
     }
 }
 
@@ -412,9 +459,10 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri).ConfigureAwait(false);
-        await session.Context.SendFriendFile(LagrangeMapper.ParseId(userId, "userId"), stream, fileName)
+        var result = await session.Context.SendFriendFileWithId(LagrangeMapper.ParseId(userId, "userId"), stream, fileName)
             .ConfigureAwait(false);
-        return string.Empty; // 好友文件无 fileId
+        if (string.IsNullOrEmpty(result.FileId)) throw new InvalidDataException("私聊文件上传未返回文件 ID。");
+        return result.FileId;
     }
 
     public async Task<string> UploadGroupFileAsync(string groupId, string fileUri, string fileName,
@@ -451,12 +499,18 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
             .WaitAsync(cancellationToken);
     }
 
-    // 不支持项:
     public Task<string> GetPrivateFileDownloadUrlAsync(string userId, string fileId, string fileHash,
         CancellationToken cancellationToken = default)
+        => GetPrivateFileDownloadUrlAsync(userId, fileId, fileHash, false, cancellationToken);
+
+    public async Task<string> GetPrivateFileDownloadUrlAsync(string userId, string fileId, string fileHash,
+        bool isSelfSend, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("私聊文件下载链接(Lagrange.Core 未提供 API)");
+        ArgumentException.ThrowIfNullOrWhiteSpace(fileId); ArgumentException.ThrowIfNullOrWhiteSpace(fileHash);
+        var peer = isSelfSend ? LagrangeMapper.ParseId(userId, nameof(userId)) : session.Context.BotUin;
+        var uid = await LagrangeProtocol.Uid(session.Context, peer, cancellationToken);
+        return await new LagrangeProtocol(session.Context).PrivateFile(uid, fileId, fileHash, cancellationToken);
     }
 
     public async Task<(IReadOnlyList<QGroupFile> Files, IReadOnlyList<QGroupFolder> Folders)> GetGroupFilesAsync(
@@ -474,7 +528,8 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("重命名群文件(Lagrange.Core 未提供 API)");
+        ArgumentException.ThrowIfNullOrWhiteSpace(fileId); ArgumentException.ThrowIfNullOrWhiteSpace(newFileName);
+        return new LagrangeProtocol(session.Context).RenameFile((ulong)LagrangeMapper.ParseId(groupId, nameof(groupId)), fileId, parentFolderId, newFileName, cancellationToken);
     }
 
     public async Task<string> CreateGroupFolderAsync(string groupId, string folderName,
@@ -511,7 +566,8 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
     public Task PersistGroupFileAsync(string groupId, string fileId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("群文件转永久(Lagrange.Core 未提供 API)");
+        ArgumentException.ThrowIfNullOrWhiteSpace(fileId);
+        return new LagrangeProtocol(session.Context).PersistFile((ulong)LagrangeMapper.ParseId(groupId, nameof(groupId)), fileId, cancellationToken);
     }
 }
 
@@ -605,8 +661,14 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     public async Task<string> GetCookiesAsync(string domain, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var cookies = await session.Context.FetchCookies(domain).ConfigureAwait(false);
-        return cookies.GetValueOrDefault(domain, string.Empty);
+        if (domain.Length is 0 or > 253 || domain.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '-')))
+            throw new ArgumentException("Cookie 域名无效。", nameof(domain));
+        var cookies = await session.Context.FetchCookies(domain).WaitAsync(cancellationToken);
+        if (!cookies.TryGetValue(domain, out var pskey) || pskey.Length == 0)
+            throw new InvalidOperationException("服务器未返回该域名的 p_skey。");
+        var uin = session.Context.BotUin;
+        var skey = System.Text.Encoding.UTF8.GetString(session.Context.Keystore.WLoginSigs.SKey);
+        return $"uin=o{uin}; p_uin=o{uin}; skey={skey}; p_skey={pskey}";
     }
 
     async Task<QLoginInfo> IQSystemApi.GetLoginInfoAsync(CancellationToken cancellationToken)
@@ -624,38 +686,65 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
         {
             ImplName = "Lagrange.Core",
             ImplVersion = typeof(Lagrange.Core.BotContext).Assembly.GetName().Version?.ToString() ?? "unknown",
-            QqProtocolType = context.Config.Protocol.ToString().ToLowerInvariant()
+            QqProtocolType = context.Config.Protocol switch
+            {
+                Protocols.AndroidPhone => "android_phone", Protocols.AndroidPad => "android_pad",
+                Protocols.MacOs => "macos", _ => context.Config.Protocol.ToString().ToLowerInvariant()
+            },
+            QqProtocolVersion = context.Config.Protocol is Protocols.AndroidPhone or Protocols.AndroidPad ? context.AppInfo.PtVersion : context.AppInfo.CurrentVersion
         });
     }
 
-    // 不支持项:
     public Task SetPeerPinAsync(QMessageScene scene, string peerId, bool isPinned = true,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var peer = LagrangeMapper.ParseId(peerId, nameof(peerId));
         if (scene == QMessageScene.Temp) throw LagrangeMapper.Unsupported("临时会话置顶");
-        return scene == QMessageScene.Group
+        return (scene == QMessageScene.Group
             ? session.Context.SetPinGroup(peer, isPinned)
-            : session.Context.SetPinFriend(peer, isPinned).WaitAsync(cancellationToken);
+            : session.Context.SetPinFriend(peer, isPinned)).WaitAsync(cancellationToken);
     }
 
-    public Task SetNicknameAsync(string nickname, CancellationToken cancellationToken = default)
+    public async Task SetNicknameAsync(string nickname, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("设置昵称(Lagrange.Core 未提供 API)");
+        ArgumentException.ThrowIfNullOrWhiteSpace(nickname);
+        await new LagrangeProtocol(session.Context).Profile((ulong)session.Context.BotUin, 20002, nickname, cancellationToken);
     }
 
-    public Task SetBioAsync(string bio, CancellationToken cancellationToken = default)
+    public async Task SetBioAsync(string bio, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("设置个性签名(Lagrange.Core 未提供 API)");
+        await new LagrangeProtocol(session.Context).Profile((ulong)session.Context.BotUin, 102, bio, cancellationToken);
     }
 
     public Task<string> GetCsrfTokenAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("CSRF Token(可用 GetCookiesAsync 自行计算 bkn)");
+        var key = System.Text.Encoding.UTF8.GetString(session.Context.Keystore.WLoginSigs.SKey);
+        if (key.Length == 0) throw new InvalidOperationException("当前会话缺少 SKey，请刷新登录凭据。");
+        uint value = 5381;
+        foreach (var ch in key) value = unchecked(value * 33 + ch);
+        return Task.FromResult((value & 0x7fffffff).ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    public async Task<IReadOnlyList<string>> GetCustomFaceUrlListAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return await new LagrangeProtocol(session.Context).Faces((ulong)session.Context.BotUin, cancellationToken);
+    }
+
+    public async Task<(IReadOnlyList<QFriend> Friends, IReadOnlyList<QGroup> Groups)> GetPeerPinsAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var pins = await new LagrangeProtocol(session.Context).Pins(cancellationToken);
+        var uids = pins.Where(x => x.Number == 1 && x.Wire == 2).Select(x => ProtoWire.String(ProtoWire.Parse(x.Bytes), 1)).ToHashSet();
+        var groups = pins.Where(x => x.Number == 3 && x.Wire == 2).Select(x => ProtoWire.Number(ProtoWire.Parse(x.Bytes), 1)).ToHashSet();
+        var friends = await session.Context.FetchFriends().WaitAsync(cancellationToken);
+        var allGroups = await session.Context.FetchGroups().WaitAsync(cancellationToken);
+        return ([.. friends.Where(x => uids.Contains(x.Uid)).Select(LagrangeMapper.ToQq)],
+            [.. allGroups.Where(x => groups.Contains((ulong)x.Uin)).Select(LagrangeMapper.ToQq)]);
     }
 }
 
@@ -674,7 +763,7 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         {
             await LagrangeMapper.AppendQqSegmentAsync(chain, segment,
                 id => session.ResolveMessageAsync(id, LagrangeMapper.ParseId(peerId, "peerId"),
-                    scene == QMessageScene.Group, cancellationToken)).ConfigureAwait(false);
+                    scene == QMessageScene.Group, cancellationToken), session.Context).ConfigureAwait(false);
         }
 
         var sent = scene == QMessageScene.Group
@@ -775,7 +864,6 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         return session.Context.GetNTV2RichMediaUrl(resourceId).WaitAsync(cancellationToken);
     }
 
-    // 不支持项:
     public async Task<IReadOnlyList<QForwardedIncomingMessage>> GetForwardedMessagesAsync(string forwardId,
         CancellationToken cancellationToken = default)
     {
@@ -796,10 +884,20 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         ];
     }
 
-    public Task MarkAsReadAsync(QMessageScene scene, string peerId, string messageId,
+    public async Task MarkAsReadAsync(QMessageScene scene, string peerId, string messageId,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        throw LagrangeMapper.Unsupported("标记已读(Lagrange.Core 未提供 API)");
+        if (scene == QMessageScene.Temp) throw new ArgumentException("临时会话不支持已读上报。", nameof(scene));
+        var peer = LagrangeMapper.ParseId(peerId, nameof(peerId));
+        var sequence = ulong.Parse(messageId, System.Globalization.CultureInfo.InvariantCulture);
+        var protocol = new LagrangeProtocol(session.Context);
+        if (scene == QMessageScene.Group) await protocol.Read((ulong)peer, null, sequence, 0, cancellationToken);
+        else
+        {
+            var message = await session.ResolveMessageAsync(messageId, peer, false, cancellationToken)
+                ?? throw new InvalidOperationException("找不到需要标记已读的消息时间。");
+            await protocol.Read((ulong)peer, await LagrangeProtocol.Uid(session.Context, peer, cancellationToken), sequence, (ulong)message.Time, cancellationToken);
+        }
     }
 }

@@ -211,6 +211,7 @@ public static class LagrangeMapper
 
     private static MessageSegment ToSegment(IMessageEntity entity) => entity switch
     {
+        PrivateFileEntity file => new FileSegment("") { ResourceId = file.FileId, FileName = file.FileName, FileSize = file.FileSize },
         FaceEntity face => new RawSegment(PlatformId, "face", new QIncomingFace(face.FaceId.ToString(), face.IsLarge)),
         TextEntity text => new TextSegment(text.Text),
         MentionEntity { Uin: 0 } => new MentionAllSegment(),
@@ -271,6 +272,7 @@ public static class LagrangeMapper
         },
         VideoEntity video => new QIncomingVideo(video.FileUuid, video.FileUrl),
         GroupFileEntity file => new QIncomingFile(file.FileId, file.FileName, file.FileSize),
+        PrivateFileEntity file => new QIncomingFile(file.FileId, file.FileName, file.FileSize) { FileHash = file.FileHash },
         MultiMsgEntity multi => new QIncomingForward(multi.ResId ?? string.Empty),
         LightAppEntity lightApp => new QIncomingLightApp(lightApp.AppName, lightApp.Payload),
         _ => new QIncomingText(string.Empty)
@@ -280,7 +282,7 @@ public static class LagrangeMapper
 
     public static async Task<MessageChain> ToChainAsync(
         IReadOnlyList<MessageSegment> segments,
-        Func<string, Task<BotMessage?>> resolveQuoted)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
     {
         var chain = new MessageChain();
 
@@ -307,9 +309,9 @@ public static class LagrangeMapper
                     }
 
                     break;
-                case EmojiSegment:
-                    // 上游 FaceEntity.Build 尚未实现，当前仅支持入站表情。
-                    throw Unsupported("QQ 表情段(FaceEntity)");
+                case EmojiSegment emoji:
+                    chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(emoji.Id), false));
+                    break;
                 case ImageSegment image:
                     chain.Add(new ImageEntity(await OpenResourceAsync(image.Uri).ConfigureAwait(false),
                         image.Summary ?? "[图片]", disposeOnCompletion: true));
@@ -327,7 +329,7 @@ public static class LagrangeMapper
                         disposeOnCompletion: true));
                     break;
                 case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
-                    await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted).ConfigureAwait(false);
+                    await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context).ConfigureAwait(false);
                     break;
                 case RawSegment { Payload: IMessageEntity lagrangeEntity }:
                     chain.Add(lagrangeEntity);
@@ -345,7 +347,7 @@ public static class LagrangeMapper
     public static async Task AppendQqSegmentAsync(
         MessageChain chain,
         QOutgoingSegment segment,
-        Func<string, Task<BotMessage?>> resolveQuoted)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
     {
         switch (segment)
         {
@@ -383,10 +385,11 @@ public static class LagrangeMapper
             case QOutgoingLightApp lightApp:
                 chain.Add(new LightAppEntity(lightApp.JsonPayload));
                 break;
-            case QOutgoingFace:
-                throw Unsupported("QQ 表情段(FaceEntity)");
+            case QOutgoingFace face:
+                chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(face.FaceId), face.IsLarge));
+                break;
             case QOutgoingForward forward:
-                chain.Add(await ToMultiMsgAsync(forward, resolveQuoted).ConfigureAwait(false));
+                chain.Add(await ToMultiMsgAsync(forward, resolveQuoted, context).ConfigureAwait(false));
                 break;
             default:
                 throw Unsupported(segment.GetType().Name);
@@ -396,7 +399,7 @@ public static class LagrangeMapper
     /// <summary>合并转发 → MultiMsgEntity(伪造消息)。</summary>
     public static async Task<MultiMsgEntity> ToMultiMsgAsync(
         QOutgoingForward forward,
-        Func<string, Task<BotMessage?>> resolveQuoted)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
     {
         var messages = new List<BotMessage>();
         foreach (var message in forward.Messages)
@@ -404,7 +407,7 @@ public static class LagrangeMapper
             var chain = new MessageChain();
             foreach (var segment in message.Segments)
             {
-                await AppendQqSegmentAsync(chain, segment, resolveQuoted).ConfigureAwait(false);
+                await AppendQqSegmentAsync(chain, segment, resolveQuoted, context).ConfigureAwait(false);
             }
 
             messages.Add(BotMessage.CreateCustomGroup(

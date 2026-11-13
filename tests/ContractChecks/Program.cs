@@ -2,6 +2,40 @@ using System.Reflection;
 using ContractChecks;
 using ShiroBot.LagrangeAdapter;
 
+if (args is ["--audit-models", var modelPath])
+{
+    var types = typeof(ShiroBot.Model.QQ.QGroup).Assembly.GetTypes().Where(t =>
+        t.Name.StartsWith("QPeer") || t.Name.StartsWith("QGroup") || t.Name.StartsWith("QFriend") || t.Name == "QEventKinds" || t.Name == "QMutedMember").ToList();
+    types.Add(typeof(ShiroBot.SDK.Models.EmojiSegment));
+    types.Add(typeof(ShiroBot.SDK.Models.FileSegment));
+    File.WriteAllText(modelPath, System.Text.Json.JsonSerializer.Serialize(types.Select(t => new { name = t.FullName,
+        properties = t.GetProperties().Select(p => new { name = p.Name, type = p.PropertyType.ToString() }), fields=t.GetFields().Select(f=> new {name=f.Name,value=f.IsLiteral?f.GetRawConstantValue()?.ToString():null}),
+        constructors = t.GetConstructors().Select(c => c.ToString()), methods = t.GetMethods().Where(m => !m.IsSpecialName).Select(m => m.ToString()) }),
+        new System.Text.Json.JsonSerializerOptions { WriteIndented = true })); return;
+}
+
+if (args is ["--audit-capabilities", var auditPath])
+{
+    var rows = new List<object>();
+    foreach (var implementation in typeof(LagrangeAdapter).Assembly.GetTypes().Where(t =>
+                 t.Namespace == "ShiroBot.LagrangeAdapter.Services" && !t.IsAbstract))
+    foreach (var contract in implementation.GetInterfaces().Where(t => t.Namespace == "ShiroBot.Model.QQ"))
+    {
+        var map = implementation.GetInterfaceMap(contract);
+        for (var i = 0; i < map.InterfaceMethods.Length; i++)
+        {
+            var method = map.InterfaceMethods[i];
+            rows.Add(new { contract = contract.Name, implementation = implementation.Name, method = method.Name,
+                returns = method.ReturnType.ToString(), parameters = method.GetParameters().Select(p =>
+                    new { name = p.Name, type = p.ParameterType.ToString(), optional = p.IsOptional }),
+                inheritedDefault = map.TargetMethods[i].DeclaringType?.IsInterface == true });
+        }
+    }
+    File.WriteAllText(auditPath, System.Text.Json.JsonSerializer.Serialize(rows,
+        new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return;
+}
+
 if (args is ["--export-appinfo", var output])
 {
     File.WriteAllText(output, System.Text.Json.JsonSerializer.Serialize(
@@ -11,8 +45,9 @@ if (args is ["--export-appinfo", var output])
 }
 
 var assembly = typeof(LagrangeAdapter).Assembly;
+await ParityChecks.Run();
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.5" ||
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.6" ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)

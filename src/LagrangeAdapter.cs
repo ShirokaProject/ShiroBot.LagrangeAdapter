@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.5")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.6")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.5",
+    Version = "0.1.6",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -232,7 +232,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.AccountUin == 0
             ? await context.Login(token)
             : await context.Login(config.AccountUin, config.Password, token);
-        if (!success) throw new InvalidOperationException("Lagrange 登录失败，请查看协议日志。");
+        if (!success) throw new InvalidOperationException(_loginError ?? "Lagrange 登录失败，请查看协议日志。");
         await PersistSessionAsync(context, ResolveKeystorePath(config));
         _loginStatus = "online";
         Logger.Success($"Lagrange 登录成功 - {context.BotInfo?.Name} ({context.BotUin})");
@@ -422,6 +422,11 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
     private void RegisterLifecycleEvents(BotContext context, string keystorePath, LagrangeAdapterConfig config)
     {
+        context.EventInvoker.RegisterEvent<BotLoginEvent>((_, e) =>
+        {
+            if (!ReferenceEquals(_services.ActiveContext, context) || e.Success) return;
+            _loginError = LagrangeSecrets.Redact($"登录失败 {e.State}: {e.Error?.Tag} {e.Error?.Message}", config);
+        });
         context.EventInvoker.RegisterEvent<BotLogEvent>((_, e) =>
         {
             if (e.Level < context.Config.LogLevel) return;

@@ -13,7 +13,7 @@ internal sealed class LagrangeMessageService(LagrangeSession session) : IMessage
         cancellationToken.ThrowIfCancellationRequested();
         var peerId = LagrangeMapper.ParseId(channel.Id, "Channel.Id");
         var chain = await LagrangeMapper.ToChainAsync(segments,
-                id => session.ResolveMessageAsync(id, peerId, channel.Type == ChannelType.Group, cancellationToken))
+                id => session.ResolveMessageAsync(id, peerId, channel.Type == ChannelType.Group, cancellationToken), session.Context)
             .ConfigureAwait(false);
 
         var sent = channel.Type == ChannelType.Group

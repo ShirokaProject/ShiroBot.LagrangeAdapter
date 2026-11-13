@@ -26,10 +26,18 @@ index 16293620..d5ef8381 100644
 \ No newline at end of file
 +}
 diff --git a/Lagrange.Core/Common/Interface/BotExt.cs b/Lagrange.Core/Common/Interface/BotExt.cs
-index 0f8ffb8e..4e9f140d 100644
+index 0f8ffb8e..0ac901a9 100644
 --- a/Lagrange.Core/Common/Interface/BotExt.cs
 +++ b/Lagrange.Core/Common/Interface/BotExt.cs
-@@ -11,6 +11,10 @@ public static class BotExt
+@@ -5,12 +5,18 @@ namespace Lagrange.Core.Common.Interface;
+ 
+ public static class BotExt
+ {
++    public static Task RefreshSession(this BotContext context, CancellationToken token = default) =>
++        context.EventContext.GetLogic<WtExchangeLogic>().RefreshSession(token);
+     public static Task<bool> Login(this BotContext context, long uin, string password, CancellationToken token = default) =>
+         context.EventContext.GetLogic<WtExchangeLogic>().Login(uin, password, token);
+     
      public static Task<bool> Login(this BotContext context, CancellationToken token = default) =>
          context.EventContext.GetLogic<WtExchangeLogic>().Login(0, null, token);
  
@@ -40,18 +48,57 @@ index 0f8ffb8e..4e9f140d 100644
      /// <summary>Restore saved session tickets without falling back to password or QR login.</summary>
      public static Task<bool> LoginWithSession(this BotContext context, CancellationToken token = default) =>
          context.EventContext.GetLogic<WtExchangeLogic>().Login(0, null, token, sessionOnly: true);
-@@ -29,4 +33,4 @@ public static class BotExt
+@@ -29,4 +35,4 @@ public static class BotExt
  
      public static ValueTask<BotSsoPacket> SendPacket(this BotContext context, BotSsoPacket packet, RequestType requestType = RequestType.D2Auth, EncryptType encryptType = EncryptType.EncryptD2Key)
          => context.EventContext.GetLogic<OperationLogic>().SendPacket(packet, requestType, encryptType);
 -}
 \ No newline at end of file
 +}
+diff --git a/Lagrange.Core/Common/Interface/MessageExt.cs b/Lagrange.Core/Common/Interface/MessageExt.cs
+index edabc158..4dfd3531 100644
+--- a/Lagrange.Core/Common/Interface/MessageExt.cs
++++ b/Lagrange.Core/Common/Interface/MessageExt.cs
+@@ -30,6 +30,9 @@ public static class MessageExt
+     public static Task<(ulong Sequence, long Time)> SendFriendFile(this BotContext context, long targetUin, Stream fileStream, string? fileName = null)
+         => context.EventContext.GetLogic<OperationLogic>().SendFriendFile(targetUin, fileStream, fileName);
+ 
++    public static Task<(ulong Sequence, long Time, string FileId)> SendFriendFileWithId(this BotContext context, long targetUin, Stream fileStream, string? fileName = null)
++        => context.EventContext.GetLogic<OperationLogic>().SendFriendFileWithId(targetUin, fileStream, fileName);
++
+     public static Task<string> SendGroupFile(this BotContext context, long groupUin, Stream fileStream, string? fileName = null, string parentDirectory = "/")
+         => context.EventContext.GetLogic<OperationLogic>().SendGroupFile(groupUin, fileStream, fileName, parentDirectory);
+ 
+diff --git a/Lagrange.Core/Common/Interface/OperationExt.cs b/Lagrange.Core/Common/Interface/OperationExt.cs
+index ef847d04..77255b54 100644
+--- a/Lagrange.Core/Common/Interface/OperationExt.cs
++++ b/Lagrange.Core/Common/Interface/OperationExt.cs
+@@ -89,4 +89,17 @@ public static class OperationExt
+ 
+     public static Task<bool> SetBotAvatar(this BotContext context, Stream stream) =>
+         context.HighwayContext.UploadFile(stream, 90, Array.Empty<byte>());
++
++    public static Task<bool> SetGroupAvatar(this BotContext context, long groupUin, Stream stream)
++    {
++        if (groupUin <= 0) throw new ArgumentOutOfRangeException(nameof(groupUin));
++        var extra = Utility.ProtoHelper.Serialize(new Internal.Packets.Service.GroupAvatarExtra
++        {
++            Type = 101, Group = (ulong)groupUin, Info = new Internal.Packets.Service.GroupAvatarExtraInfo { Value = 1 }, Flag5 = 3, Flag6 = 1
++        });
++        return context.HighwayContext.UploadFile(stream, 3000, extra);
++    }
++
++    public static Task<BotStranger> FetchStrangerByUid(this BotContext context, string uid) =>
++        context.CacheContext.ResolveStranger(uid);
+ }
 diff --git a/Lagrange.Core/Internal/Context/PacketContext.cs b/Lagrange.Core/Internal/Context/PacketContext.cs
-index 6b4d33d1..79105f1e 100644
+index 6b4d33d1..6fa3c9d5 100644
 --- a/Lagrange.Core/Internal/Context/PacketContext.cs
 +++ b/Lagrange.Core/Internal/Context/PacketContext.cs
-@@ -3,6 +3,7 @@ using Lagrange.Core.Common;
+@@ -1,14 +1,15 @@
+-﻿using System.Collections.Concurrent;
++using System.Collections.Concurrent;
+ using Lagrange.Core.Common;
  using Lagrange.Core.Common.Entity;
  using Lagrange.Core.Internal.Packets.Struct;
  using Lagrange.Core.Services;
@@ -59,7 +106,30 @@ index 6b4d33d1..79105f1e 100644
  
  namespace Lagrange.Core.Internal.Context;
  
-@@ -50,16 +51,19 @@ internal class PacketContext
+ internal class PacketContext
+ {
+-    private readonly ConcurrentDictionary<int, SsoPacketValueTaskSource> _pendingTasks = new();
++    private readonly ConcurrentDictionary<int, PendingRequest> _pendingTasks = new();
+ 
+     private readonly BotKeystore _keystore;
+     private readonly SsoPacker _ssoPacker;
+@@ -37,8 +38,13 @@ internal class PacketContext
+ 
+     public ValueTask<BotSsoPacket> SendPacket(BotSsoPacket packet, ServiceAttribute options)
+     {
+-        var tcs = new SsoPacketValueTaskSource();
+-        _pendingTasks.TryAdd(packet.Sequence, tcs);
++        var pending = new PendingRequest(this, packet.Sequence);
++        if (!_pendingTasks.TryAdd(packet.Sequence, pending))
++        {
++            pending.Dispose();
++            throw new InvalidOperationException("Duplicate QQ request sequence.");
++        }
++        pending.Start();
+ 
+         Task.Run(async () => // Schedule the task to the ThreadPool
+         {
+@@ -50,16 +56,19 @@ internal class PacketContext
                  {
                      case RequestType.D2Auth:
                      {
@@ -81,6 +151,186 @@ index 6b4d33d1..79105f1e 100644
                          }
  
                          break;
+@@ -85,18 +94,64 @@ internal class PacketContext
+                     }
+                 }
+ 
+-                await _context.SocketContext.Send(frame);
++                if (await _context.SocketContext.Send(frame) <= 0) throw new IOException("QQ socket is disconnected.");
+             }
+             catch (Exception e)
+             {
+                 if (_pendingTasks.TryRemove(packet.Sequence, out var tcs))
+                 {
+-                    tcs.SetException(e);
++                    tcs.Dispose();
++                    tcs.Source.SetException(e);
+                 }
+             }
+         });
+ 
+-        return new ValueTask<BotSsoPacket>(tcs, 0);
++        return new ValueTask<BotSsoPacket>(pending.Source, 0);
++    }
++
++    private sealed class PendingRequest : IDisposable
++    {
++        internal readonly SsoPacketValueTaskSource Source = new();
++        private readonly Timer _expiry;
++        private readonly object _gate = new();
++        private bool _completed;
++
++        internal PendingRequest(PacketContext owner, int sequence)
++        {
++            _expiry = new Timer(_ =>
++            {
++                if (owner._pendingTasks.TryRemove(new KeyValuePair<int, PendingRequest>(sequence, this)))
++                {
++                    Dispose();
++                    Source.SetException(new TimeoutException($"QQ request timed out (sequence {sequence})."));
++                }
++            }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
++        }
++
++        internal void Start()
++        {
++            lock (_gate)
++                if (!_completed) _expiry.Change(TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan);
++        }
++
++        public void Dispose()
++        {
++            lock (_gate)
++            {
++                _completed = true;
++                _expiry.Dispose();
++            }
++        }
++    }
++
++    internal void FailPending(Exception error)
++    {
++        foreach (var (sequence, _) in _pendingTasks)
++            if (_pendingTasks.TryRemove(sequence, out var pending))
++            {
++                pending.Dispose();
++                pending.Source.SetException(error);
++            }
+     }
+ 
+     public void DispatchPacket(ReadOnlySpan<byte> buffer)
+@@ -106,14 +161,15 @@ internal class PacketContext
+ 
+         if (_pendingTasks.TryRemove(sso.Sequence, out var tcs))
+         {
++            tcs.Dispose();
+             if (sso is { RetCode: not 0, Extra: var extra })
+             {
+                 string msg = $"Packet '{sso.Command}' returns {sso.RetCode} with seq: {sso.Sequence}, extra: {extra}";
+-                tcs.SetException(new InvalidOperationException(msg));
++                tcs.Source.SetException(new InvalidOperationException(msg));
+             }
+             else
+             {
+-                tcs.SetResult(sso);
++                tcs.Source.SetResult(sso);
+             }
+         }
+         else
+diff --git a/Lagrange.Core/Internal/Context/SocketContext.cs b/Lagrange.Core/Internal/Context/SocketContext.cs
+index c0062e32..9c73a7a5 100644
+--- a/Lagrange.Core/Internal/Context/SocketContext.cs
++++ b/Lagrange.Core/Internal/Context/SocketContext.cs
+@@ -4,6 +4,8 @@ using System.Net.NetworkInformation;
+ using System.Net.Sockets;
+ using Lagrange.Core.Common;
+ using Lagrange.Core.Internal.Network;
++using Lagrange.Core.Common.Interface;
++using Lagrange.Core.Events.EventArgs;
+ 
+ namespace Lagrange.Core.Internal.Context;
+ 
+@@ -20,6 +22,9 @@ internal class SocketContext : IClientListener, IDisposable
+     private readonly BotConfig _config;
+     
+     private readonly BotContext _context;
++    private readonly CancellationTokenSource _lifetime = new();
++    private bool _intentionalDisconnect;
++    private int _reconnecting;
+     
+     public SocketContext(BotContext context)
+     {
+@@ -34,17 +39,47 @@ internal class SocketContext : IClientListener, IDisposable
+ 
+     public void OnDisconnect()
+     {
+-        
++        _context.PacketContext.FailPending(new IOException("QQ socket disconnected."));
++        var wasOnline = _context.IsOnline;
++        _context.IsOnline = false;
++        if (_intentionalDisconnect || _lifetime.IsCancellationRequested || !wasOnline) return;
++        _context.EventInvoker.PostEvent(new BotOfflineEvent(BotOfflineEvent.Reasons.Disconnected, null));
++        if (!_config.AutoReconnect || Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0) return;
++        _ = Reconnect();
++    }
++
++    private async Task Reconnect()
++    {
++        try
++        {
++            for (var attempt = 0; attempt < 6 && !_lifetime.IsCancellationRequested; attempt++)
++            {
++                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 1 << attempt)), _lifetime.Token);
++                try
++                {
++                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
++                    timeout.CancelAfter(TimeSpan.FromSeconds(40));
++                    if (await _context.LoginWithSession(timeout.Token)) return;
++                }
++                catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { return; }
++                catch (Exception e) { _context.LogWarning(Tag, "Session reconnect attempt {0} failed: {1}", null, attempt + 1, e.GetType().Name); }
++                _client.Disconnect();
++            }
++        }
++        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
++        finally { Interlocked.Exchange(ref _reconnecting, 0); }
+     }
+ 
+     public void OnSocketError(Exception e, ReadOnlyMemory<byte> data)
+     {
+-        
++        if (!_intentionalDisconnect && !_lifetime.IsCancellationRequested)
++            _context.LogWarning(Tag, "Socket error: {0}", null, e.GetType().Name);
+     }
+     
+     public async Task<bool> Connect()
+     {
+         if (_client.Connected) return true;
++        _intentionalDisconnect = false;
+         
+         var servers = await ResolveDns();
+         if (_config.GetOptimumServer) await SortServers(servers);
+@@ -56,7 +91,7 @@ internal class SocketContext : IClientListener, IDisposable
+         return connected;
+     }
+     
+-    public void Disconnect() => _client.Disconnect();
++    public void Disconnect() { _intentionalDisconnect = true; _client.Disconnect(); }
+     
+     public ValueTask<int> Send(ReadOnlyMemory<byte> packet) => _client.Send(packet);
+     
+@@ -92,6 +127,9 @@ internal class SocketContext : IClientListener, IDisposable
+     
+     public void Dispose()
+     {
++        _intentionalDisconnect = true;
++        _lifetime.Cancel();
++        _context.PacketContext.FailPending(new ObjectDisposedException(nameof(SocketContext)));
+         _client.Disconnect();
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs b/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
 index fca8f082..6f29a00c 100644
 --- a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
@@ -112,8 +362,95 @@ index fca8f082..6f29a00c 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/Lagrange.Core/Internal/Logic/OperationLogic.cs b/Lagrange.Core/Internal/Logic/OperationLogic.cs
+index 7dbb67a5..bd600584 100644
+--- a/Lagrange.Core/Internal/Logic/OperationLogic.cs
++++ b/Lagrange.Core/Internal/Logic/OperationLogic.cs
+@@ -249,6 +249,12 @@ internal class OperationLogic(BotContext context) : ILogic
+     }
+ 
+     public async Task<(ulong, long)> SendFriendFile(long targetUin, Stream fileStream, string? fileName)
++    {
++        var result = await SendFriendFileWithId(targetUin, fileStream, fileName);
++        return (result.Sequence, result.Time);
++    }
++
++    public async Task<(ulong Sequence, long Time, string FileId)> SendFriendFileWithId(long targetUin, Stream fileStream, string? fileName)
+     {
+         fileName = ResolveFileName(fileStream, fileName);
+ 
+@@ -313,7 +319,7 @@ internal class OperationLogic(BotContext context) : ILogic
+         var sendResult = await context.EventContext.SendEvent<SendMessageEventResp>(new SendFriendFileEventReq(friend, request, result, sequence, random));
+         if (sendResult.Result != 0) throw new OperationException(sendResult.Result);
+ 
+-        return (sequence, sendResult.SendTime);
++        return (sequence, sendResult.SendTime, result.FileId);
+     }
+ 
+     private static string ResolveFileName(Stream fileStream, string? fileName)
+diff --git a/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs b/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
+index 1b940511..bdaa292f 100644
+--- a/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
++++ b/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
+@@ -1,4 +1,4 @@
+-﻿using System.Text.Json;
++using System.Text.Json;
+ using System.Web;
+ using Lagrange.Core.Common.Entity;
+ using Lagrange.Core.Events.EventArgs;
+@@ -10,6 +10,8 @@ namespace Lagrange.Core.Internal.Logic.Processors;
+ 
+ [MsgPushProcessor(MsgType.GroupMessage)]
+ [MsgPushProcessor(MsgType.PrivateMessage)]
++[MsgPushProcessor((MsgType)208)]
++[MsgPushProcessor((MsgType)529)]
+ [MsgPushProcessor(MsgType.TempMessage)]
+ internal class RichTextMsgProcessor : MsgPushProcessorBase
+ {
+@@ -17,7 +19,7 @@ internal class RichTextMsgProcessor : MsgPushProcessorBase
+     {
+         var message = await context.EventContext.GetLogic<MessagingLogic>().Parse(msgEvt.MsgPush.CommonMessage);
+ 
+-        if (message.Entities.Count > 0 && message.Entities[0] is LightAppEntity app && TryHandleLightApp(context, message, app)) return true;
++        if (message.Entities.Count > 0 && message.Entities[0] is LightAppEntity app) TryHandleLightApp(context, message, app);
+ 
+         context.EventInvoker.PostEvent(new BotMessageEvent(message, msgEvt.Raw));
+         return true;
+@@ -25,7 +27,7 @@ internal class RichTextMsgProcessor : MsgPushProcessorBase
+ 
+     private bool TryHandleLightApp(BotContext context, BotMessage message, LightAppEntity app)
+     {
+-        if ((app.AppName == "com.tencent.qun.invite" || app.AppName == "com.tencent.qun.invite") && TryHandleQunInvite(context, message, app)) return true;
++        if ((app.AppName == "com.tencent.qun.invite" || app.AppName == "com.tencent.tuwen.lua") && TryHandleQunInvite(context, message, app)) return true;
+ 
+         return false;
+     }
+@@ -60,4 +62,4 @@ internal class RichTextMsgProcessor : MsgPushProcessorBase
+ 
+         return true;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Logic/PushLogic.cs b/Lagrange.Core/Internal/Logic/PushLogic.cs
+index fdaa6957..089a147e 100644
+--- a/Lagrange.Core/Internal/Logic/PushLogic.cs
++++ b/Lagrange.Core/Internal/Logic/PushLogic.cs
+@@ -19,6 +19,12 @@ internal class PushLogic(BotContext ctx) : ILogic
+         var hasContent = msgEvt.MsgPush.CommonMessage.MessageBody?.MsgContent is not null;
+         var content = msgEvt.MsgPush.CommonMessage.MessageBody?.MsgContent;
+ 
++        if (content is { Length: > 0 } extra &&
++            ((int)msgType is 44 or 34 || msgType == MsgType.Event0x210 && subType is 39 or 290 ||
++             msgType == MsgType.Event0x2DC && subType is 12 or 16 or 21))
++            ctx.EventInvoker.PostEvent(new Lagrange.Core.Events.EventArgs.BotExtendedNoticeEvent((int)msgType, subType,
++                msgEvt.MsgPush.CommonMessage.RoutingHead.FromUin, extra.ToArray()));
++
+         if (_processors.TryGetValue(new MsgMatchKey(msgType, subType, hasContent), out var handlers))
+         {
+             foreach (var handler in handlers)
 diff --git a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
-index 70fcb9e9..15dce0ca 100644
+index 70fcb9e9..b97c3d2a 100644
 --- a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
 +++ b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
 @@ -1,4 +1,4 @@
@@ -131,12 +468,18 @@ index 70fcb9e9..15dce0ca 100644
          {
              _transEmpSource?.TrySetCanceled();
              _captchaSource?.TrySetCanceled();
-@@ -118,6 +118,121 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -118,6 +118,127 @@ internal class WtExchangeLogic : ILogic, IDisposable
          return true;
      }
  
 +    private async Task<bool> CompleteAndroidLogin(LoginEventResp result)
 +    {
++    if (result.State == LoginEventResp.States.PreventByHighRiskOfEnvironment && result.Tlvs.TryGetValue(0x543, out var verification))
++    {
++        var url = ProtoHelper.Deserialize<AndroidVerificationInfo>(verification).Buttons.Actions.Select(x => x.Url)
++            .FirstOrDefault(x => Uri.TryCreate(x, UriKind.Absolute, out var uri) && uri.Scheme is "https" or "http");
++        if (url is not null) _context.EventInvoker.PostEvent(new BotNewDeviceVerifyEvent(url));
++    }
 +    if (result.State == LoginEventResp.States.CaptchaVerify)
 +    {
 +        if (result.Tlvs.TryGetValue(0x104, out var tlv104))
@@ -253,7 +596,7 @@ index 70fcb9e9..15dce0ca 100644
      private async Task<bool> ManualLogin(long uin, string? password)
      {
          if (string.IsNullOrEmpty(password) && _context.Config.Protocol.IsAndroid())
-@@ -183,86 +298,7 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -183,86 +304,7 @@ internal class WtExchangeLogic : ILogic, IDisposable
  
                  var result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Tgtgt, password));
  
@@ -341,7 +684,7 @@ index 70fcb9e9..15dce0ca 100644
              }
              else
              {
-@@ -283,11 +319,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -283,11 +325,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
                          case NTLoginRetCode.LOGIN_ERROR_PROOF_WATER:
                              _context.LogInfo(Tag, "Captcha required, URL: {0}", result.JumpingUrl);
  
@@ -358,7 +701,7 @@ index 70fcb9e9..15dce0ca 100644
                              result = await _context.EventContext.SendEvent<PasswordLoginEventResp>(new PasswordLoginEventReq(password, (ticket, randStr, sid)));
                              break;
                          case NTLoginRetCode.LOGIN_ERROR_NEW_DEVICE:
-@@ -364,6 +402,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+@@ -364,6 +408,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
          return (success, result.Message);
      }
  
@@ -372,8 +715,70 @@ index 70fcb9e9..15dce0ca 100644
      public bool SubmitCaptcha(string ticket, string randStr)
      {
          if (_captchaSource == null) return false;
+@@ -393,7 +444,8 @@ internal class WtExchangeLogic : ILogic, IDisposable
+                 _context.IsOnline = true;
+ 
+                 _timers[SsoHeartBeatTag].Change(0, 270 * 1000);
+-                if (_context.Config.Protocol.IsAndroid()) _timers[ExchangeEmpTag].Change(TimeSpan.Zero, TimeSpan.FromDays(1));
++                if (_context.Config.Protocol.IsAndroid() && _context.Config.AutoReLogin)
++                    _timers[ExchangeEmpTag].Change(TimeSpan.FromDays(1), TimeSpan.FromDays(1));
+                 return true;
+             }
+         }
+@@ -490,13 +542,7 @@ internal class WtExchangeLogic : ILogic, IDisposable
+     {
+         try
+         {
+-            var result = await _context.EventContext.SendEvent<ExchangeEmpEventResp>(new ExchangeEmpEventReq(ExchangeEmpEventReq.Command.RefreshByA1));
+-            if (result.RetCode == 0)
+-            {
+-                ReadWLoginSigs(result.Tlvs);
+-                if (!_context.IsOnline) await Online();
+-                _context.EventInvoker.PostEvent(new BotRefreshKeystoreEvent(_context.Keystore));
+-            }
++            await RefreshSession(_token ?? default);
+         }
+         catch (Exception e)
+         {
+@@ -504,6 +550,17 @@ internal class WtExchangeLogic : ILogic, IDisposable
+         }
+     });
+ 
++    public async Task RefreshSession(CancellationToken token)
++    {
++        token.ThrowIfCancellationRequested();
++        if (!_context.Config.Protocol.IsAndroid()) throw new NotSupportedException("此续期入口仅用于 Android。");
++        var result = await _context.EventContext.SendEvent<ExchangeEmpEventResp>(new ExchangeEmpEventReq(ExchangeEmpEventReq.Command.RefreshByA1)).AsTask().WaitAsync(token);
++        if (result.RetCode != 0) throw new InvalidOperationException($"Android 凭据续期失败: {result.RetCode}");
++        ReadWLoginSigs(result.Tlvs);
++        if (!_context.IsOnline && !await Online()) throw new InvalidOperationException("续期后注册上线失败。");
++        _context.EventInvoker.PostEvent(new BotRefreshKeystoreEvent(_context.Keystore));
++    }
++
+     private void OnNewDevice(object? state) => Task.Run(async () =>
+     {
+         if (_client == null || _transEmpSource == null) throw new InvalidOperationException("Can not find client");
+diff --git a/Lagrange.Core/Internal/Network/ClientListener.cs b/Lagrange.Core/Internal/Network/ClientListener.cs
+index e3591f80..26b14e52 100644
+--- a/Lagrange.Core/Internal/Network/ClientListener.cs
++++ b/Lagrange.Core/Internal/Network/ClientListener.cs
+@@ -186,6 +186,7 @@ internal abstract partial class ClientListener : IClientListener
+         if (Interlocked.CompareExchange(ref Session, null, session) == session)
+         {
+             session.Dispose();
++            OnDisconnect();
+         }
+     }
+ 
+@@ -196,4 +197,4 @@ internal abstract partial class ClientListener : IClientListener
+     public abstract void OnDisconnect();
+ 
+     public abstract void OnSocketError(Exception e, ReadOnlyMemory<byte> data = default);
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Packets/Login/Tlv.cs b/Lagrange.Core/Internal/Packets/Login/Tlv.cs
-index 8b847e50..2347d6de 100644
+index 8b847e50..101675b6 100644
 --- a/Lagrange.Core/Internal/Packets/Login/Tlv.cs
 +++ b/Lagrange.Core/Internal/Packets/Login/Tlv.cs
 @@ -126,16 +126,23 @@ internal ref struct Tlv : IDisposable
@@ -414,10 +819,17 @@ index 8b847e50..2347d6de 100644
          plainWriter.Write(_keystore.Uin.ToString(), Prefix.Int16 | Prefix.LengthOnly);
          plainWriter.Write<short>(0);
          _writer.Write(TeaProvider.Encrypt(plainWriter.CreateReadOnlySpan(), key));
-@@ -679,6 +686,37 @@ internal ref struct Tlv : IDisposable
+@@ -679,6 +686,44 @@ internal ref struct Tlv : IDisposable
          _writer.ExitLengthBarrier<short>(false);
      }
  
++    public void Tlv542()
++    {
++        WriteTlv(0x542);
++        _writer.Write(new byte[] { 0x4a, 4, 0x60, 1, 0x78, 1, 0x88, 1, 1 });
++        _writer.ExitLengthBarrier<short>(false);
++    }
++
 +    public void Tlv108(byte[] ksid)
 +    {
 +        WriteTlv(0x108);
@@ -452,8 +864,15 @@ index 8b847e50..2347d6de 100644
      public ReadOnlySpan<byte> CreateReadOnlySpan()
      {
          _writer.Write(_count, _prefixed ? 2 : 0);
+@@ -718,4 +763,4 @@ internal partial class DeviceReport
+     [ProtoMember(8)] public string? BaseBand { get; set; }
+     
+     [ProtoMember(9)] public string? InnerVersion { get; set; }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
-index b56130a4..31686185 100644
+index b56130a4..c8b36f54 100644
 --- a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
 +++ b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
 @@ -1,10 +1,12 @@
@@ -588,6 +1007,15 @@ index b56130a4..31686185 100644
      public async Task<ReadOnlyMemory<byte>> BuildOicq02Android(string ticket)
      {
          var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
+@@ -214,7 +285,7 @@ internal class WtLogin : StructBase
+         if (Keystore.State.Tlv547 is { } tlv547) tlvs.Tlv547(tlv547);
+         tlvs.Tlv544(energy);
+         tlvs.Tlv553(attach);
+-        // 542 smsExtraData
++        tlvs.Tlv542();
+         
+         return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
+     }
 @@ -327,6 +398,9 @@ internal class WtLogin : StructBase
          EncryptMethod method = EncryptMethod.EM_ECDH_ST,
          bool useWtSession = false) // corrected
@@ -681,6 +1109,56 @@ index b56130a4..31686185 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/Lagrange.Core/Internal/Packets/Message/Elem.cs b/Lagrange.Core/Internal/Packets/Message/Elem.cs
+index 4bdb7ae6..97b1c8d3 100644
+--- a/Lagrange.Core/Internal/Packets/Message/Elem.cs
++++ b/Lagrange.Core/Internal/Packets/Message/Elem.cs
+@@ -365,10 +365,19 @@ internal partial class CommonElem
+ internal partial class QSmallFaceExtra // PbElem of CommonElem 33
+ {
+     [ProtoMember(1)] public uint FaceId { get; set; }
++    [ProtoMember(2)] public string Text { get; set; } = "";
++    [ProtoMember(3)] public string CompatText { get; set; } = "";
+ }
+ 
+ [ProtoPackable]
+ internal partial class QBigFaceExtra // PbElem of CommonElem 37
+ {
++    [ProtoMember(1)] public string PackId { get; set; } = "";
++    [ProtoMember(2)] public string StickerId { get; set; } = "";
+     [ProtoMember(3)] public uint FaceId { get; set; }
+-}
+\ No newline at end of file
++    [ProtoMember(4)] public uint Field4 { get; set; }
++    [ProtoMember(5)] public uint StickerType { get; set; }
++    [ProtoMember(6)] public string Field6 { get; set; } = "";
++    [ProtoMember(7)] public string Preview { get; set; } = "";
++    [ProtoMember(9)] public uint Field9 { get; set; }
++}
+diff --git a/Lagrange.Core/Internal/Packets/Message/NTMessageCommon.cs b/Lagrange.Core/Internal/Packets/Message/NTMessageCommon.cs
+index daf7cd7b..035d7d42 100644
+--- a/Lagrange.Core/Internal/Packets/Message/NTMessageCommon.cs
++++ b/Lagrange.Core/Internal/Packets/Message/NTMessageCommon.cs
+@@ -194,6 +194,12 @@ internal partial class NotOnlineFile
+     [ProtoMember(57)] public string FileIdCrcMedia { get; set; } = string.Empty;
+ }
+ 
++[ProtoPackable]
++internal partial class PrivateFileExtra
++{
++    [ProtoMember(1)] public NotOnlineFile File { get; set; } = new();
++}
++
+ [ProtoPackable]
+ internal partial class Ptt
+ {
+@@ -280,4 +286,4 @@ internal partial class Trans211TmpMsg
+     [ProtoMember(1)] public byte[]? MsgBody { get; set; }
+ 
+     [ProtoMember(2)] public uint C2CCmd { get; set; }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs b/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs
 index 2f05ffcf..2b6216aa 100644
 --- a/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs
@@ -733,7 +1211,7 @@ index c17ccfb7..bcadef0d 100644
 \ No newline at end of file
 +}
 diff --git a/Lagrange.Core/Internal/Services/Login/LoginService.cs b/Lagrange.Core/Internal/Services/Login/LoginService.cs
-index c48a4146..a6f6a763 100644
+index c48a4146..40303a07 100644
 --- a/Lagrange.Core/Internal/Services/Login/LoginService.cs
 +++ b/Lagrange.Core/Internal/Services/Login/LoginService.cs
 @@ -48,10 +48,13 @@ internal class LoginServiceAndroid : BaseService<LoginEventReq, LoginEventResp>
@@ -751,6 +1229,134 @@ index c48a4146..a6f6a763 100644
              _ => throw new ArgumentOutOfRangeException(nameof(input), $"Unknown command: {input.Cmd}")
          };
      }
+@@ -84,7 +87,7 @@ file static class Common
+             string errorTitle = errorReader.ReadString(Prefix.Int16 | Prefix.LengthOnly);
+             string errorMessage = errorReader.ReadString(Prefix.Int16 | Prefix.LengthOnly);
+             
+-            return new LoginEventResp(state, (errorTitle, errorMessage));
++            return new LoginEventResp(state, (errorTitle, errorMessage)) { Tlvs = tlvs };
+         }
+ 
+         if (tlvs.TryGetValue(0x119, out var tgtgt))
+@@ -99,4 +102,4 @@ file static class Common
+ 
+         return new LoginEventResp(state, tlvs);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Message/Entities/FaceEntity.cs b/Lagrange.Core/Message/Entities/FaceEntity.cs
+index 4b7d1fa5..e0f3ebd2 100644
+--- a/Lagrange.Core/Message/Entities/FaceEntity.cs
++++ b/Lagrange.Core/Message/Entities/FaceEntity.cs
+@@ -5,11 +5,32 @@ namespace Lagrange.Core.Message.Entities;
+ 
+ public class FaceEntity : IMessageEntity
+ {
++    public FaceEntity() { }
++
++    public FaceEntity(int faceId, bool isLarge = false, string text = "", uint packId = 0, uint stickerId = 0, uint stickerType = 0)
++    {
++        ArgumentOutOfRangeException.ThrowIfNegative(faceId);
++        FaceId = faceId; IsLarge = isLarge; _text = text; _packId = packId; _stickerId = stickerId; _stickerType = stickerType;
++    }
++    private readonly string _text = "";
++    private readonly uint _packId, _stickerId, _stickerType;
+     public int FaceId { get; internal init; }
+ 
+     public bool IsLarge { get; internal init; }
+ 
+-    Elem[] IMessageEntity.Build() => throw new NotSupportedException();
++    Elem[] IMessageEntity.Build()
++    {
++        if (FaceId < 260) return [new Elem { Face = new Face { Index = (uint)FaceId } }];
++        return [new Elem { CommonElem = new CommonElem
++        {
++            ServiceType = IsLarge ? 37u : 33u, BusinessType = _stickerType,
++            PbElem = IsLarge ? ProtoHelper.Serialize(new QBigFaceExtra
++            {
++                FaceId = (uint)FaceId, PackId = _packId.ToString(), StickerId = _stickerId.ToString(),
++                Field4 = 1, StickerType = _stickerType, Preview = _text, Field9 = 1
++            }) : ProtoHelper.Serialize(new QSmallFaceExtra { FaceId = (uint)FaceId, Text = _text, CompatText = _text })
++        } }];
++    }
+ 
+     IMessageEntity? IMessageEntity.Parse(List<Elem> elements, Elem target)
+     {
+@@ -24,4 +45,4 @@ public class FaceEntity : IMessageEntity
+     }
+ 
+     string IMessageEntity.ToPreviewString() => "[表情]";
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Message/MessagePacker.cs b/Lagrange.Core/Message/MessagePacker.cs
+index 011f6eca..5ae03560 100644
+--- a/Lagrange.Core/Message/MessagePacker.cs
++++ b/Lagrange.Core/Message/MessagePacker.cs
+@@ -32,7 +32,13 @@ internal class MessagePacker(BotContext context)
+         if (msg.MessageBody is null)
+             return message;
+ 
+-        if (ParsePttRichText(msg.MessageBody.RichText) is { } record)
++        if (contentHead.Type == 529 && msg.MessageBody.MsgContent is { Length: > 0 } fileContent)
++        {
++            var file = ProtoHelper.Deserialize<PrivateFileExtra>(fileContent.Span).File;
++            message.Entities.Add(new PrivateFileEntity { FileId = file.FileUuid, FileName = file.FileName,
++                FileSize = checked((long)file.FileSize), FileHash = file.FileIdCrcMedia });
++        }
++        else if (ParsePttRichText(msg.MessageBody.RichText) is { } record)
+         {
+             message.Entities.Add(record);
+         }
+@@ -63,7 +69,7 @@ internal class MessagePacker(BotContext context)
+     {
+         switch (type)
+         {
+-            case 166:
++            case 166 or 208 or 529:
+                 var friend = await context.CacheContext.ResolveFriend(routingHead.FromUin);
+                 return friend ?? new BotFriend(routingHead.FromUin, routingHead.FromUid, string.Empty, string.Empty, string.Empty, string.Empty, null!);
+ 
+@@ -86,7 +92,7 @@ internal class MessagePacker(BotContext context)
+     {
+         switch (type)
+         {
+-            case 166:
++            case 166 or 208 or 529:
+                 var friend = await context.CacheContext.ResolveFriend(routingHead.ToUin);
+                 if (friend == null)
+                 {
+diff --git a/Lagrange.Core/Events/EventArgs/BotExtendedNoticeEvent.cs b/Lagrange.Core/Events/EventArgs/BotExtendedNoticeEvent.cs
+new file mode 100644
+index 00000000..e47ea312
+--- /dev/null
++++ b/Lagrange.Core/Events/EventArgs/BotExtendedNoticeEvent.cs
+@@ -0,0 +1,11 @@
++namespace Lagrange.Core.Events.EventArgs;
++
++/// <summary>Additional server notices, retaining their original protobuf content.</summary>
++public sealed class BotExtendedNoticeEvent(int type, int subType, long sender, byte[] content) : EventBase
++{
++    public int Type { get; } = type;
++    public int SubType { get; } = subType;
++    public long Sender { get; } = sender;
++    public byte[] Content { get; } = content;
++    public override string ToEventMessage() => $"Extended notice {Type}/{SubType}";
++}
+diff --git a/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
+new file mode 100644
+index 00000000..25dcad99
+--- /dev/null
++++ b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
+@@ -0,0 +1,7 @@
++namespace Lagrange.Core.Exceptions;
++
++/// <summary>The server requires a web verification before a new SMS login attempt.</summary>
++public sealed class SmsLoginVerificationException(string message, string url) : Exception(message)
++{
++    public string Url { get; } = url;
++}
 diff --git a/Lagrange.Core/Internal/Logic/SmsLoginSession.cs b/Lagrange.Core/Internal/Logic/SmsLoginSession.cs
 new file mode 100644
 index 00000000..2ff4599d
@@ -914,16 +1520,73 @@ index 00000000..2ff4599d
 +        return await send(new(LoginEventReq.Command.Tgtgt) { Sms = session }).WaitAsync(token);
 +    }
 +}
-diff --git a/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
+diff --git a/Lagrange.Core/Internal/Packets/Login/AndroidVerificationInfo.cs b/Lagrange.Core/Internal/Packets/Login/AndroidVerificationInfo.cs
 new file mode 100644
-index 00000000..25dcad99
+index 00000000..c5024ae4
 --- /dev/null
-+++ b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
-@@ -0,0 +1,7 @@
-+namespace Lagrange.Core.Exceptions;
++++ b/Lagrange.Core/Internal/Packets/Login/AndroidVerificationInfo.cs
+@@ -0,0 +1,19 @@
++using Lagrange.Proto;
 +
-+/// <summary>The server requires a web verification before a new SMS login attempt.</summary>
-+public sealed class SmsLoginVerificationException(string message, string url) : Exception(message)
++namespace Lagrange.Core.Internal.Packets.Login;
++
++[ProtoPackable]
++internal partial class AndroidVerificationInfo
 +{
-+    public string Url { get; } = url;
++    [ProtoMember(60)] public AndroidVerificationButtons Buttons { get; set; } = new();
++}
++[ProtoPackable]
++internal partial class AndroidVerificationButtons
++{
++    [ProtoMember(9)] public List<AndroidVerificationAction> Actions { get; set; } = [];
++}
++[ProtoPackable]
++internal partial class AndroidVerificationAction
++{
++    [ProtoMember(3)] public string Url { get; set; } = "";
++}
+diff --git a/Lagrange.Core/Internal/Packets/Service/GroupAvatarExtra.cs b/Lagrange.Core/Internal/Packets/Service/GroupAvatarExtra.cs
+new file mode 100644
+index 00000000..2d756161
+--- /dev/null
++++ b/Lagrange.Core/Internal/Packets/Service/GroupAvatarExtra.cs
+@@ -0,0 +1,19 @@
++using Lagrange.Proto;
++
++namespace Lagrange.Core.Internal.Packets.Service;
++
++[ProtoPackable]
++internal partial class GroupAvatarExtra
++{
++    [ProtoMember(1)] public uint Type { get; set; }
++    [ProtoMember(2)] public ulong Group { get; set; }
++    [ProtoMember(3)] public GroupAvatarExtraInfo Info { get; set; } = new();
++    [ProtoMember(5)] public uint Flag5 { get; set; }
++    [ProtoMember(6)] public uint Flag6 { get; set; }
++}
++
++[ProtoPackable]
++internal partial class GroupAvatarExtraInfo
++{
++    [ProtoMember(1)] public uint Value { get; set; }
++}
+diff --git a/Lagrange.Core/Message/Entities/PrivateFileEntity.cs b/Lagrange.Core/Message/Entities/PrivateFileEntity.cs
+new file mode 100644
+index 00000000..924eb7a3
+--- /dev/null
++++ b/Lagrange.Core/Message/Entities/PrivateFileEntity.cs
+@@ -0,0 +1,14 @@
++using Lagrange.Core.Internal.Packets.Message;
++
++namespace Lagrange.Core.Message.Entities;
++
++public sealed class PrivateFileEntity : IMessageEntity
++{
++    public string FileId { get; init; } = "";
++    public string FileName { get; init; } = "";
++    public long FileSize { get; init; }
++    public string FileHash { get; init; } = "";
++    Elem[] IMessageEntity.Build() => throw new NotSupportedException("Upload private files through SendFriendFile.");
++    IMessageEntity? IMessageEntity.Parse(List<Elem> elements, Elem target) => null;
++    string IMessageEntity.ToPreviewString() => $"[文件 {FileName}]";
 +}

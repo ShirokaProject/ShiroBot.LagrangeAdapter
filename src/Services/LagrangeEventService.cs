@@ -22,6 +22,15 @@ internal sealed class LagrangeEventService : IEventService
     {
         _session = session;
         var invoker = session.Context.EventInvoker;
+        var context = session.Context;
+        invoker.RegisterEvent<BotExtendedNoticeEvent>(async (_, e) =>
+        {
+            if (!ReferenceEquals(_session?.ActiveContext, context)) return;
+            // Wrapped 0x2DC notices are binary envelopes, not bare protobuf.
+            var mapped = await LagrangeNoticeMapper.Map(e, context.BotUin.ToString(), async uid =>
+                (await Lagrange.Core.Common.Interface.OperationExt.FetchStrangerByUid(context, uid)).Uin.ToString());
+            if (mapped is not null) await PublishAsync(mapped);
+        });
 
         // 注意:Lagrange 断言 handler 不能是静态方法,这里全部用实例 lambda 委托
         invoker.RegisterEvent<BotMessageEvent>(async (_, e) => await OnMessageAsync(e));
@@ -158,11 +167,24 @@ internal sealed class LagrangeEventService : IEventService
         }));
     }
 
+    internal static PlatformEvent PrivateFileNotice(Lagrange.Core.Message.BotMessage message, PrivateFileEntity file, string self)
+    {
+        var isSelf = message.Contact.Uin.ToString() == self;
+        var peer = (isSelf ? message.Receiver.Uin : message.Contact.Uin).ToString();
+        return new PlatformEvent { Platform = LagrangeMapper.PlatformId, SelfId = self,
+            Kind = QEventKinds.FriendFileUpload, Channel = Channel.Direct(peer),
+            Raw = new QFriendFileUpload { UserId = peer, FileId = file.FileId,
+                FileName = file.FileName, FileSize = file.FileSize, FileHash = file.FileHash,
+                IsSelf = isSelf, SelfId = self, Time = DateTimeOffset.FromUnixTimeSeconds(message.Time) } };
+    }
+
     private async Task OnMessageAsync(BotMessageEvent e)
     {
         _session?.CacheMessage(e.Message);
         await PublishAsync(LagrangeMapper.ToMessageEvent(e.Message, _session?.ActiveContext?.BotUin.ToString()))
             .ConfigureAwait(false);
+        foreach (var file in e.Message.Entities.OfType<PrivateFileEntity>())
+            await PublishAsync(PrivateFileNotice(e.Message, file, SelfUin().ToString()));
         if (e.Message.Contact is BotGroupMember member)
         {
             foreach (var file in e.Message.Entities.OfType<GroupFileEntity>())

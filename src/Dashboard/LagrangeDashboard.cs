@@ -97,6 +97,43 @@ public partial class LagrangeAdapter
         try
         {
             if (!_started) throw new InvalidOperationException("请先启动适配器实例。");
+            if (action == "refresh-session")
+            {
+                if (!_services.Context.IsOnline) throw new InvalidOperationException("请先登录。");
+                await _services.Context.RefreshSession(token);
+                await PersistSessionAsync(_services.Context, ResolveKeystorePath(CurrentConfigValue));
+                return LoginPageState();
+            }
+            if (action == "check-connection")
+            {
+                if (!_services.Context.IsOnline) throw new InvalidOperationException("请先登录。");
+                var checks = new JsonArray();
+                async Task Check(string operation, Func<Task> run)
+                {
+                    try { await run(); checks.Add(new JsonObject { ["operation"] = operation, ["ok"] = true }); }
+                    catch (Exception ex) { checks.Add(new JsonObject { ["operation"] = operation, ["ok"] = false,
+                        ["error"] = DescribeLoginFailure(ex, CurrentConfigValue) }); }
+                }
+                var system = new Services.LagrangeQqSystemApi(_services);
+                var friend = new Services.LagrangeQqFriendApi(_services);
+                await Check("friends", async () => { await system.GetFriendListAsync(true, token); });
+                await Check("groups", async () => { await system.GetGroupListAsync(true, token); });
+                await Check("pins", async () => { await system.GetPeerPinsAsync(token); });
+                await Check("custom-face", async () => { await system.GetCustomFaceUrlListAsync(token); });
+                await Check("friend-requests", async () => { await friend.GetFriendRequestsAsync(20, false, token); });
+                await Check("filtered-friend-requests", async () => { await friend.GetFriendRequestsAsync(20, true, token); });
+                await Check("face-catalog", async () => { await LagrangeFaceCatalog.Create(_services.Context, 300, false); });
+                if (arguments?["groupId"]?.GetValue<string>() is { Length: > 0 } groupId)
+                {
+                    var group = new Services.LagrangeQqGroupApi(_services);
+                    var files = new Services.LagrangeQqFileApi(_services);
+                    await Check("group-members", async () => { await group.GetGroupMemberListAsync(groupId, true, token); });
+                    await Check("group-files", async () => { await files.GetGroupFilesAsync(groupId, "/", token); });
+                    await Check("group-announcements", async () => { await group.GetAnnouncementsAsync(groupId, token); });
+                    await Check("group-essence", async () => { await group.GetEssenceMessagesPageAsync(groupId, 0, 10, token); });
+                }
+                var result = LoginPageState(); result["checks"] = checks; return result;
+            }
             if (action is "password-login" or "sms-login")
             {
                 var account = arguments?["uin"]?.GetValue<string>() ?? "";
@@ -165,7 +202,7 @@ public partial class LagrangeAdapter
                     }
                     catch (Exception ex)
                     {
-                        _loginStatus = "failed";
+                        if (_loginStatus != "device") _loginStatus = "failed";
                         _loginError = DescribeLoginFailure(ex, config);
                         Logger.Error($"QQ 登录失败: {_loginError}");
                     }
