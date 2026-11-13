@@ -41,9 +41,51 @@ internal static class LagrangeConnectionOptions
                     modern[key] = value?.DeepClone();
             }
 
+            // Kotlin serializes ByteArray as signed JSON numbers; .NET expects base64.
+            var signatureKey = modern.Select(x => x.Key).FirstOrDefault(x =>
+                x.Equals("ApkSignatureMd5", StringComparison.OrdinalIgnoreCase));
+            if (signatureKey is not null && modern[signatureKey] is JsonArray signature)
+            {
+                if (signature.Count != 16) throw new InvalidDataException("AppInfo.ApkSignatureMd5 必须为 16 字节。");
+                var bytes = new byte[signature.Count];
+                for (var i = 0; i < bytes.Length; i++)
+                {
+                    if (signature[i] is not JsonValue element || !element.TryGetValue<int>(out var number) ||
+                        number is < -128 or > 255)
+                        throw new InvalidDataException("AppInfo.ApkSignatureMd5 包含无效字节。");
+                    bytes[i] = unchecked((byte)number);
+                }
+                modern[signatureKey] = Convert.ToBase64String(bytes);
+            }
             Merge(node, modern);
         }
-        return node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
+        var info = node.Deserialize<BotAppInfo>(Json) ?? throw new InvalidDataException("AppInfo 不能为空。");
+        ValidateAndroidLogin(protocol, info);
+        return info;
+    }
+
+    private static void ValidateAndroidLogin(Protocols protocol, BotAppInfo info)
+    {
+        if (protocol is not (Protocols.AndroidPhone or Protocols.AndroidPad)) return;
+        if (info.WtLoginSsoProtocol is not (10 or 12))
+            throw new InvalidDataException("AppInfo.WtLoginSsoProtocol 仅支持 10 或 12。");
+        if (info.WtLoginPublicKey is not { } key) return;
+        try
+        {
+            var bytes = Convert.FromHexString(key);
+            if (bytes.Length != 65 || bytes[0] != 4 || info.WtLoginKeyVersion == 0)
+                throw new FormatException();
+            using var ec = System.Security.Cryptography.ECDiffieHellman.Create();
+            ec.ImportParameters(new System.Security.Cryptography.ECParameters
+            {
+                Curve = System.Security.Cryptography.ECCurve.NamedCurves.nistP256,
+                Q = new System.Security.Cryptography.ECPoint { X = bytes[1..33], Y = bytes[33..65] }
+            });
+        }
+        catch (Exception ex) when (ex is FormatException or System.Security.Cryptography.CryptographicException or ArgumentException)
+        {
+            throw new InvalidDataException("AppInfo.WtLoginPublicKey 必须是有效的 P-256 公钥，且 KeyVersion 不能为 0。", ex);
+        }
     }
 
     internal static void ValidatePlatform(Protocols protocol, BotAppInfo info)

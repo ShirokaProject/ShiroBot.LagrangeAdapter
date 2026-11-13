@@ -16,6 +16,7 @@ internal static class AndroidLoginChecks
 {
     internal static async Task Run(Assembly assembly)
     {
+        AndroidAppInfoChecks.Run(assembly);
         var type = assembly.GetType("ShiroBot.LagrangeAdapter.LagrangeAndroidSignProvider")!;
         foreach (var protocol in new[] { Protocols.AndroidPhone, Protocols.AndroidPad })
         foreach (var pathToken in new[] { false, true })

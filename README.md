@@ -59,6 +59,8 @@ adapter action <实例 ID> qr-login
 
 在“QQ 登录”页面输入账号密码。选择 AndroidPhone 或 AndroidPad 后，自定义签名器自动使用 Yogurt Android 格式的 `/sign`、`/energy`、`/get_tlv553`；PC 继续使用 `/api/sign/sec-sign`。完整 QUA、QQ 版本与 SDK 版本来自当前 AppInfo，不再固定为内核内置的旧版本。
 
+Android AppInfo 支持 `WtLoginPublicKey`、`WtLoginKeyVersion`、`WtLoginSsoProtocol` 和 `WtLoginProductType`。提供公钥时，登录实际使用 P-256 和指定密钥版本；`WtLoginSsoProtocol = 10` 只作用于 Android 的 `wtlogin.*`，其他请求保留原传输格式。APK 摘要兼容有符号/无符号 JSON 字节数组和 .NET Base64。Android 扫码仍不受支持。
+
 例如使用版本签名地址（需该服务已启用对应 backend）：
 
 ```toml

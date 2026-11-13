@@ -1,3 +1,30 @@
+diff --git a/Lagrange.Core/Common/BotAppInfo.cs b/Lagrange.Core/Common/BotAppInfo.cs
+index 16293620..d5ef8381 100644
+--- a/Lagrange.Core/Common/BotAppInfo.cs
++++ b/Lagrange.Core/Common/BotAppInfo.cs
+@@ -30,6 +30,15 @@ public class BotAppInfo
+ 
+     public ushort AppClientVersion { get; init; }
+ 
++    // Optional Android SDK login parameters. Null keeps the legacy PC/SDK path.
++    public string? WtLoginPublicKey { get; init; }
++
++    public ushort WtLoginKeyVersion { get; init; } = 1;
++
++    public int WtLoginSsoProtocol { get; init; } = 12;
++
++    public int WtLoginProductType { get; init; }
++
+     private static readonly BotAppInfo Linux = new()
+     {
+         Os = "Linux",
+@@ -212,4 +221,4 @@ public enum Sig
+     WLOGIN_DA2 = 1 << 25,
+     WLOGIN_QRPUSH = 1 << 26,
+     WLOGIN_PT4Token = 1 << 27
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Common/Interface/BotExt.cs b/Lagrange.Core/Common/Interface/BotExt.cs
 index 0f8ffb8e..4e9f140d 100644
 --- a/Lagrange.Core/Common/Interface/BotExt.cs
@@ -20,6 +47,40 @@ index 0f8ffb8e..4e9f140d 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/Lagrange.Core/Internal/Context/PacketContext.cs b/Lagrange.Core/Internal/Context/PacketContext.cs
+index 6b4d33d1..79105f1e 100644
+--- a/Lagrange.Core/Internal/Context/PacketContext.cs
++++ b/Lagrange.Core/Internal/Context/PacketContext.cs
+@@ -3,6 +3,7 @@ using Lagrange.Core.Common;
+ using Lagrange.Core.Common.Entity;
+ using Lagrange.Core.Internal.Packets.Struct;
+ using Lagrange.Core.Services;
++using Lagrange.Core.Utility.Extension;
+ 
+ namespace Lagrange.Core.Internal.Context;
+ 
+@@ -50,16 +51,19 @@ internal class PacketContext
+                 {
+                     case RequestType.D2Auth:
+                     {
++                        var protocol = _context.Config.Protocol.IsAndroid() &&
++                                       packet.Command.StartsWith("wtlogin.", StringComparison.Ordinal)
++                            ? _context.AppInfo.WtLoginSsoProtocol : 12;
+                         if (SignProvider.IsWhiteListCommand(packet.Command))
+                         {
+                             var secInfo = await SignProvider.GetSecSign(_keystore.Uin, packet.Command, packet.Sequence, packet.Data);
+                             var sso = _ssoPacker.BuildProtocol12(packet, secInfo);
+-                            frame = _servicePacker.BuildProtocol12(sso, options);
++                            frame = _servicePacker.BuildProtocol12(sso, options, protocol);
+                         }
+                         else
+                         {
+                             var sso = _ssoPacker.BuildProtocol12(packet, null);
+-                            frame = _servicePacker.BuildProtocol12(sso, options);
++                            frame = _servicePacker.BuildProtocol12(sso, options, protocol);
+                         }
+ 
+                         break;
 diff --git a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs b/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
 index fca8f082..6f29a00c 100644
 --- a/Lagrange.Core/Internal/Events/Login/LoginEvent.cs
@@ -392,10 +453,55 @@ index 8b847e50..2347d6de 100644
      {
          _writer.Write(_count, _prefixed ? 2 : 0);
 diff --git a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
-index b56130a4..5cb25ca9 100644
+index b56130a4..31686185 100644
 --- a/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
 +++ b/Lagrange.Core/Internal/Packets/Login/WtLogin.cs
-@@ -161,7 +161,7 @@ internal class WtLogin : StructBase
+@@ -1,10 +1,12 @@
+ using System.Buffers.Binary;
+ using System.Runtime.InteropServices;
++using System.Security.Cryptography;
+ using System.Text;
+ using Lagrange.Core.Common;
+ using Lagrange.Core.Internal.Packets.Struct;
+ using Lagrange.Core.Utility.Binary;
+ using Lagrange.Core.Utility.Cryptography;
++using Lagrange.Core.Utility.Extension;
+ 
+ namespace Lagrange.Core.Internal.Packets.Login;
+ 
+@@ -13,13 +15,30 @@ internal class WtLogin : StructBase
+     private static readonly byte[] ServerPublicKey = [0x04, 0x92, 0x8D, 0x88, 0x50, 0x67, 0x30, 0x88, 0xB3, 0x43, 0x26, 0x4E, 0x0C, 0x6B, 0xAC, 0xB8, 0x49, 0x6D, 0x69, 0x77, 0x99, 0xF3, 0x72, 0x11, 0xDE, 0xB2, 0x5B, 0xB7, 0x39, 0x06, 0xCB, 0x08, 0x9F, 0xEA, 0x96, 0x39, 0xB4, 0xE0, 0x26, 0x04, 0x98, 0xB5, 0x1A, 0x99, 0x2D, 0x50, 0x81, 0x3D, 0xA8];
+ 
+     private readonly byte[] _shareKey;
++
++    private readonly EcdhProvider? _androidEcdh;
++    private byte[] _androidRandomKey = [];
+     
+     private readonly BotContext _context;
+     
+     public WtLogin(BotContext context) : base(context)
+     {
+         _context = context;
+-        _shareKey = Keystore.Secp192K1.KeyExchange(ServerPublicKey, true);
++        if (context.Config.Protocol.IsAndroid() && AppInfo.WtLoginPublicKey is { } serverKey)
++        {
++            var publicKey = Convert.FromHexString(serverKey);
++            if (publicKey.Length != 65 || publicKey[0] != 4 || AppInfo.WtLoginKeyVersion == 0)
++                throw new InvalidDataException("Invalid Android WtLogin public key or key version.");
++            using var validation = ECDiffieHellman.Create();
++            validation.ImportParameters(new ECParameters
++            {
++                Curve = ECCurve.NamedCurves.nistP256,
++                Q = new ECPoint { X = publicKey[1..33], Y = publicKey[33..65] }
++            });
++            _androidEcdh = new EcdhProvider(EllipticCurve.Prime256V1);
++            _shareKey = _androidEcdh.KeyExchange(publicKey, true);
++        }
++        else _shareKey = Keystore.Secp192K1.KeyExchange(ServerPublicKey, true);
+     }
+     
+     public ReadOnlyMemory<byte> BuildTransEmp31(byte[]? unusualSig)
+@@ -161,7 +180,7 @@ internal class WtLogin : StructBase
          return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
      }
      
@@ -404,7 +510,7 @@ index b56130a4..5cb25ca9 100644
      {
          var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
          var energy = await sign.GetEnergy(_context.BotUin, "810_9");
-@@ -171,10 +171,12 @@ internal class WtLogin : StructBase
+@@ -171,10 +190,12 @@ internal class WtLogin : StructBase
          
          tlvs.Tlv018Android();
          tlvs.Tlv001();
@@ -418,7 +524,7 @@ index b56130a4..5cb25ca9 100644
          tlvs.Tlv142();
          tlvs.Tlv144Report(false);
          tlvs.Tlv145();
-@@ -187,6 +189,7 @@ internal class WtLogin : StructBase
+@@ -187,6 +208,7 @@ internal class WtLogin : StructBase
          tlvs.Tlv188();
          tlvs.Tlv191(0x82);
          tlvs.Tlv177();
@@ -426,7 +532,7 @@ index b56130a4..5cb25ca9 100644
          tlvs.Tlv516();
          tlvs.Tlv521Android();
          tlvs.Tlv525();
-@@ -199,6 +202,55 @@ internal class WtLogin : StructBase
+@@ -199,6 +221,55 @@ internal class WtLogin : StructBase
          return BuildPacket(0x810, tlvs.CreateReadOnlySpan());
      }
  
@@ -482,6 +588,150 @@ index b56130a4..5cb25ca9 100644
      public async Task<ReadOnlyMemory<byte>> BuildOicq02Android(string ticket)
      {
          var sign = (AndroidBotSignProvider)_context.PacketContext.SignProvider;
+@@ -327,6 +398,9 @@ internal class WtLogin : StructBase
+         EncryptMethod method = EncryptMethod.EM_ECDH_ST,
+         bool useWtSession = false) // corrected
+     {
++        if (_androidEcdh is not null && !useWtSession &&
++            method is EncryptMethod.EM_ECDH or EncryptMethod.EM_ECDH_ST)
++            return BuildAndroidPacket(command, payload);
+         ReadOnlySpan<byte> key;
+ 
+         switch (method)
+@@ -369,6 +443,35 @@ internal class WtLogin : StructBase
+         return writer.ToArray();
+     }
+ 
++    private ReadOnlyMemory<byte> BuildAndroidPacket(short command, scoped ReadOnlySpan<byte> payload)
++    {
++        var cipher = TeaProvider.Encrypt(payload, _shareKey);
++        _androidRandomKey = RandomNumberGenerator.GetBytes(16);
++        using var writer = new BinaryPacket(cipher.Length + 128);
++        writer.Write((byte)2);
++        writer.EnterLengthBarrier<short>();
++        writer.Write((short)8001);
++        writer.Write(command);
++        writer.Write((short)1);
++        writer.Write((uint)Keystore.Uin);
++        writer.Write((byte)3);
++        writer.Write((byte)(command == 0x812 ? 7 : 135));
++        writer.Write((byte)0);
++        writer.Write(2);
++        writer.Write((int)AppInfo.AppClientVersion);
++        writer.Write(0);
++        writer.Write((byte)2);
++        writer.Write((byte)1);
++        writer.Write(_androidRandomKey);
++        writer.Write((ushort)0x131);
++        writer.Write(AppInfo.WtLoginKeyVersion);
++        writer.Write(_androidEcdh!.PackPublic(false), Prefix.Int16 | Prefix.LengthOnly);
++        writer.Write(cipher);
++        writer.Write((byte)3);
++        writer.ExitLengthBarrier<short>(true, 1);
++        return writer.ToArray();
++    }
++
+     private ReadOnlyMemory<byte> BuildCode2dPacket(
+         short command,
+         scoped ReadOnlySpan<byte> tlv,
+@@ -425,6 +528,7 @@ internal class WtLogin : StructBase
+ 
+     public ReadOnlySpan<byte> Parse(ReadOnlySpan<byte> input, out ushort command)
+     {
++        if (_androidEcdh is not null) return ParseAndroid(input, out command);
+         var reader = new BinaryPacket(input);
+         
+         byte header = reader.Read<byte>();
+@@ -471,6 +575,31 @@ internal class WtLogin : StructBase
+         return TeaProvider.CreateDecryptSpan(span);
+     }
+ 
++    private ReadOnlySpan<byte> ParseAndroid(ReadOnlySpan<byte> input, out ushort command)
++    {
++        if (input.Length < 18 || input[0] != 2 || input[^1] != 3 ||
++            BinaryPrimitives.ReadUInt16BigEndian(input[1..]) != input.Length)
++            throw new InvalidDataException("Invalid Android WtLogin response frame.");
++        command = BinaryPrimitives.ReadUInt16BigEndian(input[5..]);
++        var encrypted = input[16..^1];
++        var flag = BinaryPrimitives.ReadUInt16BigEndian(input[13..]);
++        if (flag != 1) return TeaProvider.Decrypt(encrypted, _shareKey);
++        if (_androidRandomKey.Length != 16) throw new InvalidDataException("Android WtLogin request key is unavailable.");
++        var outer = TeaProvider.Decrypt(encrypted, _androidRandomKey);
++        var reader = new BinaryPacket(outer.AsSpan());
++        var publicKey = reader.ReadBytes(Prefix.Int16 | Prefix.LengthOnly);
++        if (publicKey.Length != 65 || publicKey[0] != 4)
++            throw new InvalidDataException("Invalid Android WtLogin response public key.");
++        using var validation = ECDiffieHellman.Create();
++        validation.ImportParameters(new ECParameters
++        {
++            Curve = ECCurve.NamedCurves.nistP256,
++            Q = new ECPoint { X = publicKey[1..33].ToArray(), Y = publicKey[33..65].ToArray() }
++        });
++        var key = _androidEcdh!.KeyExchange(publicKey.ToArray(), true);
++        return TeaProvider.Decrypt(reader.ReadBytes(), key);
++    }
++
+     public ReadOnlySpan<byte> ParseCode2dPacket(ReadOnlySpan<byte> input, out ushort command)
+     {
+         byte encrypt = input[1];
+@@ -498,4 +627,4 @@ internal class WtLogin : StructBase
+         EM_ECDH = 0x07,
+         EM_ECDH_ST = 0x87 // same with EM_ECDH, but controlled with a flag, if flag is set to 1, the ST would be used
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs b/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs
+index 2f05ffcf..2b6216aa 100644
+--- a/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs
++++ b/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs
+@@ -10,7 +10,7 @@ internal class ServicePacker(BotContext context) : StructBase(context)
+ {
+     private static readonly ReadOnlyMemory<byte> EmptyD2Key = new byte[16];
+     
+-    public ReadOnlyMemory<byte> BuildProtocol12(BinaryPacket sso, ServiceAttribute options)
++    public ReadOnlyMemory<byte> BuildProtocol12(BinaryPacket sso, ServiceAttribute options, int protocol = 12)
+     {
+         var cipher = options.EncryptType switch
+         {
+@@ -25,7 +25,7 @@ internal class ServicePacker(BotContext context) : StructBase(context)
+         
+         writer.EnterLengthBarrier<int>();
+         
+-        writer.Write(12);
++        writer.Write(protocol);
+         writer.Write((byte)options.EncryptType);
+         if (options.EncryptType == EncryptType.EncryptD2Key) writer.Write(Keystore.WLoginSigs.D2, Prefix.Int32 | Prefix.WithPrefix);
+         else writer.Write(4);
+diff --git a/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs b/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
+index c17ccfb7..bcadef0d 100644
+--- a/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
++++ b/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
+@@ -17,11 +17,15 @@ internal class SsoPacker(BotContext context) : StructBase(context)
+     public BinaryPacket BuildProtocol12(BotSsoPacket sso, SsoSecureInfo? secInfo)
+     {
+         var head = new BinaryPacket(stackalloc byte[0x200]);
++        var legacy = _context.Config.Protocol.IsAndroid() && AppInfo.WtLoginSsoProtocol == 10 &&
++                     sso.Command.StartsWith("wtlogin.", StringComparison.Ordinal);
+         
+         head.Write(sso.Sequence); // sequence
+         head.Write(AppInfo.SubAppId); // subAppId
+-        head.Write(2052); // unknown
+-        head.Write([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
++        head.Write(legacy ? AppInfo.SubAppId : 2052);
++        head.Write(legacy
++            ? new byte[] { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 }
++            : new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+         head.Write(Keystore.WLoginSigs.A2, Prefix.Int32 | Prefix.WithPrefix); // tgt
+         head.Write(sso.Command, Prefix.Int32 | Prefix.WithPrefix); // command
+         head.Write(ReadOnlySpan<byte>.Empty, Prefix.Int32 | Prefix.WithPrefix); // message_cookies
+@@ -114,4 +118,4 @@ internal class SsoPacker(BotContext context) : StructBase(context)
+         ProtoHelper.Serialize(ref writer, reserved);
+         writer.ExitLengthBarrier<int>(true);
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Services/Login/LoginService.cs b/Lagrange.Core/Internal/Services/Login/LoginService.cs
 index c48a4146..a6f6a763 100644
 --- a/Lagrange.Core/Internal/Services/Login/LoginService.cs
@@ -503,6 +753,7 @@ index c48a4146..a6f6a763 100644
      }
 diff --git a/Lagrange.Core/Internal/Logic/SmsLoginSession.cs b/Lagrange.Core/Internal/Logic/SmsLoginSession.cs
 new file mode 100644
+index 00000000..2ff4599d
 --- /dev/null
 +++ b/Lagrange.Core/Internal/Logic/SmsLoginSession.cs
 @@ -0,0 +1,157 @@
@@ -665,6 +916,7 @@ new file mode 100644
 +}
 diff --git a/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
 new file mode 100644
+index 00000000..25dcad99
 --- /dev/null
 +++ b/Lagrange.Core/Exceptions/SmsLoginVerificationException.cs
 @@ -0,0 +1,7 @@

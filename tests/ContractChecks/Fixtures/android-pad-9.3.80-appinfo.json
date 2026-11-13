@@ -1,0 +1,41 @@
+{
+  "Os": "ANDROID",
+  "Kernel": "Linux",
+  "VendorOs": "android",
+  "Qua": "V1_AND_SQ_9.3.80_16750_YYB_D",
+  "CurrentVersion": "9.3.80.555ca0cf",
+  "PtVersion": "9.3.80",
+  "SsoVersion": 22,
+  "PackageName": "com.tencent.mobileqq",
+  "ApkSignatureMd5": [
+    -90,
+    -73,
+    69,
+    -65,
+    36,
+    -94,
+    -62,
+    119,
+    82,
+    119,
+    22,
+    -10,
+    -13,
+    110,
+    -74,
+    -115
+  ],
+  "SdkInfo": {
+    "SdkBuildTime": 1789719797,
+    "SdkVersion": "6.0.0.2591",
+    "MiscBitMap": 150470524,
+    "SubSigMap": 66560,
+    "MainSigMap": 16724722
+  },
+  "AppId": 16,
+  "SubAppId": 537400153,
+  "AppClientVersion": 0,
+  "WtLoginPublicKey": "0440eaf325b9c66225143aa7f3961c953c3d5a8048c2b73293cdc7dcbab7f35c4c66aa8917a8fd511f9d969d02c8501bcaa3e3b11746f00567e3aea303ac5f2d25",
+  "WtLoginKeyVersion": 2,
+  "WtLoginSsoProtocol": 10
+}
