@@ -2,13 +2,13 @@
   <Import Project="../build/Package.props" />
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
-    <Version>0.1.1</Version>
-    <AssemblyVersion>0.1.1.0</AssemblyVersion>
-    <FileVersion>0.1.1.0</FileVersion>
+    <Version>0.1.2</Version>
+    <AssemblyVersion>0.1.2.0</AssemblyVersion>
+    <FileVersion>0.1.2.0</FileVersion>
     <Authors>ShirokaProject</Authors>
     <Company>ShirokaProject</Company>
     <Product>ShiroBot Lagrange V2 Adapter</Product>
-    <Description>基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、扫码与会话快速登录。</Description>
+    <Description>基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。</Description>
     <PackageProjectUrl>https://github.com/ShirokaProject/ShiroBot.LagrangeAdapter</PackageProjectUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>shirobot;adapter;qq;lagrange;lagrange-v2</PackageTags>

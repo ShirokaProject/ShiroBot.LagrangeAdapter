@@ -10,15 +10,15 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.1")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.2")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.1",
-    Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、扫码与会话快速登录。",
+    Version = "0.1.2",
+    Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
     IsSingleFile = true,
@@ -29,7 +29,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private CancellationTokenSource? _loginCancellation;
     private Task? _loginTask;
-    private LagrangeSignProvider? _signProvider;
+    private BotSignProvider? _signProvider;
     private TaskCompletionSource<string>? _qrReady;
     private bool _started;
     private string? _automaticDeviceName;
@@ -128,15 +128,26 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             config.Validate();
             CurrentConfigValue = config;
             Config.Save(config);
-            InitializeConnection(config, false);
+            await InitializeConnectionAsync(config, false);
             _started = true;
             Lifetime.Defer(() => new ValueTask(StopAsync()));
             if (config.AutoLogin)
             {
-                _loginTask = LoginAsync(config, false, _loginCancellation!.Token);
-                await _loginTask;
+                var stopping = _loginCancellation!.Token;
+                _loginStatus = "logging_in";
+                _loginTask = Lifetime.Run(async _ =>
+                {
+                    try { await LoginAsync(config, false, stopping); }
+                    catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
+                    catch (Exception ex)
+                    {
+                        _loginStatus = "failed";
+                        _loginError = DescribeLoginFailure(ex, config);
+                        Logger.Error($"自动登录失败: {_loginError}");
+                    }
+                });
             }
-            else Logger.Info("Lagrange 已准备就绪，请通过适配器的扫码登录 Action 登录。");
+            else Logger.Info("Lagrange 已准备就绪，请通过 QQ 登录页面登录。");
         }
         catch
         {
@@ -150,7 +161,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         }
     }
 
-    private void InitializeConnection(LagrangeAdapterConfig config, bool fresh)
+    private async Task InitializeConnectionAsync(LagrangeAdapterConfig config, bool fresh)
     {
         config.Validate();
         var keystorePath = ResolveKeystorePath(config);
@@ -166,12 +177,21 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
                       ?? throw new InvalidDataException("AppInfo 文件必须是 JSON 对象。");
         }
 
+        _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Stopping);
+        if (config.FetchAppInfo)
+        {
+            using var client = new LagrangeSignClient(config, _loginCancellation.Token);
+            appInfo = await client.RequestAsync("appinfo");
+        }
+
         if (appInfo?.Any(x => x.Key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase)) == true)
             Logger.Warning("AppInfo 中旧版 NTLoginType 字段在当前上游 V2 中没有对应项，已忽略；建议改用 V2 AppInfo 模板。");
         var resolved = LagrangeConnectionOptions.ResolveAppInfo(protocol, appInfo);
-        _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Stopping);
+        LagrangeConnectionOptions.ValidatePlatform(protocol, resolved);
         if (!string.IsNullOrWhiteSpace(config.SignServer))
-            _signProvider = new LagrangeSignProvider(config, _loginCancellation.Token);
+            _signProvider = protocol is Protocols.AndroidPhone or Protocols.AndroidPad
+                ? new LagrangeAndroidSignProvider(config, _loginCancellation.Token)
+                : new LagrangeSignProvider(config, _loginCancellation.Token);
         var botConfig = config.CreateBotConfig(protocol);
         botConfig.SignProvider = _signProvider;
         Directory.CreateDirectory(Path.GetDirectoryName(keystorePath)!);
@@ -227,9 +247,11 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         try
         {
             if (!_started) return new PluginActionResult(false, "请先启动适配器。");
-            await ClearConnectionAsync();
             var config = LoadAdapterConfig(Config);
-            InitializeConnection(config, true); // Explicit QR login bypasses password and saved tickets.
+            if (config.Protocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase))
+                return new PluginActionResult(false, "当前 Lagrange 内核未实现 Android 扫码登录，请在 QQ 登录页使用账号密码。");
+            await ClearConnectionAsync();
+            await InitializeConnectionAsync(config, true); // Explicit QR login bypasses password and saved tickets.
             _qrReady = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             async Task Run(CancellationToken unused)
@@ -290,7 +312,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             if (config.AccountUin != 0 && config.AccountUin != saved.Uin)
                 return new PluginActionResult(false, "配置账号与保存的登录账号不一致，请切换账号或重新扫码。");
             await ClearConnectionAsync();
-            InitializeConnection(config, false);
+            await InitializeConnectionAsync(config, false);
             var context = _services.Context;
             LagrangeConnectionOptions.ValidatePlatform(context.Config.Protocol, context.AppInfo);
             _loginStatus = "logging_in";
@@ -365,7 +387,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _qrReady = null;
         _qrImage = null;
         _loginError = null;
-        _verificationUrl = null;
+        ClearVerification();
         _loginStatus = "ready";
         var context = _session?.ActiveContext;
         _session = null;
@@ -389,7 +411,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _qqSystemApi = null;
         _qqMessageApi = null;
         context?.Dispose();
-        _signProvider?.Dispose();
+        (_signProvider as IDisposable)?.Dispose();
         _signProvider = null;
         _loginCancellation?.Dispose();
         _loginCancellation = null;
@@ -403,7 +425,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         context.EventInvoker.RegisterEvent<BotLogEvent>((_, e) =>
         {
             if (e.Level < context.Config.LogLevel) return;
-            var detail = e.Exception is null ? e.Message : $"{e.Message}\n{DescribeLoginFailure(e.Exception, config)}";
+            var detail = LagrangeSecrets.Redact(e.Exception is null ? e.Message : $"{e.Message}\n{DescribeLoginFailure(e.Exception, config)}", config);
             var text = $"[Lagrange][{e.Tag}] {detail}";
             switch (e.Level)
             {
@@ -459,6 +481,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
         context.EventInvoker.RegisterEvent<BotQrCodeQueryEvent>((_, e) =>
         {
+            if (!ReferenceEquals(_services.ActiveContext, context)) return;
             switch (e.State)
             {
                 case BotQrCodeQueryEvent.TransEmpState.Confirmed:
@@ -480,25 +503,24 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 
         context.EventInvoker.RegisterEvent<BotCaptchaEvent>((_, e) =>
         {
-            _verificationUrl = e.CaptchaUrl;
-            _loginStatus = "captcha";
+            SetVerification(context, "captcha", e.CaptchaUrl);
             Logger.Warning("登录需要滑块验证，请在登录页面查看验证地址并提交结果。");
         });
         context.EventInvoker.RegisterEvent<BotSMSEvent>((_, e) =>
         {
-            _verificationUrl = e.Url;
-            _loginStatus = "sms";
+            SetVerification(context, "sms", e.Url, e.Phone);
             Logger.Warning("登录需要短信验证，请在登录页面提交验证码。");
         });
 
         context.EventInvoker.RegisterEvent<BotNewDeviceVerifyEvent>((_, e) =>
         {
-            _verificationUrl = e.Url;
-            _loginStatus = "device";
+            SetVerification(context, "device", e.Url);
             Logger.Warning("登录需要新设备验证，请在登录页面查看验证地址。");
         });
         context.EventInvoker.RegisterEvent<BotOfflineEvent>((_, _) =>
         {
+            if (!ReferenceEquals(_services.ActiveContext, context)) return;
+            ClearVerification();
             _loginStatus = "offline";
             _qrImage = null;
         });
@@ -532,7 +554,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
             if (!ReferenceEquals(_services.ActiveContext, context)) return;
             LagrangeStorage.SaveSession(Config, context.Keystore);
             _qrImage = null;
-            _verificationUrl = null;
+            ClearVerification();
             var qrFile = Path.Combine(Path.GetDirectoryName(keystorePath)!, "qrcode.png");
             try
             {
@@ -584,10 +606,14 @@ public sealed class LagrangeAdapterConfig
         GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 30, Placeholder = "appinfo.example.json")]
     public string? AppInfoPath { get; set; } = "";
 
-    /// <summary>Lagrange V2 签名基础地址，自动追加 api/sign/sec-sign；留空使用上游默认服务。</summary>
-    [ConfigField("填写基础地址，自动追加 /api/sign/sec-sign；留空使用上游内置服务。", Label = "签名服务地址", Group = "sign", GroupLabel = "签名服务",
+    /// <summary>签名基础地址；根据 PC / Android 协议自动选择对应接口。</summary>
+    [ConfigField("PC 追加 /api/sign/sec-sign；Android 追加 /sign、/energy、/get_tlv553。路径 Token 地址可直接填写，SignToken 留空。", Label = "签名服务地址", Group = "sign", GroupLabel = "签名服务",
         GroupOrder = 30, Order = 20, Placeholder = "http://127.0.0.1:8080")]
     public string? SignServer { get; set; } = "";
+
+    [ConfigField("从同一签名地址的 /appinfo 获取版本资料；与内联 AppInfo、AppInfo 文件互斥。", Label = "获取签名服务 AppInfo", Group = "protocol",
+        GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 15)]
+    public bool FetchAppInfo { get; set; } = false;
 
     /// <summary>签名请求的 Bearer Token，留空不发送 Authorization。</summary>
     [ConfigField("以 Authorization: Bearer 发送。需要同时填写签名服务地址。", Label = "签名服务 Token", Group = "sign", GroupLabel = "签名服务",
@@ -658,11 +684,21 @@ public sealed class LagrangeAdapterConfig
         if (SignTimeoutSeconds is <= 0 or > 600) throw new ArgumentOutOfRangeException(nameof(SignTimeoutSeconds));
         if (HighwayChunkSize is 0 or > 1048576) throw new ArgumentOutOfRangeException(nameof(HighwayChunkSize));
         if (HighwayConcurrent == 0) throw new ArgumentOutOfRangeException(nameof(HighwayConcurrent));
+        if (protocol == Protocols.AndroidWatch)
+            throw new ArgumentException("当前 Lagrange 内核未实现 AndroidWatch 登录，请选择 AndroidPhone 或 AndroidPad。");
+        if (protocol is Protocols.AndroidPhone or Protocols.AndroidPad && string.IsNullOrWhiteSpace(SignServer))
+            throw new ArgumentException("Android 协议需要填写与 AppInfo 对应的签名服务地址。");
+        if (FetchAppInfo && (string.IsNullOrWhiteSpace(SignServer) || !string.IsNullOrWhiteSpace(AppInfo) || !string.IsNullOrWhiteSpace(AppInfoPath)))
+            throw new ArgumentException("FetchAppInfo 需要 SignServer，且不能同时指定 AppInfo 或 AppInfoPath。");
         if (!string.IsNullOrWhiteSpace(AppInfo) && !string.IsNullOrWhiteSpace(AppInfoPath))
             throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
         foreach (var address in new[] { SignServer, SignProxyUrl }.Where(x => !string.IsNullOrWhiteSpace(x)))
-            if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+            if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
+                uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
                 throw new ArgumentException("签名服务和代理必须为完整 HTTP(S) 地址。");
+        if (!string.IsNullOrWhiteSpace(SignToken) && Uri.TryCreate(SignServer, UriKind.Absolute, out var signUri) &&
+            signUri.Segments.Any(x => Uri.UnescapeDataString(x).StartsWith("ss_", StringComparison.Ordinal)))
+            throw new ArgumentException("路径 Token 和 SignToken 不能同时设置。");
         if (string.IsNullOrWhiteSpace(SignServer) &&
             (!string.IsNullOrWhiteSpace(SignToken) || !string.IsNullOrWhiteSpace(SignProxyUrl)))
             throw new ArgumentException("设置签名 Token 或代理前，请先填写 SignServer。");
@@ -701,7 +737,7 @@ public sealed class LagrangeAdapterConfig
     /// <summary>协议: Linux / Windows / MacOs / AndroidPhone / AndroidPad / AndroidWatch。默认 Linux。</summary>
     [ConfigField("选择与签名服务和 AppInfo 对应的平台。", Label = "客户端平台", Group = "protocol", GroupLabel = "协议与 AppInfo",
         GroupOrder = 20, Order = 10, Type = "select",
-        Options = ["Linux", "Windows", "MacOs", "AndroidPhone", "AndroidPad", "AndroidWatch"])]
+        Options = ["Linux", "Windows", "MacOs", "AndroidPhone", "AndroidPad"])]
     public string Protocol { get; set; } = "Linux";
 
     /// <summary>keystore 保存路径,留空则保存在适配器配置目录。</summary>

@@ -1,7 +1,8 @@
 Lagrange.Core V2 进程内 QQ 适配器，适用于 .NET 11 / ShiroBot SDK 1.0.3。
 
 - 支持扫码、账号密码和保存会话快速登录，二维码可输出到控制台。
-- 支持自定义 AppInfo、设备名称和标准 Lagrange V2 PC 签名服务。
+- 支持自定义 AppInfo、设备名称、PC 签名及 AndroidPhone / AndroidPad 的三接口签名服务；可从签名服务获取 AppInfo。
+- 登录页支持滑块结果、短信二次验证和设备验证链接。独立免密码短信登录与 Android 扫码尚未实现，验证流程需要签名服务支持对应模块。
 - 多实例会话分别保存到 config.toml 对应实例的 session_store；登录后删除二维码 PNG。
 - 已接入上游现有消息、群管理、文件、事件等能力，具体范围见 docs/CAPABILITIES.md。
 

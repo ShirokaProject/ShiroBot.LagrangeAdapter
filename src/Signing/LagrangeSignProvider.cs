@@ -1,5 +1,3 @@
-using System.Net;
-using System.Net.Http.Headers;
 using System.Text.Json.Nodes;
 using Lagrange.Core.Common;
 
@@ -8,26 +6,14 @@ namespace ShiroBot.LagrangeAdapter;
 /// <summary>Lagrange POST sign API. Command list mirrors the pinned upstream provider.</summary>
 internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
 {
-    private readonly HttpClient _client;
-    private readonly Uri _endpoint;
-    private readonly CancellationToken _stopping;
+    private readonly LagrangeSignClient _client;
     private readonly LagrangeAdapterConfig _options;
 
     public LagrangeSignProvider(LagrangeAdapterConfig options, CancellationToken stopping,
         HttpMessageHandler? handler = null)
     {
-        options.Validate();
-        if (string.IsNullOrWhiteSpace(options.SignServer)) throw new ArgumentException("SignServer 不能为空。");
         _options = options;
-        var address = options.SignServer!;
-        _endpoint = new Uri(new Uri(address.TrimEnd('/') + "/"), "api/sign/sec-sign");
-        _stopping = stopping;
-        handler ??= string.IsNullOrWhiteSpace(options.SignProxyUrl)
-            ? new HttpClientHandler()
-            : new HttpClientHandler { Proxy = new WebProxy(options.SignProxyUrl), UseProxy = true };
-        _client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(options.SignTimeoutSeconds) };
-        if (!string.IsNullOrWhiteSpace(options.SignToken))
-            _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.SignToken);
+        _client = new LagrangeSignClient(options, stopping, handler);
     }
 
     private static readonly HashSet<string> WhiteListCommand =
@@ -566,54 +552,22 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
         "wtlogin_device.tran_sim_emp"
     ];
 
-    public override bool IsWhiteListCommand(string cmd) => WhiteListCommand.Contains(cmd);
+    internal static bool IsSigningCommand(string cmd) => WhiteListCommand.Contains(cmd);
+
+    public override bool IsWhiteListCommand(string cmd) => IsSigningCommand(cmd);
 
     public override async Task<SsoSecureInfo?> GetSecSign(long uin, string cmd, int seq, ReadOnlyMemory<byte> body)
     {
-        object payload = new
+        var payload = new JsonObject
         {
-            uin = _options.AccountUin,
-            command = cmd,
-            seq,
-            body = Convert.ToHexString(body.Span).ToLowerInvariant(),
-            guid = Convert.ToHexString(Context.Keystore.Guid).ToLowerInvariant(),
-            qua = BuildQua(Context.Config.Protocol, Context.AppInfo)
+            ["uin"] = _options.AccountUin,
+            ["command"] = cmd,
+            ["seq"] = seq,
+            ["body"] = Convert.ToHexString(body.Span).ToLowerInvariant(),
+            ["guid"] = Convert.ToHexString(Context.Keystore.Guid).ToLowerInvariant(),
+            ["qua"] = BuildQua(Context.Config.Protocol, Context.AppInfo)
         };
-        using var response = await _client.PostAsJsonAsync(_endpoint, payload, _stopping);
-        if (!response.IsSuccessStatusCode)
-        {
-            var bodyText = await response.Content.ReadAsStringAsync(_stopping);
-            string detail;
-            try
-            {
-                var error = JsonNode.Parse(bodyText);
-                var message = error?["message"] ?? error?["error"] ?? error?["detail"];
-                detail = message is JsonValue errorValue && errorValue.TryGetValue<string>(out var text)
-                    ? text
-                    : message?.ToJsonString() ?? "服务未提供错误说明";
-            }
-            catch
-            {
-                detail = "签名服务返回非 JSON 错误响应";
-            }
-
-            detail = new[] { _options.SignToken, _options.Password }.Where(x => !string.IsNullOrEmpty(x))
-                .Aggregate(detail, (current, secret) => current.Replace(secret!, "[已隐藏]", StringComparison.Ordinal));
-            if (detail.Length > 1024) detail = detail[..1024];
-            throw new HttpRequestException($"签名服务 HTTP {(int)response.StatusCode} (Lagrange V2): {detail}", null,
-                response.StatusCode);
-        }
-
-        var root = await response.Content.ReadFromJsonAsync<JsonObject>(_stopping)
-                   ?? throw new InvalidDataException("签名服务返回空响应。");
-        if (root["code"] is JsonValue code && code.GetValue<int>() != 0)
-        {
-            var detail = root["message"]?.GetValue<string>() ?? "未提供错误说明";
-            detail = new[] { _options.SignToken, _options.Password }.Where(x => !string.IsNullOrEmpty(x))
-                .Aggregate(detail, (current, secret) => current.Replace(secret!, "[已隐藏]", StringComparison.Ordinal));
-            throw new InvalidDataException($"签名服务失败 (code={code}): {detail}");
-        }
-
+        var root = await _client.RequestAsync("api/sign/sec-sign", payload);
         var value = root["value"] as JsonObject
                     ?? throw new InvalidDataException("签名服务响应缺少 value 对象。");
         return new SsoSecureInfo

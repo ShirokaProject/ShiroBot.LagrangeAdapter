@@ -17,7 +17,9 @@ device_name = ""
 # 登录二维码同时以字符形式输出到宿主控制台。
 console_qr_code = true
 
-# Lagrange V2 PC 签名服务，填写基础地址，自动追加 /api/sign/sec-sign。留空 sign_server 使用 Lagrange.Core 内置签名服务。
+# PC 自动追加 /api/sign/sec-sign；Android 自动追加 /sign、/energy、/get_tlv553。
+# Android 示例：protocol="AndroidPad"，sign_server="https://sign.shiroka.org/android/9.3.80-16750/<Token>"。
+# 路径中已有 Token 时 sign_token 留空；或用无 Token 的基础地址和 Bearer sign_token。
 sign_server = ""
 sign_token = ""
 sign_proxy_url = ""
@@ -28,6 +30,8 @@ sign_timeout_seconds = 30
 # app_info 为内联 JSON 字符串，与 app_info_path 二选一。
 app_info_path = ""
 app_info = ""
+# true 时从 sign_server/appinfo 读取，必须清空上面两个 AppInfo 覆盖字段。
+fetch_app_info = false
 
 # 与 Lagrange.Milky 的 Login/Server 配置对应。
 auto_re_login = true

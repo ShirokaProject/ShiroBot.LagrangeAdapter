@@ -48,12 +48,13 @@ internal static class LagrangeConnectionOptions
 
     internal static void ValidatePlatform(Protocols protocol, BotAppInfo info)
     {
-        var os = info.Os.ToLowerInvariant();
+        var os = (info.Os ?? "").ToLowerInvariant();
         var mismatch = protocol switch
         {
             Protocols.Linux => os != "linux",
             Protocols.MacOs => os is not ("mac" or "macos" or "osx"),
             Protocols.Windows => os is not ("windows" or "win"),
+            Protocols.AndroidPhone or Protocols.AndroidPad => os != "android",
             _ => false
         };
         if (mismatch)

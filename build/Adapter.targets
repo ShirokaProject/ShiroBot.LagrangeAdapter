@@ -1,4 +1,20 @@
 <Project>
+  <!-- Apply the tracked compatibility patch to the pinned SDK checkout. -->
+  <Target Name="ApplyLagrangeLoginChallengePatch" BeforeTargets="ResolveProjectReferences"
+          Condition="'$(MSBuildProjectName)' == 'ShiroBot.LagrangeAdapter' and '$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <LagrangePatchRoot>$(MSBuildThisFileDirectory)../external/LagrangeV2</LagrangePatchRoot>
+      <LagrangeLoginPatch>$(MSBuildThisFileDirectory)../patches/lagrange-login-challenges.patch</LagrangeLoginPatch>
+    </PropertyGroup>
+    <Exec Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --check &quot;$(LagrangeLoginPatch)&quot;"
+          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
+      <Output TaskParameter="ExitCode" PropertyName="LagrangePatchCheck" />
+    </Exec>
+    <Exec Condition="'$(LagrangePatchCheck)' == '0'"
+          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply &quot;$(LagrangeLoginPatch)&quot;" />
+    <Exec Condition="'$(LagrangePatchCheck)' != '0'"
+          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeLoginPatch)&quot;" />
+  </Target>
   <!--
     .NET 11 runtime-native async (Runtime Async V2). The compiler emits runtime-managed
     suspension instead of async state machines, and the .NET 11 runtime executes it.

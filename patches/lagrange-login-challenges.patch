@@ -1,0 +1,137 @@
+diff --git a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
+index 70fcb9e9..cbba1573 100644
+--- a/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
++++ b/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs
+@@ -1,4 +1,4 @@
+-using System.Collections.Concurrent;
++﻿using System.Collections.Concurrent;
+ using System.Text;
+ using System.Web;
+ using Lagrange.Core.Common;
+@@ -74,7 +74,7 @@ internal class WtExchangeLogic : ILogic, IDisposable
+     {
+         _token = token;
+ 
+-        token.UnsafeRegister(_ =>
++        using var registration = token.UnsafeRegister(_ =>
+         {
+             _transEmpSource?.TrySetCanceled();
+             _captchaSource?.TrySetCanceled();
+@@ -199,11 +199,11 @@ internal class WtExchangeLogic : ILogic, IDisposable
+ 
+                     string captchaUrl = Encoding.UTF8.GetString(result.Tlvs[0x192]);
+                     _context.LogInfo(Tag, "Captcha required, URL: {0}", captchaUrl);
++                    var captcha = new TaskCompletionSource<(string, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
++                    _captchaSource = captcha;
+                     _context.EventInvoker.PostEvent(new BotCaptchaEvent(captchaUrl));
+-
+-                    _captchaSource = new TaskCompletionSource<(string, string)>();
+-                    var (ticket, _) = await _captchaSource.Task;
+-                    _context.LogInfo(Tag, "Captcha ticket: {0}, try to login", ticket);
++                    var (ticket, _) = await captcha.Task.WaitAsync(_token ?? default);
++                    _context.LogInfo(Tag, "Captcha submitted, try to login");
+ 
+                     _token?.ThrowIfCancellationRequested();
+                     result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.Captcha) { Ticket = ticket });
+@@ -211,42 +211,39 @@ internal class WtExchangeLogic : ILogic, IDisposable
+ 
+                 if (result.State == LoginEventResp.States.DeviceLockViaSmsNewArea)
+                 {
+-                    if (result.Tlvs.TryGetValue(0x104, out var tlv104))
+-                    {
+-                        _context.Keystore.State.Tlv104 = tlv104;
+-                        _context.LogDebug(Tag, "Tlv104 received, length: {0}", tlv104.Length);
+-                    }
++                    SaveSmsTokens(result);
++                    var challenge = result;
++                    _token?.ThrowIfCancellationRequested();
++                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.FetchSMSCode));
++                    // FetchSMSCode may return only changed TLVs. Preserve the
++                    // original phone/URL/session tokens without losing updates.
++                    PreserveSmsChallenge(result, challenge);
++                }
+ 
+-                    if (result.Tlvs.TryGetValue(0x174, out var tlv174))
++                // State 160 can also be returned directly by password/captcha.
++                if (result.State == LoginEventResp.States.SmsRequired)
++                {
++                    SaveSmsTokens(result);
++                    string? url = result.Tlvs.TryGetValue(0x204, out var tlv204) ? Encoding.UTF8.GetString(tlv204) : null;
++                    string phone = "";
++                    if (result.Tlvs.TryGetValue(0x178, out var tlv178Bytes))
+                     {
+-                        _context.Keystore.State.Tlv174 = tlv174;
+-                        _context.LogDebug(Tag, "Tlv174 received, length: {0}", tlv174.Length);
++                        var tlv178 = new BinaryPacket(tlv178Bytes.AsSpan());
++                        string countryCode = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
++                        phone = countryCode + "-" + tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
+                     }
+ 
+-                    string? url = null;
+-                    if (result.Tlvs.TryGetValue(0x204, out var tlv204)) url = Encoding.UTF8.GetString(tlv204);
+-
+-                    var tlv178 = new BinaryPacket(result.Tlvs[0x178].AsSpan());
+-                    string countryCode = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
+-                    string phone = tlv178.ReadString(Prefix.Int16 | Prefix.LengthOnly);
++                    var sms = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
++                    _smsSource = sms;
++                    _context.EventInvoker.PostEvent(new BotSMSEvent(url, phone));
++                    string code = await sms.Task.WaitAsync(_token ?? default);
++                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.SubmitSMSCode) { Code = code });
++                }
+ 
+-                    _token?.ThrowIfCancellationRequested();
+-                    result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.FetchSMSCode));
+-                    if (result.State == LoginEventResp.States.SmsRequired)
+-                    {
+-                        if (result.Tlvs.TryGetValue(0x104, out var tlv1048))
+-                        {
+-                            _context.Keystore.State.Tlv104 = tlv1048;
+-                            _context.LogDebug(Tag, "Tlv104 received, length: {0}", tlv1048.Length);
+-                        }
+-
+-                        _context.LogInfo(Tag, "SMS Verification required, Phone: {0}-{1} | URL: {2}", countryCode, phone, url);
+-                        _context.EventInvoker.PostEvent(new BotSMSEvent(url, $"{countryCode}-{phone}"));
+-
+-                        _smsSource = new TaskCompletionSource<string>();
+-                        string code = await _smsSource.Task;
+-                        result = await _context.EventContext.SendEvent<LoginEventResp>(new LoginEventReq(LoginEventReq.Command.SubmitSMSCode) { Code = code });
+-                    }
++                void SaveSmsTokens(LoginEventResp challenge)
++                {
++                    if (challenge.Tlvs.TryGetValue(0x104, out var tlv104)) _context.Keystore.State.Tlv104 = tlv104;
++                    if (challenge.Tlvs.TryGetValue(0x174, out var tlv174)) _context.Keystore.State.Tlv174 = tlv174;
+                 }
+ 
+                 if (result.State == LoginEventResp.States.Success)
+@@ -283,11 +280,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+                         case NTLoginRetCode.LOGIN_ERROR_PROOF_WATER:
+                             _context.LogInfo(Tag, "Captcha required, URL: {0}", result.JumpingUrl);
+ 
++                            var captcha = new TaskCompletionSource<(string, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
++                            _captchaSource = captcha;
+                             _context.EventInvoker.PostEvent(new BotCaptchaEvent(result.JumpingUrl));
+-                            _captchaSource = new TaskCompletionSource<(string, string)>();
+ 
+-                            string sid = result.JumpingUrl.Split("&sid=")[1].Split("&")[0];
+-                            var (ticket, randStr) = await _captchaSource.Task;
++                            string sid = HttpUtility.ParseQueryString(new Uri(result.JumpingUrl).Query)["sid"]
++                                ?? throw new InvalidDataException("Captcha URL has no sid");
++                            var (ticket, randStr) = await captcha.Task.WaitAsync(_token ?? default);
+                             result = await _context.EventContext.SendEvent<PasswordLoginEventResp>(new PasswordLoginEventReq(password, (ticket, randStr, sid)));
+                             break;
+                         case NTLoginRetCode.LOGIN_ERROR_NEW_DEVICE:
+@@ -364,6 +363,13 @@ internal class WtExchangeLogic : ILogic, IDisposable
+         return (success, result.Message);
+     }
+ 
++    private static void PreserveSmsChallenge(LoginEventResp result, LoginEventResp challenge)
++    {
++        foreach (ushort key in new ushort[] { 0x104, 0x174, 0x178, 0x204 })
++            if (!result.Tlvs.ContainsKey(key) && challenge.Tlvs.TryGetValue(key, out var value))
++                result.Tlvs[key] = value;
++    }
++
+     public bool SubmitCaptcha(string ticket, string randStr)
+     {
+         if (_captchaSource == null) return false;
