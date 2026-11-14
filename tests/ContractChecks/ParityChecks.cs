@@ -12,6 +12,7 @@ internal static class ParityChecks
 {
     internal static async Task Run()
     {
+        ReaderBoundsChecks();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
         Equal(wire, "089601120141");
@@ -95,6 +96,30 @@ internal static class ParityChecks
         if (chain.Single() is not FaceEntity { FaceId: 14 }) throw new Exception("Generic emoji send mapping failed.");
         Console.WriteLine("Yogurt parity wire fixtures, protocol rejections, files, Web mappings, event mapping and actual FaceEntity encoding passed (offline).");
     }
+    private static void ReaderBoundsChecks()
+    {
+        foreach (var hex in new[] { "", "80", "808080808080808080", "ffffffffffffffffff02" })
+        {
+            var reader = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString(hex));
+            try { reader.DecodeVarIntUnsafe<ulong>(); throw new Exception("Truncated/overflowing native varint accepted."); }
+            catch (InvalidDataException) { }
+        }
+        var signed = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString("ffffffffffffffffff01"));
+        if (signed.DecodeVarIntUnsafe<int>() != -1 || !signed.IsCompleted) throw new Exception("Sign-extended protobuf int32 changed.");
+        var badLength = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString("ffffffff0f"));
+        try { badLength.SkipField(Lagrange.Proto.Serialization.WireType.LengthDelimited); throw new Exception("Negative protobuf length accepted."); }
+        catch (ArgumentOutOfRangeException) { }
+        var random = new Random(19380);
+        for (var i = 0; i < 20000; i++)
+        {
+            var data = new byte[random.Next(65)]; random.NextBytes(data);
+            var reader = new Lagrange.Proto.Primitives.ProtoReader(data);
+            try { while (!reader.IsCompleted) reader.DecodeVarIntUnsafe<ulong>(); }
+            catch (InvalidDataException) { }
+        }
+        Console.WriteLine("Bounded protobuf tail/skip, signed int32, overflowing lengths and 20,000 malformed-input checks passed.");
+    }
+
     private static async Task NoticeChecks()
     {
         Task<string> Resolve(string uid) => Task.FromResult(uid == "u" ? "123" : "456");

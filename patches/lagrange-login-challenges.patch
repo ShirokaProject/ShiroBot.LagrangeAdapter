@@ -1327,6 +1327,159 @@ index 011f6eca..5ae03560 100644
                  var friend = await context.CacheContext.ResolveFriend(routingHead.ToUin);
                  if (friend == null)
                  {
+diff --git a/Lagrange.Proto/Primitives/ProtoReader.cs b/Lagrange.Proto/Primitives/ProtoReader.cs
+index 2b50cbb1..8708565e 100644
+--- a/Lagrange.Proto/Primitives/ProtoReader.cs
++++ b/Lagrange.Proto/Primitives/ProtoReader.cs
+@@ -72,7 +72,7 @@ public ref struct ProtoReader
+     
+     public ReadOnlySpan<byte> CreateSpan(int length)
+     {
+-        if (_length - _offset < length) ThrowHelper.ThrowArgumentOutOfRangeException_NoEnoughSpace(nameof(CreateSpan), length, _length - _offset);
++        if (length < 0 || _length - _offset < length) ThrowHelper.ThrowArgumentOutOfRangeException_NoEnoughSpace(nameof(CreateSpan), length, _length - _offset);
+         
+         var result = MemoryMarshal.CreateSpan(ref Unsafe.Add(ref _first, _offset), length);
+         _offset += length;
+@@ -80,28 +80,28 @@ public ref struct ProtoReader
+     }
+     
+     [MethodImpl(MethodImplOptions.NoInlining)]
+-    private unsafe T DecodeVarIntSlowPath<T>() where T : unmanaged, INumber<T>
++    private T DecodeVarIntSlowPath<T>() where T : unmanaged, INumber<T>
+     {
+-        int shift = 0;
+-        T result = T.Zero;
+-        do
++        ulong value = 0;
++        for (var index = 0; index < 10; index++)
+         {
+-            byte b = Unsafe.Add(ref _first, _offset++);
+-            result += T.CreateTruncating((ulong)(b & 0x7Fu) << shift);
+-            if (b <= 0x7F)
+-            {
+-                return result;
+-            }
+-            shift += 7;
++            if (_offset >= _length) ThrowHelper.ThrowInvalidDataException_MalformedMessage();
++            byte next = Unsafe.Add(ref _first, _offset++);
++            if (index == 9 && next > 1) ThrowHelper.ThrowInvalidDataException_MalformedMessage();
++            value |= (ulong)(next & 0x7f) << (index * 7);
++            if (next < 0x80) return T.CreateTruncating(value);
+         }
+-        while (shift < sizeof(T) << 3);
+         ThrowHelper.ThrowInvalidDataException_MalformedMessage();
+-        return result;
++        return T.Zero;
+     }
+-    
++
+     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    public void Rewind(int count) => _offset += count;
+-    
++    public void Rewind(int count)
++    {
++        if (count < -_offset || count > _length - _offset) ThrowHelper.ThrowInvalidDataException_MalformedMessage();
++        _offset += count;
++    }
++
+     /// <summary>
+     /// Max VarInt Bytes for u8: 2
+     /// Max VarInt Bytes for u16: 3
+@@ -109,63 +109,11 @@ public ref struct ProtoReader
+     /// Max VarInt Bytes for u64: 10
+     /// </summary>
+     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    public unsafe T DecodeVarIntUnsafe<T>() where T : unmanaged, INumber<T>
++    public T DecodeVarIntUnsafe<T>() where T : unmanaged, INumber<T>
+     {
+-        if (sizeof(T) <= 4) // indicate that the byte can be handled in the 64-bit reg
+-        {
+-            ulong b = Unsafe.As<byte, ulong>(ref Unsafe.Add(ref _first, _offset));
+-            ulong msbs = ~b & ~0x7f7f7f7f7f7f7f7ful;
+-            ulong varintPart = b & (msbs ^ msbs - 1);
+-
+-            _offset += (BitOperations.TrailingZeroCount(msbs) + 1) >> 3; // in bits
+-
+-            if (Bmi2.X64.IsSupported)
+-            {
+-                return sizeof(T) switch
+-                {
+-                    sizeof(byte) => T.CreateTruncating(Bmi2.X64.ParallelBitExtract(varintPart, 0x000000000000017f)),
+-                    sizeof(ushort) => T.CreateTruncating(Bmi2.X64.ParallelBitExtract(varintPart, 0x0000000000037f7f)),
+-                    sizeof(uint) => T.CreateTruncating(Bmi2.X64.ParallelBitExtract(varintPart, 0x0000000f7f7f7f7f)),
+-                    _ => throw new NotSupportedException()
+-                };
+-            }
+-            else
+-            {
+-                return sizeof(T) switch
+-                {
+-                    sizeof(byte) => T.CreateTruncating((varintPart & 0x000000000000007f) | ((varintPart & 0x0000000000000100) >> 1)),
+-                    sizeof(ushort) => T.CreateTruncating((varintPart & 0x000000000000007f) | ((varintPart & 0x0000000000030000) >> 2) | ((varintPart & 0x0000000000007f00) >> 1)),
+-                    sizeof(uint) => T.CreateTruncating((varintPart & 0x000000000000007f) | ((varintPart & 0x0000000f00000000) >> 4) | ((varintPart & 0x000000007f000000) >> 3) | ((varintPart & 0x00000000007f0000) >> 2) | ((varintPart & 0x0000000000007f00) >> 1)),
+-                    _ => throw new NotSupportedException()
+-                };
+-            }
+-            
+-        }
+-        else
+-        {
+-            ulong b0 = Unsafe.As<byte, ulong>(ref Unsafe.Add(ref _first, _offset));
+-            ulong b1 = Unsafe.As<byte, ulong>(ref Unsafe.Add(ref _first, _offset + 8));
+-            
+-            ulong msbs0 = ~b0 & ~0x7f7f7f7f7f7f7f7ful;
+-            ulong msbs1 = ~b1 & ~0x7f7f7f7f7f7f7f7ful;
+-            
+-            int len0 = BitOperations.TrailingZeroCount(msbs0) + 1; // in bits
+-            ulong varintPart0 = b0 & (msbs0 ^ msbs0 - 1);
+-            ulong varintPart1;
+-            
+-            if (msbs0 == 0)
+-            {
+-                varintPart1 = b1 & (msbs1 ^ msbs1 - 1);
+-                _offset += (BitOperations.TrailingZeroCount(msbs1) + 1 + 64) >> 3;
+-            }
+-            else
+-            {
+-                varintPart1 = 0;
+-                _offset += len0 >> 3;
+-            }
+-            
+-            return ExtractFromVector<T>(varintPart0, varintPart1);
+-        }
++        // Generated message readers call this API even for a one-byte tail.
++        // Retain the public name without reading beyond the supplied span.
++        return DecodeVarIntSlowPath<T>();
+     }
+ 
+     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+@@ -350,15 +298,8 @@ public ref struct ProtoReader
+         }
+     }
+ 
+-    private void SkipVarInt()
+-    {
+-        ulong b0 = Unsafe.As<byte, ulong>(ref Unsafe.Add(ref _first, _offset));
+-        ulong b1 = Unsafe.As<byte, ulong>(ref Unsafe.Add(ref _first, _offset + 8));
+-        ulong msbs0 = ~b0 & ~0x7f7f7f7f7f7f7f7ful;
+-        ulong msbs1 = ~b1 & ~0x7f7f7f7f7f7f7f7ful;
+-        _offset += msbs0 == 0 ? (BitOperations.TrailingZeroCount(msbs1) + 1 + 64) >> 3 : (BitOperations.TrailingZeroCount(msbs0) + 1) >> 3;
+-    }
+-    
++    private void SkipVarInt() => _ = DecodeVarInt<ulong>();
++
+     private void SkipFixed32()
+     {
+         if (_length - _offset < 4) ThrowHelper.ThrowArgumentOutOfRangeException_NoEnoughSpace(nameof(SkipFixed32), 4, _length - _offset);
+@@ -376,7 +317,7 @@ public ref struct ProtoReader
+     private void SkipLengthDelimited()
+     {
+         int length = DecodeVarInt<int>();
+-        if (_length - _offset < length) ThrowHelper.ThrowArgumentOutOfRangeException_NoEnoughSpace(nameof(SkipLengthDelimited), length, _length - _offset);
++        if (length < 0 || _length - _offset < length) ThrowHelper.ThrowArgumentOutOfRangeException_NoEnoughSpace(nameof(SkipLengthDelimited), length, _length - _offset);
+         
+         _offset += length;
+     }
 diff --git a/Lagrange.Core/Events/EventArgs/BotExtendedNoticeEvent.cs b/Lagrange.Core/Events/EventArgs/BotExtendedNoticeEvent.cs
 new file mode 100644
 index 00000000..e47ea312
