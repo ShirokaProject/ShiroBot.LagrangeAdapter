@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.6")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.2")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.6",
+    Version = "0.1.2",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -30,6 +30,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     private CancellationTokenSource? _loginCancellation;
     private Task? _loginTask;
     private BotSignProvider? _signProvider;
+    private LagrangeTokenRelay? _tokenRelay;
     private TaskCompletionSource<string>? _qrReady;
     private bool _started;
     private string? _automaticDeviceName;
@@ -219,6 +220,20 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _qqSystemApi = new LagrangeQqSystemApi(_session);
         _qqMessageApi = new LagrangeQqMessageApi(_session);
 
+        if (config.TokenRelayEnabled && protocol == Protocols.MacOs)
+        {
+            var relayKeyPath = string.IsNullOrWhiteSpace(config.TokenRelayKeyFile)
+                ? keystorePath + ".relay.key" : ResolveConfigPath(config.TokenRelayKeyFile);
+            var relayKey = LagrangeTokenRelayFiles.LoadOrCreateKey(relayKeyPath);
+            _tokenRelay = new LagrangeTokenRelay(config.TokenRelayPort, relayKey,
+                () => new(context.IsOnline, context.BotUin, Convert.ToHexString(context.Keystore.Guid).ToLowerInvariant()),
+                async (command, body, cancellation) => {
+                    var result = await context.SendPacket(new Lagrange.Core.Common.Entity.BotSsoPacket(command, body)).AsTask().WaitAsync(cancellation);
+                    return (result.RetCode, result.Data.ToArray());
+                }, _loginCancellation.Token);
+            _tokenRelay.PublishDiscovery(keystorePath + ".relay.json", relayKeyPath);
+            Logger.Info($"设备 Token relay 已开启: 127.0.0.1:{_tokenRelay.Port}");
+        }
         RegisterLifecycleEvents(context, keystorePath, config);
         _eventService.Attach(_session);
     }
@@ -389,6 +404,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _loginError = null;
         ClearVerification();
         _loginStatus = "ready";
+        if (_tokenRelay is { } relay) { await relay.DisposeAsync(); _tokenRelay = null; }
         var context = _session?.ActiveContext;
         _session = null;
         _eventService.Detach();
@@ -687,6 +703,7 @@ public sealed class LagrangeAdapterConfig
             !(helper.Scheme == "https" || helper.Scheme == "http" && helper.IsLoopback))
             throw new ArgumentException("CaptchaHelperUrl 必须为 HTTPS 基础地址；本机地址也支持 HTTP，不能含鉴权、查询参数或片段。");
         _ = AccountUin;
+        if (TokenRelayPort is < 0 or > 65535) throw new ArgumentException("TokenRelayPort 无效。");
         if (DeviceName.Length > 64 || DeviceName.Any(char.IsControl))
             throw new ArgumentException("设备名称最多 64 个字符，不能包含控制字符。");
         if (!Enum.TryParse<Protocols>(Protocol, true, out var protocol) ||
@@ -741,6 +758,15 @@ public sealed class LagrangeAdapterConfig
     [ConfigField("留空自动生成 Shiro- 加随机 4–8 位数字；自动名称随登录凭据保存，刷新二维码时保持不变。", Label = "设备名称", Group = "login",
         GroupLabel = "登录", GroupOrder = 10, Order = 35, Placeholder = "Shiro-123456")]
     public string DeviceName { get; set; } = "";
+
+    [ConfigField("默认开启；仅 Mac 协议生效。只接受本机两个固定 O3 命令，远端使用受控隧道。", Label = "设备 Token relay", Group = "protocol", Order = 60)]
+    public bool TokenRelayEnabled { get; set; } = true;
+
+    [ConfigField("0 自动分配独立端口；也可指定固定端口。", Label = "Token relay 端口", Group = "protocol", Order = 61, Min = 0, Max = 65535)]
+    public int TokenRelayPort { get; set; } = 0;
+
+    [ConfigField("留空在实例会话目录自动生成独立密钥；自定义路径相对于配置目录。密钥为 32–256 字符 URL-safe 串。", Label = "Token relay 密钥文件", Group = "protocol", Order = 62)]
+    public string TokenRelayKeyFile { get; set; } = "";
 
     /// <summary>密码。留空使用二维码登录(推荐,首次扫码后 keystore 自动续期)。</summary>
     [ConfigField("仅自动密码登录需要。建议通过登录页面输入，避免把密码保存到配置。", Label = "登录密码", Group = "login", GroupLabel = "登录",

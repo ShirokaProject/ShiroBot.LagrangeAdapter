@@ -46,8 +46,9 @@ if (args is ["--export-appinfo", var output])
 
 var assembly = typeof(LagrangeAdapter).Assembly;
 await ParityChecks.Run();
+await TokenRelayChecks.Run();
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.6" ||
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.2" ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)

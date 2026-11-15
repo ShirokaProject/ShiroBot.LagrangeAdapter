@@ -57,4 +57,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" artifacts/ShiroBot.LagrangeAdapter.zip --verify-tag --title "$RELEASE_TAG" --notes-file .github/release-notes.md
+          gh release create "$RELEASE_TAG" artifacts/ShiroBot.LagrangeAdapter.zip --verify-tag --title "$RELEASE_TAG" --notes ""
