@@ -1,6 +1,6 @@
 <Project>
-  <!-- Apply the tracked compatibility patch to the pinned SDK checkout. -->
-  <Target Name="ApplyLagrangeLoginChallengePatch" BeforeTargets="ResolveProjectReferences"
+  <!-- Apply during restore so new SDK source files exist before a fresh build graph enumerates Compile items. -->
+  <Target Name="ApplyLagrangeLoginChallengePatch" BeforeTargets="CollectPackageReferences;ResolveProjectReferences"
           Condition="'$(MSBuildProjectName)' == 'ShiroBot.LagrangeAdapter' and '$(DesignTimeBuild)' != 'true'">
     <PropertyGroup>
       <LagrangePatchRoot>$(MSBuildThisFileDirectory)../external/LagrangeV2</LagrangePatchRoot>
