@@ -1,0 +1,17 @@
+{
+  "Os": "Mac",
+  "Kernel": "Darwin",
+  "VendorOs": "macos",
+  "CurrentVersion": "7.0.3-54395",
+  "MiscBitmap": 32764,
+  "PtVersion": "2.0.1-fabu.1620",
+  "SsoVersion": 23,
+  "PackageName": "com.tencent.qq",
+  "WtLoginSdk": "nt.wtlogin.0.0.1",
+  "AppId": 1600001602,
+  "SubAppId": 537403747,
+  "AppClientVersion": 54395,
+  "MainSigMap": 169742560,
+  "SubSigMap": 0,
+  "Qua": "V1_MAC_NQ_7.0.3_54395_GW_B"
+}

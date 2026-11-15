@@ -41,9 +41,9 @@ public partial class LagrangeAdapter
             ["verificationUrl"] = _verificationUrl,
             ["verificationPhone"] = _verificationPhone,
             ["verificationId"] = _verificationId,
-            ["protocol"] = CurrentConfigValue.Protocol,
-            ["qrSupported"] = !CurrentConfigValue.Protocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase),
-            ["passwordlessSmsSupported"] = CurrentConfigValue.Protocol is "AndroidPhone" or "AndroidPad"
+            ["protocol"] = CurrentConfigValue.EffectiveProtocol,
+            ["qrSupported"] = !CurrentConfigValue.EffectiveProtocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase),
+            ["passwordlessSmsSupported"] = CurrentConfigValue.EffectiveProtocol is "AndroidPhone" or "AndroidPad"
         };
     }
 

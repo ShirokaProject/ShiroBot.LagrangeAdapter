@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.2")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.3")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.2",
+    Version = "0.1.3",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -166,25 +166,29 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
     {
         config.Validate();
         var keystorePath = ResolveKeystorePath(config);
-        if (!Enum.TryParse<Protocols>(config.Protocol, true, out var protocol))
-            throw new ArgumentException($"未知 Lagrange 协议: {config.Protocol}");
-        var appInfo = string.IsNullOrWhiteSpace(config.AppInfo)
-            ? null
-            : JsonNode.Parse(config.AppInfo) as JsonObject ?? throw new InvalidDataException("AppInfo 必须是 JSON 对象。");
-        if (!string.IsNullOrWhiteSpace(config.AppInfoPath))
-        {
-            if (appInfo is not null) throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
-            appInfo = JsonNode.Parse(File.ReadAllText(ResolveConfigPath(config.AppInfoPath))) as JsonObject
-                      ?? throw new InvalidDataException("AppInfo 文件必须是 JSON 对象。");
-        }
-
+        if (!Enum.TryParse<Protocols>(config.EffectiveProtocol, true, out var protocol))
+            throw new ArgumentException($"未知 Lagrange 协议: {config.EffectiveProtocol}");
         _loginCancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Stopping);
-        if (config.FetchAppInfo)
+        var appInfo = LagrangeAppInfoPresets.Get(config.AppInfoPreset);
+        if (appInfo is null)
         {
-            using var client = new LagrangeSignClient(config, _loginCancellation.Token);
-            appInfo = await client.RequestAsync("appinfo");
-        }
+            appInfo = string.IsNullOrWhiteSpace(config.AppInfo)
+                ? null
+                : JsonNode.Parse(config.AppInfo) as JsonObject ?? throw new InvalidDataException("AppInfo 必须是 JSON 对象。");
+            if (!string.IsNullOrWhiteSpace(config.AppInfoPath))
+            {
+                if (appInfo is not null) throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
+                appInfo = JsonNode.Parse(File.ReadAllText(ResolveConfigPath(config.AppInfoPath))) as JsonObject
+                          ?? throw new InvalidDataException("AppInfo 文件必须是 JSON 对象。");
+            }
 
+            if (config.FetchAppInfo)
+            {
+                using var client = new LagrangeSignClient(config, _loginCancellation.Token);
+                appInfo = await client.RequestAsync("appinfo");
+            }
+
+        }
         if (appInfo?.Any(x => x.Key.Equals("NTLoginType", StringComparison.OrdinalIgnoreCase)) == true)
             Logger.Warning("AppInfo 中旧版 NTLoginType 字段在当前上游 V2 中没有对应项，已忽略；建议改用 V2 AppInfo 模板。");
         var resolved = LagrangeConnectionOptions.ResolveAppInfo(protocol, appInfo);
@@ -243,7 +247,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         var context = _services.Context;
         LagrangeConnectionOptions.ValidatePlatform(context.Config.Protocol, context.AppInfo);
         _loginStatus = qr ? "waiting_scan" : "logging_in";
-        Logger.Info($"Lagrange 开始登录(协议: {config.Protocol})...");
+        Logger.Info($"Lagrange 开始登录(协议: {config.EffectiveProtocol})...");
         var success = qr || string.IsNullOrWhiteSpace(config.Password) || config.AccountUin == 0
             ? await context.Login(token)
             : await context.Login(config.AccountUin, config.Password, token);
@@ -263,7 +267,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         {
             if (!_started) return new PluginActionResult(false, "请先启动适配器。");
             var config = LoadAdapterConfig(Config);
-            if (config.Protocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase))
+            if (config.EffectiveProtocol.StartsWith("Android", StringComparison.OrdinalIgnoreCase))
                 return new PluginActionResult(false, "当前 Lagrange 内核未实现 Android 扫码登录，请在 QQ 登录页使用账号密码。");
             await ClearConnectionAsync();
             await InitializeConnectionAsync(config, true); // Explicit QR login bypasses password and saved tickets.
@@ -618,7 +622,13 @@ public sealed class LagrangeAdapterConfig
 
     [ConfigField("默认使用仓库 GitHub Pages 的 Ticket helper；也可填写自己的 HTTPS 地址或本机静态服务。", Label = "验证码辅助页面", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 50,
         Placeholder = "https://captcha.example.com/")]
-    public string CaptchaHelperUrl { get; set; } = "https://shirokaproject.github.io/ShiroBot.LagrangeAdapter/";
+    public string CaptchaHelperUrl { get; set; } = "https://ticket-helper.shiroka.org/";
+
+    [ConfigField("选择内置版本会自动设置平台和 AppInfo；自定义时使用下面的平台、内联/文件或远端 AppInfo。签名服务地址仍需与版本匹配。", Label = "协议版本", Group = "protocol", GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 5, Type = "select",
+        Options = ["Mac 7.0.3-54395", "AndroidPad 9.3.80-16750", "自定义"])]
+    public string AppInfoPreset { get; set; } = "自定义";
+
+    internal string EffectiveProtocol => LagrangeAppInfoPresets.Protocol(AppInfoPreset) ?? Protocol;
 
     /// <summary>覆盖当前协议内置 AppInfo 的字段，可只提供需要修改的字段。</summary>
     [ConfigField("JSON 格式的局部覆盖值；与 AppInfo 文件路径二选一。留空使用平台默认值。", Label = "内联 AppInfo", Group = "protocol",
@@ -706,7 +716,7 @@ public sealed class LagrangeAdapterConfig
         if (TokenRelayPort is < 0 or > 65535) throw new ArgumentException("TokenRelayPort 无效。");
         if (DeviceName.Length > 64 || DeviceName.Any(char.IsControl))
             throw new ArgumentException("设备名称最多 64 个字符，不能包含控制字符。");
-        if (!Enum.TryParse<Protocols>(Protocol, true, out var protocol) ||
+        if (!Enum.TryParse<Protocols>(EffectiveProtocol, true, out var protocol) ||
             !BotAppInfo.ProtocolToAppInfo.ContainsKey(protocol))
             throw new ArgumentException($"未知协议: {Protocol}");
         if (!Enum.TryParse<LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
@@ -718,9 +728,9 @@ public sealed class LagrangeAdapterConfig
             throw new ArgumentException("当前 Lagrange 内核未实现 AndroidWatch 登录，请选择 AndroidPhone 或 AndroidPad。");
         if (protocol is Protocols.AndroidPhone or Protocols.AndroidPad && string.IsNullOrWhiteSpace(SignServer))
             throw new ArgumentException("Android 协议需要填写与 AppInfo 对应的签名服务地址。");
-        if (FetchAppInfo && (string.IsNullOrWhiteSpace(SignServer) || !string.IsNullOrWhiteSpace(AppInfo) || !string.IsNullOrWhiteSpace(AppInfoPath)))
+        if (AppInfoPreset == "自定义" && FetchAppInfo && (string.IsNullOrWhiteSpace(SignServer) || !string.IsNullOrWhiteSpace(AppInfo) || !string.IsNullOrWhiteSpace(AppInfoPath)))
             throw new ArgumentException("FetchAppInfo 需要 SignServer，且不能同时指定 AppInfo 或 AppInfoPath。");
-        if (!string.IsNullOrWhiteSpace(AppInfo) && !string.IsNullOrWhiteSpace(AppInfoPath))
+        if (AppInfoPreset == "自定义" && !string.IsNullOrWhiteSpace(AppInfo) && !string.IsNullOrWhiteSpace(AppInfoPath))
             throw new ArgumentException("AppInfo 与 AppInfoPath 只能设置一个。");
         foreach (var address in new[] { SignServer, SignProxyUrl }.Where(x => !string.IsNullOrWhiteSpace(x)))
             if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||

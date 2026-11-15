@@ -7,6 +7,11 @@ using var file = File.OpenRead(args[0]);
 using var pe = new PEReader(file);
 var reader = pe.GetMetadataReader();
 var provider = new AttributeTypes();
+foreach (var name in new[] { "mac-7.0.3-54395", "android-pad-9.3.80-16750" })
+    if (!reader.ManifestResources.Any(handle => reader.GetString(reader.GetManifestResource(handle).Name) ==
+        $"ShiroBot.LagrangeAdapter.Configuration.Presets.{name}.json"))
+        throw new InvalidOperationException("Release package lost AppInfo preset: " + name);
+
 string? packageVersion = null;
 var componentVersions = new List<string>();
 foreach (var attribute in reader.GetAssemblyDefinition().GetCustomAttributes().Select(reader.GetCustomAttribute)

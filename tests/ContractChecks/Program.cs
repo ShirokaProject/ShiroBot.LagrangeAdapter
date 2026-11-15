@@ -44,11 +44,27 @@ if (args is ["--export-appinfo", var output])
     return;
 }
 
+foreach (var (preset, protocol, qua, appId, subId) in new[] {
+    ("Mac 7.0.3-54395", Lagrange.Core.Common.Protocols.MacOs, "V1_MAC_NQ_7.0.3_54395_GW_B", 1600001602L, 537403747L),
+    ("AndroidPad 9.3.80-16750", Lagrange.Core.Common.Protocols.AndroidPad, "V1_AND_SQ_9.3.80_16750_YYB_D", 16L, 537400153L)
+})
+{
+    var config = new LagrangeAdapterConfig { AppInfoPreset = preset, Protocol = "Linux", SignServer = "https://sign.example.test/" };
+    config.Validate();
+    if (config.EffectiveProtocol != protocol.ToString()) throw new Exception("Preset did not select platform.");
+    var info = LagrangeConnectionOptions.ResolveAppInfo(protocol, LagrangeAppInfoPresets.Get(preset));
+    LagrangeConnectionOptions.ValidatePlatform(protocol, info);
+    if (info.Qua != qua || info.AppId != appId || info.SubAppId != subId) throw new Exception("Embedded preset identity mismatch.");
+    var modified = LagrangeAppInfoPresets.Get(preset)!; modified["Qua"] = "modified";
+    if (LagrangeAppInfoPresets.Get(preset)!["Qua"]!.GetValue<string>() != qua) throw new Exception("Preset shared mutable state.");
+}
+Console.WriteLine("Embedded Mac/Android preset versions, platform, AppIDs and isolation checks passed.");
+
 var assembly = typeof(LagrangeAdapter).Assembly;
 await ParityChecks.Run();
 await TokenRelayChecks.Run();
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.2" ||
+if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.3" ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)
