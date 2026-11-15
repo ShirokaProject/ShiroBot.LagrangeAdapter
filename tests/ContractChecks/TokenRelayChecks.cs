@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Http.Headers;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using ShiroBot.LagrangeAdapter;
@@ -8,145 +7,98 @@ using ShiroBot.LagrangeAdapter;
 namespace ContractChecks;
 internal static class TokenRelayChecks
 {
-    private const string Key = "test-relay-credential-0123456789abcdef";
     private const string Guid = "0123456789abcdef0123456789abcdef";
-    private const string Establish = "trpc.o3.ecdh_access.EcdhAccess.SsoEstablishShareKey";
-    private const string Secure = "trpc.o3.ecdh_access.EcdhAccess.SsoSecureAccess";
-    private static int Port()
-    {
-        using var socket = new TcpListener(IPAddress.Loopback, 0);
-        socket.Start(); return ((IPEndPoint)socket.LocalEndpoint).Port;
-    }
-    private static void Check(bool value, string name)
-    { if (!value) throw new Exception("Token relay: " + name); }
-    private static async Task AutomaticSetup()
-    {
-        var directory = Directory.CreateTempSubdirectory("lagrange-relay-check-").FullName;
-        var keyFile = Path.Combine(directory, "first.relay.key");
-        var info = Path.Combine(directory, "first.relay.json");
-        try
-        {
-            var key = LagrangeTokenRelayFiles.LoadOrCreateKey(keyFile);
-            Check(key.Length == 64 && LagrangeTokenRelayFiles.LoadOrCreateKey(keyFile) == key, "generated key persists");
-            Check(LagrangeTokenRelayFiles.LoadOrCreateKey(Path.Combine(directory, "second.relay.key")) != key, "instance keys isolated");
-            if (!OperatingSystem.IsWindows())
-            {
-                Check(File.GetUnixFileMode(keyFile) == (UnixFileMode.UserRead | UnixFileMode.UserWrite), "private generated key");
-                File.SetUnixFileMode(keyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
-                try { LagrangeTokenRelayFiles.LoadOrCreateKey(keyFile); throw new Exception("public key permissions accepted"); }
-                catch (IOException) { }
-                File.SetUnixFileMode(keyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            }
-            File.WriteAllText(keyFile, "bad");
-            try { LagrangeTokenRelayFiles.LoadOrCreateKey(keyFile); throw new Exception("malformed existing key accepted"); }
-            catch (InvalidDataException) { }
-            File.WriteAllText(keyFile, key);
-            var identity = new LagrangeTokenRelay.Identity(true, 123456789, Guid);
-            var first = new LagrangeTokenRelay(0, key, () => identity,
-                (_, _, _) => Task.FromResult((0, Array.Empty<byte>())), CancellationToken.None);
-            try
-            {
-                await using var second = new LagrangeTokenRelay(0, key, () => identity,
-                    (_, _, _) => Task.FromResult((0, Array.Empty<byte>())), CancellationToken.None);
-                Check(first.Port > 0 && second.Port > 0 && first.Port != second.Port, "multiple automatic listeners");
-                first.PublishDiscovery(info, keyFile);
-                var text = File.ReadAllText(info);
-                var data = JsonDocument.Parse(text).RootElement;
-                Check(data.GetProperty("endpoint").GetString() == $"http://127.0.0.1:{first.Port}/debug/shiroSignToken" &&
-                    data.GetProperty("keyFile").GetString() == keyFile && !text.Contains(key), "discovery contains endpoint without credential");
-                if (!OperatingSystem.IsWindows())
-                    Check(File.GetUnixFileMode(info) == (UnixFileMode.UserRead | UnixFileMode.UserWrite), "private discovery");
-            }
-            finally { await first.DisposeAsync(); }
-            Check(!File.Exists(info) && File.Exists(keyFile), "unload removes discovery and preserves key");
-        }
-        finally { Directory.Delete(directory, recursive: true); }
-    }
+    private const string Qua = "V1_MAC_NQ_7.0.3_54395_GW_B";
+    private const string Command = "trpc.o3.ecdh_access.EcdhAccess.SsoEstablishShareKey";
+    private static readonly LagrangeTokenRelay.Identity Online = new(true, 123456789, Guid);
+    private static void Check(bool value, string name) { if (!value) throw new Exception("Token relay: " + name); }
     internal static async Task Run()
     {
-        var config = new LagrangeAdapterConfig { Protocol = "MacOs" };
-        config.Validate();
-        Check(config.TokenRelayEnabled && config.TokenRelayPort == 0 && config.TokenRelayKeyFile == "", "default enabled with automatic port and key");
-        config.TokenRelayEnabled = false; config.Validate();
-        config.Protocol = "AndroidPad"; config.SignServer = "http://127.0.0.1:1";
-        config.Validate(); // Unsupported protocol needs no relay key.
-        await AutomaticSetup();
-        var identity = new LagrangeTokenRelay.Identity(true, 123456789, Guid);
-        var calls = 0;
-        Func<string, byte[], CancellationToken, Task<(int, byte[])>> send = (command, bytes, _) => {
-            Interlocked.Increment(ref calls);
-            Check(command is Establish or Secure, "command whitelist");
-            Check(bytes.SequenceEqual(new byte[] { 1, 2 }), "request hex decoded");
-            return Task.FromResult((0, new byte[] { 3, 4 }));
-        };
-        var port = Port();
-        var relay = new LagrangeTokenRelay(port, Key, () => identity,
-            (command, body, ct) => send(command, body, ct), CancellationToken.None);
-        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(5) };
-        async Task<HttpResponseMessage> Request(string? command = Establish, string body = "0102", string uin = "123456789",
-            string guid = Guid, string? key = Key, string? origin = null, string path = "/debug/shiroSignToken",
-            string method = "POST", string? raw = null, string media = "application/json")
+        Check(new LagrangeAdapterConfig().TokenRelayEnabled, "one default-on switch");
+        Check(typeof(LagrangeAdapterConfig).GetProperty("TokenRelayPort") is null &&
+              typeof(LagrangeAdapterConfig).GetProperty("TokenRelayKeyFile") is null, "no port or extra key configuration");
+        var identity = Online; var sent = 0;
+        var packet = JsonSerializer.Serialize(new { id = new string('a', 32), command = Command, body = "0102", uin = "123456789", guid = Guid });
+        var handler = new Transport(": heartbeat\n\nevent: task\ndata: " + packet + "\n\nevent: task\ndata: " + packet + "\n\n");
+        await using (var relay = Create(handler, () => identity, (command, body, _) => {
+            Check(command == Command && body.SequenceEqual(new byte[] {1,2}), "whitelisted bytes reach SDK");
+            Interlocked.Increment(ref sent); return Task.FromResult((0,new byte[]{3,4}));
+        }))
         {
-            using var req = new HttpRequestMessage(new HttpMethod(method), path);
-            req.Content = new StringContent(raw ?? JsonSerializer.Serialize(new { command, body, uin, guid }), Encoding.UTF8, media);
-            if (key is not null) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
-            if (origin is not null) req.Headers.Add("Origin", origin);
-            return await client.SendAsync(req);
+            await handler.Submitted.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await handler.SecondGet.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Check(sent==1 && handler.Results==1, "duplicate SSE task executes exactly once");
         }
-        async Task Status(int expected, Task<HttpResponseMessage> pending)
-        { using var response = await pending; Check((int)response.StatusCode == expected, $"expected {expected}, got {response.StatusCode}"); }
-        try
+        foreach (var bad in new[] {
+            new { id = new string('a',32), command = "arbitrary.command", body="0102", uin="123456789", guid=Guid },
+            new { id = new string('a',32), command = Command, body="0102", uin="987654321", guid=Guid },
+            new { id = new string('a',32), command = Command, body="0102", uin="123456789", guid=new string('b',32) },
+            new { id = new string('a',32), command = Command, body="xx", uin="123456789", guid=Guid }
+        })
         {
-            await Status(404, Request(path: "/other"));
-            await Status(405, Request(method: "GET"));
-            await Status(401, Request(key: null));
-            await Status(401, Request(key: "wrong"));
-            await Status(403, Request(origin: "https://example.com"));
-            await Status(400, Request(command: "arbitrary.command"));
-            await Status(400, Request(body: "xx"));
-            await Status(400, Request(body: "0"));
-            await Status(400, Request(body: ""));
-            await Status(400, Request(raw: "{"));
-            await Status(400, Request(raw: new string('x', 40001)));
-            await Status(400, Request(media: "text/plain"));
-            await Status(400, Request(guid: "wrong"));
-            await Status(409, Request(uin: "987654321"));
-            await Status(409, Request(guid: new string('a', 32)));
-            identity = identity with { Online = false };
-            await Status(503, Request());
-            Check(calls == 0, "rejected requests never send SSO");
-            identity = identity with { Online = true };
-            foreach (var command in new[] { Establish, Secure })
+            var rejected = new Transport("event: task\ndata: "+JsonSerializer.Serialize(bad)+"\n\n");
+            var calls=0;
+            await using var relay=Create(rejected,()=>Online,(_,_,_)=> { calls++; return Task.FromResult((0,Array.Empty<byte>())); });
+            await rejected.Reregistered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Check(calls==0 && rejected.Results==0,"invalid command, identity or HEX never sends SSO");
+        }
+        var offline = new Transport("event: task\ndata: "+packet+"\n\n");
+        identity=Online;
+        await using (var relay=Create(offline,()=>identity,(_,_,_)=> {
+            identity=identity with {Online=false}; return Task.FromResult((0,new byte[]{1}));
+        }))
+        {
+            await offline.Delivered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Delay(100);
+            Check(offline.Results==0,"identity change prevents stale response submission");
+        }
+        var unsupported=new Transport(""){Reject=true};
+        var stopped=Create(unsupported,()=>Online,(_,_,_)=>throw new Exception("must not send"));
+        await unsupported.Registered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await stopped.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        Console.WriteLine("Outbound relay reuses auth/backend path; SSE/reply, replay, identity, whitelist, fallback and cancellation checks passed (no QQ transport).");
+    }
+    private static LagrangeTokenRelay Create(HttpMessageHandler handler,Func<LagrangeTokenRelay.Identity> identity,
+        Func<string,byte[],CancellationToken,Task<(int,byte[])>> send) => new(new LagrangeAdapterConfig {
+            SignServer="https://sign.example.test/backends/mac/", SignToken="test-sign-credential"
+        },Qua,identity,send,CancellationToken.None,handler);
+    private sealed class Transport(string events) : HttpMessageHandler
+    {
+        public int Results, Registrations, Gets;
+        public bool Reject;
+        public TaskCompletionSource Registered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Reregistered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Submitted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondGet = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Delivered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken cancellation)
+        {
+            Check(request.Headers.Authorization?.ToString()=="Bearer test-sign-credential","existing auth reused");
+            var path=request.RequestUri!.AbsolutePath;
+            Check(path.StartsWith("/backends/mac/relay/"),"configured backend path retained");
+            if (path.EndsWith("/register"))
             {
-                using var response = await Request(command, guid: Guid.ToUpperInvariant());
-                Check(response.IsSuccessStatusCode, "fixed command succeeds");
-                var reply = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
-                Check(reply.GetProperty("retcode").GetInt32() == 0 && reply.GetProperty("body").GetString() == "0304" &&
-                    reply.GetProperty("guid").GetString() == Guid && reply.GetProperty("uin").GetString() == "123456789", "wire reply");
-                Check(response.Headers.CacheControl?.NoStore == true, "no-store response");
+                var body=JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellation)).RootElement;
+                Check(body.GetProperty("qua").GetString()==Qua && body.GetProperty("guid").GetString()==Guid &&
+                    body.GetProperty("features")[0].GetProperty("value").GetString()==Guid,"actual identity registered");
+                if (++Registrations>1) Reregistered.TrySetResult();
+                Registered.TrySetResult();
+                return new HttpResponseMessage(Reject?HttpStatusCode.NotFound:HttpStatusCode.OK) {
+                    Content=new StringContent(JsonSerializer.Serialize(new {client=new string('c',64)}),Encoding.UTF8,"application/json") };
             }
-            send = (_, _, _) => { identity = identity with { Online = false }; return Task.FromResult((0, new byte[] { 1 })); };
-            await Status(409, Request()); // No stale response after reconnect/account change.
-            identity = identity with { Online = true };
-            send = (_, _, _) => Task.FromResult((0, new byte[32769]));
-            await Status(502, Request());
-            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            send = async (_, _, ct) => { entered.TrySetResult(); await Task.Delay(Timeout.Infinite, ct); return (0, Array.Empty<byte>()); };
-            var pending = Request();
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            await Status(503, Request()); // One in-flight request per adapter.
-            await relay.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
-            relay = null!;
-            try { using var response = await pending; Check(!response.IsSuccessStatusCode, "unload must not return success"); }
-            catch (HttpRequestException) { }
-            // Same port can be reused immediately after unload.
-            await using var replacement = new LagrangeTokenRelay(port, Key, () => identity,
-                (_, _, _) => Task.FromResult((7, new byte[] { 8 })), CancellationToken.None);
-            using var replaced = await Request();
-            Check(replaced.IsSuccessStatusCode && JsonDocument.Parse(await replaced.Content.ReadAsStringAsync()).RootElement.GetProperty("retcode").GetInt32() == 7,
-                "port released and nonzero retcode preserved");
+            if (path.EndsWith("/events"))
+            {
+                Check(request.RequestUri.Query=="?client="+new string('c',64),"opaque lease scoped events");
+                if (++Gets>1) { SecondGet.TrySetResult(); await Task.Delay(Timeout.Infinite,cancellation); }
+                Delivered.TrySetResult();
+                return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(events,Encoding.UTF8,"text/event-stream")};
+            }
+            Check(path.EndsWith("/result"),"fixed API routes only");
+            var result=JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellation)).RootElement;
+            Check(result.GetProperty("client").GetString()==new string('c',64) && result.GetProperty("uin").GetString()=="123456789" &&
+                result.GetProperty("guid").GetString()==Guid && result.GetProperty("body").GetString()=="0304", "reply bound to original identity");
+            Interlocked.Increment(ref Results); Submitted.TrySetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent("{\"code\":0}",Encoding.UTF8,"application/json")};
         }
-        finally { if (relay is not null) await relay.DisposeAsync(); }
-        Console.WriteLine("Token relay loopback authentication, whitelist, identity, bounds, busy and unload checks passed.");
     }
 }
