@@ -616,9 +616,9 @@ public sealed class LagrangeAdapterConfig
         GroupOrder = 10, Order = 10)]
     public bool AutoLogin { get; set; } = false;
 
-    [ConfigField("独立 Ticket helper 的基础地址，可部署到自己的 HTTPS 站点；本机测试默认端口 18130。", Label = "验证码辅助页面", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 50,
+    [ConfigField("默认使用仓库 GitHub Pages 的 Ticket helper；也可填写自己的 HTTPS 地址或本机静态服务。", Label = "验证码辅助页面", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 50,
         Placeholder = "https://captcha.example.com/")]
-    public string CaptchaHelperUrl { get; set; } = "http://127.0.0.1:18130/";
+    public string CaptchaHelperUrl { get; set; } = "https://shirokaproject.github.io/ShiroBot.LagrangeAdapter/";
 
     /// <summary>覆盖当前协议内置 AppInfo 的字段，可只提供需要修改的字段。</summary>
     [ConfigField("JSON 格式的局部覆盖值；与 AppInfo 文件路径二选一。留空使用平台默认值。", Label = "内联 AppInfo", Group = "protocol",

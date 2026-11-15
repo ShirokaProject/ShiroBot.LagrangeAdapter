@@ -144,7 +144,7 @@ internal static class AndroidLoginChecks
         state = await Call("status");
         var helper = new Uri(state["verificationUrl"]!.GetValue<string>());
         var query = System.Web.HttpUtility.ParseQueryString(helper.Query);
-        if (helper.AbsolutePath != "/" || helper.Host != "127.0.0.1" || helper.Port != 18130 || query["uin"] != "123456789" ||
+        if (helper.AbsolutePath != "/ShiroBot.LagrangeAdapter/" || helper.Host != "shirokaproject.github.io" || helper.Scheme != "https" || query["uin"] != "123456789" ||
             query["sid"] != "123" || query["cap_cd"] != "abc+def**")
             throw new Exception("Android captcha helper lost account or challenge parameters.");
         try { await Call("captcha", new JsonObject { ["ticket"] = "terror_1006_synthetic", ["verificationId"] = state["verificationId"]!.GetValue<string>() }); throw new Exception("Failed helper ticket accepted."); }
