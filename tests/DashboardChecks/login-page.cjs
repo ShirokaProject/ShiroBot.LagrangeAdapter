@@ -9,6 +9,7 @@ async function run() {
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   const elements = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, {
     value: '', hidden: false, disabled: false, textContent: '',
+    reportValidity() { return !this.invalid; },
     removeAttribute(name) { delete this[name]; }
   }]));
   const requests = [];
@@ -32,6 +33,33 @@ async function run() {
   vm.runInContext(script, context);
   const flush = () => new Promise(resolve => setImmediate(resolve));
   await flush();
+  // Clicking a type=button must work even if the host sandbox never emits a
+  // native form submit event. No real credentials or network calls are used.
+  for (const id of ['password-submit', 'sms-login-submit', 'captcha-submit', 'sms-submit'])
+    assert.match(html, new RegExp(`id="${id}" type="button"`));
+  elements.uin.value = '199999998';
+  elements.password.value = 'synthetic-password';
+  elements.login.invalid = true;
+  elements['password-submit'].onclick();
+  await flush();
+  assert.equal(requests.filter(x => x.action === 'password-login').length, 0);
+  assert.equal(elements.password.value, 'synthetic-password');
+  elements.login.invalid = false;
+  elements['password-submit'].onclick();
+  await flush();
+  assert.equal(requests.filter(x => x.action === 'password-login').length, 1);
+  assert.equal(elements.password.value, '');
+  elements.password.value = 'synthetic-password';
+  let prevented = false;
+  elements.login.onkeydown({key:'Enter',target:{tagName:'INPUT'},preventDefault(){prevented=true;}});
+  await flush();
+  assert.equal(prevented, true);
+  assert.equal(requests.filter(x => x.action === 'password-login').length, 2);
+  elements['sms-uin'].value = '199999998';
+  elements['sms-login-submit'].onclick();
+  await flush();
+  assert.equal(requests.filter(x => x.action === 'sms-login').length, 1);
+  vm.runInContext('render(testInitialState)', Object.assign(context,{testInitialState:state}));
   assert.equal(elements.scan.disabled, true);
   assert.equal(elements.sms.hidden, false);
   assert.equal(elements['sms-login'].hidden, false);
@@ -49,8 +77,23 @@ async function run() {
   vm.runInContext('render(testState)', context);
   assert.equal(elements.captcha.hidden, false);
   assert.equal(elements.randstr.required, false);
+  assert.equal(elements.randstr.hidden, true);
+  assert.equal(elements['randstr-label'].hidden, true);
+  assert.equal(elements['captcha-result'].hidden, true);
+  elements.ticket.value = '{"ticket":"synthetic-single-ticket"}';
+  elements.ticket.oninput();
+  assert.equal(elements.ticket.value, 'synthetic-single-ticket');
+  elements.ticket.value = 'synthetic-plain-ticket';
+  elements.ticket.oninput();
+  assert.equal(elements.ticket.value, 'synthetic-plain-ticket');
+  context.pcState = {...state,protocol:'MacOs'};
+  vm.runInContext('render(pcState)', context);
+  assert.equal(elements.randstr.hidden, false);
+  assert.equal(elements.randstr.required, true);
+  assert.equal(elements['captcha-result'].hidden, false);
+  vm.runInContext('render(testState)', context);
   elements.ticket.value = 'terror_1006_synthetic';
-  elements.captcha.onsubmit({ preventDefault() {} });
+  elements['captcha-submit'].onclick();
   await flush();
   assert.equal(requests.filter(x => x.action === 'captcha').length, 0, 'Invalid helper result was submitted');
   assert.ok(elements.message.textContent.includes('加载失败'));
@@ -58,7 +101,7 @@ async function run() {
   elements['captcha-result'].oninput();
   assert.equal(elements.ticket.value, 'synthetic-ticket');
   assert.equal(elements.randstr.value, 'synthetic-rand');
-  elements.captcha.onsubmit({ preventDefault() {} });
+  elements['captcha-submit'].onclick();
   await flush();
   const submission = requests.find(x => x.action === 'captcha');
   assert.equal(submission.args.verificationId, 'second');
@@ -74,6 +117,6 @@ async function run() {
   vm.runInContext('render(testState)', context);
   await elements['copy-url'].onclick();
   assert.ok(elements.message.textContent.includes('手动复制'));
-  console.log('Login page JavaScript/DOM contracts passed: Android QR capability, SMS/links, challenge lifecycle, JSON paste, safe href and copy fallback. No browser rendering or QQ login performed.');
+  console.log('Login page JavaScript/DOM contracts passed: sandbox-compatible click/Enter dispatch and validation, Android QR capability, SMS/links, challenge lifecycle, JSON paste, safe href and copy fallback. No browser rendering or QQ login performed.');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

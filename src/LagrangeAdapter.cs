@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.4")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.5")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.4",
+    Version = "0.1.5",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -224,7 +224,7 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _qqSystemApi = new LagrangeQqSystemApi(_session);
         _qqMessageApi = new LagrangeQqMessageApi(_session);
 
-        if (config.TokenRelayEnabled && protocol == Protocols.MacOs && Uri.TryCreate(config.SignServer, UriKind.Absolute, out var relayAddress) &&
+        if (config.TokenRelayEnabled && (protocol is Protocols.MacOs or Protocols.AndroidPhone or Protocols.AndroidPad) && Uri.TryCreate(config.SignServer, UriKind.Absolute, out var relayAddress) &&
             (relayAddress.Scheme == "https" || relayAddress.Scheme == "http" && relayAddress.IsLoopback))
         {
             _tokenRelay = new LagrangeTokenRelay(config, resolved.Qua,
@@ -764,7 +764,7 @@ public sealed class LagrangeAdapterConfig
         GroupLabel = "登录", GroupOrder = 10, Order = 35, Placeholder = "Shiro-123456")]
     public string DeviceName { get; set; } = "";
 
-    [ConfigField("默认开启；Mac 协议使用现有签名地址和 Token，主动连接 SSE 并通过 HTTPS 回传设备 Token 任务结果。无需公网 IP、端口或隧道；不支持的服务会自动回退。", Label = "设备 Token relay", Group = "protocol", Order = 60)]
+    [ConfigField("默认开启；Mac、Android 协议使用现有签名地址和 Token，主动连接 SSE 并回传签名配置任务结果。无需公网端口；不支持的服务保持普通签名。", Label = "签名配置 relay", Group = "protocol", Order = 60)]
     public bool TokenRelayEnabled { get; set; } = true;
 
     /// <summary>密码。留空使用二维码登录(推荐,首次扫码后 keystore 自动续期)。</summary>

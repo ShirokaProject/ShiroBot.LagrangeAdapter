@@ -64,7 +64,8 @@ var assembly = typeof(LagrangeAdapter).Assembly;
 await ParityChecks.Run();
 await TokenRelayChecks.Run();
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
-if (adapterMetadata.Id != "lagrange" || adapterMetadata.Version != "0.1.4" ||
+var releaseVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0];
+if (adapterMetadata.Id != "lagrange" || string.IsNullOrWhiteSpace(releaseVersion) || adapterMetadata.Version != releaseVersion ||
     adapterMetadata.Author != "ShirokaProject" ||
     adapterMetadata.GithubRepo != "ShirokaProject/ShiroBot.LagrangeAdapter" ||
     adapterMetadata.Protocol != "lagrange-v2" || !adapterMetadata.IsSingleFile)
