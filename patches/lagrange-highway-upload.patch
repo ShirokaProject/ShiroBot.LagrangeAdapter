@@ -1028,3 +1028,43 @@ index 27eef16..b15ed6d 100644
          {
              EncodeTwo32VarIntSimd<TT, TU>(v1, v2);
          }
+diff --git a/Lagrange.Core/Message/Entities/MultiMsgEntity.cs b/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
+index 44be011..338971a 100644
+--- a/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
++++ b/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
+@@ -2,6 +2,7 @@ using System.IO.Compression;
+ using System.Text.Json.Nodes;
+ using System.Xml;
+ using Lagrange.Core.Common.Entity;
++using Lagrange.Core.Exceptions;
+ using Lagrange.Core.Internal.Events.Message;
+ using Lagrange.Core.Internal.Packets.Message;
+ using Lagrange.Core.Internal.Packets.Service;
+@@ -24,14 +25,22 @@ public class MultiMsgEntity(string? resId) : IMessageEntity
+ 
+     public async Task Preprocess(BotContext context, BotMessage message)
+     {
+-        if (string.IsNullOrEmpty(ResId))
+-        {
+-            var result = await context.EventContext.SendEvent<LongMsgSendEventResp>(new LongMsgSendEventReq(message.Receiver, Messages));
+-            ResId = result.ResId;
++        if (!string.IsNullOrEmpty(ResId)) return;
+ 
++        // Only the enclosing message has the real QQ conversation and recipient.
++        foreach (var node in Messages)
++        {
++            foreach (var entity in node.Entities)
++                await entity.Preprocess(context, message);
+         }
++
++        var result = await context.EventContext.SendEvent<LongMsgSendEventResp>(
++            new LongMsgSendEventReq(message.Receiver, Messages));
++        if (string.IsNullOrWhiteSpace(result.ResId))
++            throw new OperationException(-1, "QQ did not return a resource ID for the forwarded messages");
++        ResId = result.ResId;
+     }
+-    
++
+     public async Task Postprocess(BotContext context, BotMessage message)
+     {
+         if (string.IsNullOrEmpty(ResId)) return;

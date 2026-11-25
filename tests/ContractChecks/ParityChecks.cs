@@ -2,6 +2,8 @@ using System.Reflection;
 using System.Text.Json.Nodes;
 using Lagrange.Core;
 using Lagrange.Core.Events.EventArgs;
+using Lagrange.Core.Common.Interface;
+using Lagrange.Core.Message;
 using Lagrange.Core.Message.Entities;
 using ShiroBot.LagrangeAdapter;
 using ShiroBot.Model.QQ;
@@ -14,6 +16,7 @@ internal static class ParityChecks
     {
         ReaderBoundsChecks();
         WriterBoundsChecks();
+        await ForwardMediaPreparationChecks();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
         Equal(wire, "089601120141");
@@ -136,6 +139,39 @@ internal static class ParityChecks
         if (replyTarget.Uid != "sender")
             throw new Exception("A private reply must reuse the UID learned from the inbound message.");
     }
+
+    private static async Task ForwardMediaPreparationChecks()
+    {
+        using var bot = BotFactory.Create(new Lagrange.Core.Common.BotConfig());
+        var image = new ForwardProbeImage();
+        var node = BotMessage.CreateCustomGroup(0, 123, "node", 1, [image]);
+        var nested = new MultiMsgEntity([node]);
+        var forward = new MultiMsgEntity([BotMessage.CreateCustomGroup(0, 456, "parent", 1, [nested])]);
+        var envelope = BotMessage.CreateCustomGroup(789, 456, "sender", 2, [forward]);
+        try
+        {
+            await forward.Preprocess(bot, envelope);
+            throw new Exception("Forwarded media was not preprocessed before the long-message request.");
+        }
+        catch (StopBeforeForwardUpload)
+        {
+            if (!ReferenceEquals(image.Envelope, envelope))
+                throw new Exception("Forwarded media must use the enclosing destination, including nested forwards.");
+        }
+    }
+
+    private sealed class ForwardProbeImage() : ImageEntity(Stream.Null)
+    {
+        public BotMessage? Envelope { get; private set; }
+
+        public override Task Preprocess(BotContext context, BotMessage message)
+        {
+            Envelope = message;
+            throw new StopBeforeForwardUpload();
+        }
+    }
+
+    private sealed class StopBeforeForwardUpload : Exception;
 
     private static void ReaderBoundsChecks()
     {
