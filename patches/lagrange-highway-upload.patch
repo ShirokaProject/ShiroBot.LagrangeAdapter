@@ -1,0 +1,1030 @@
+diff --git a/Lagrange.Core/BotContext.cs b/Lagrange.Core/BotContext.cs
+index ed40abc..b5de279 100644
+--- a/Lagrange.Core/BotContext.cs
++++ b/Lagrange.Core/BotContext.cs
+@@ -95,6 +95,8 @@ public class BotContext : IDisposable
+ 
+     public void Dispose()
+     {
++        HighwayContext.Dispose();
++        FlashTransferContext.Dispose();
+         EventInvoker.Dispose();
+         SocketContext.Dispose();
+         EventContext.Dispose();
+diff --git a/Lagrange.Core/Internal/Context/FlashTransferContext.cs b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
+index f9d248a..42b4620 100644
+--- a/Lagrange.Core/Internal/Context/FlashTransferContext.cs
++++ b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
+@@ -1,113 +1,157 @@
+-﻿using System.Security.Cryptography;
++using System.Buffers;
++using System.Net;
++using System.Security.Cryptography;
+ using Lagrange.Core.Internal.Packets.Service;
+ using Lagrange.Core.Utility;
+ using Lagrange.Core.Utility.Cryptography;
+-using Lagrange.Core.Utility.Extension;
++using Lagrange.Proto.Serialization;
+ 
+ namespace Lagrange.Core.Internal.Context;
+ 
+-public class FlashTransferContext
++public sealed class FlashTransferContext : IDisposable
+ {
+     private const string Tag = nameof(FlashTransferContext);
+-    private readonly BotContext _botContext;
++    private const int ChunkSize = 1024 * 1024;
++    private const int Attempts = 3;
++    private readonly BotContext _context;
+     private readonly HttpClient _client;
+-    private readonly string? _url;
+-    private const uint ChunkSize = 1024 * 1024;
++    private readonly Uri _endpoint;
++    private readonly SemaphoreSlim _uploads;
+ 
+-    internal FlashTransferContext(BotContext botContext)
++    internal FlashTransferContext(BotContext context)
++        : this(context, new Uri("https://multimedia.qfile.qq.com/sliceupload")) { }
++
++    internal FlashTransferContext(BotContext context, Uri endpoint)
+     {
+-        _botContext = botContext;
+-        _client = new HttpClient();
+-        _client.DefaultRequestHeaders.Add("Accept-Encoding", "gzip");
+-        _url = "https://multimedia.qfile.qq.com/sliceupload";
++        _context = context;
++        _endpoint = endpoint;
++        _client = new HttpClient(new SocketsHttpHandler
++        {
++            AutomaticDecompression = DecompressionMethods.GZip,
++            Expect100ContinueTimeout = TimeSpan.FromMilliseconds(200)
++        })
++        {
++            Timeout = TimeSpan.FromSeconds(45),
++            MaxResponseContentBufferSize = 1024 * 1024
++        };
++        var concurrent = checked((int)context.Config.HighwayConcurrent);
++        _uploads = new SemaphoreSlim(concurrent, concurrent);
+     }
+ 
+     public async Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream)
+     {
+-        var sha1StateVs = new FlashTransferSha1StateV { State = [] };
+-        var chunkCount = (uint)((bodyStream.Length + ChunkSize - 1) / ChunkSize);
++        var fileSize = bodyStream.Length;
++        if (fileSize == 0) return true;
++        if (fileSize > (long)uint.MaxValue + 1)
++            throw new ArgumentOutOfRangeException(nameof(bodyStream), "FlashTransfer offsets exceed 32 bits");
+ 
+-        var sha1Stream = new Sha1Stream();
+-        for (uint i = 0; i < chunkCount; i++)
++        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(20));
++        var token = timeout.Token;
++        await _uploads.WaitAsync(token);
++        try
+         {
+-            if (i != chunkCount - 1)
++            var buffer = ArrayPool<byte>.Shared.Rent(ChunkSize);
++            try
+             {
+-                var accLength = (int)((i + 1) * ChunkSize);
+-                var accBuffer = new byte[accLength];
+-            
+-                bodyStream.Position = 0;
+-                await bodyStream.ReadExactlyAsync(accBuffer, 0, accLength);
+-            
+-                var accSpan = accBuffer.AsSpan();
+-                var digest = new byte[20];
+-                sha1Stream.Update(accSpan);
+-                sha1Stream.Hash(digest, false);
+-                sha1Stream.Reset();
+-                sha1StateVs.State.Add(digest.ToArray());
++                var states = await BuildSha1StatesAsync(bodyStream, fileSize, buffer, token);
++                var writer = new ArrayBufferWriter<byte>(ChunkSize);
++                var body = new FlashTransferUploadBody { FieId1 = [], UKey = uKey, Sha1StateV = states };
++                var request = new FlashTransferUploadReq { AppId = appId, FileId3 = 2, Body = body };
++                for (long offset = 0; offset < fileSize;)
++                {
++                    int length = (int)Math.Min(ChunkSize, fileSize - offset);
++                    var chunk = buffer.AsMemory(0, length);
++                    await bodyStream.ReadExactlyAsync(chunk, token);
++                    body.Start = checked((uint)offset);
++                    body.End = checked((uint)(offset + length - 1));
++                    body.Sha1 = SHA1.HashData(chunk.Span);
++                    body.Body = chunk;
++                    writer.ResetWrittenCount();
++                    ProtoSerializer.SerializeProtoPackable(writer, request);
++                    if (!await UploadChunkAsync(appId, offset, writer.WrittenMemory, token))
++                        return false;
++                    offset += length;
++                }
++                return true;
+             }
+-            else
++            finally
+             {
+-                bodyStream.Position = 0;
+-                sha1StateVs.State.Add(bodyStream.Sha1());
++                ArrayPool<byte>.Shared.Return(buffer);
+             }
+         }
+-
+-        for (uint i = 0; i < chunkCount; i++)
++        finally
+         {
+-            var chunkStart = (long)(i * ChunkSize);
+-            var chunkLength = (int)Math.Min(ChunkSize, bodyStream.Length - chunkStart);
+-
+-            bodyStream.Position = chunkStart;
+-            var uploadBuffer = new byte[chunkLength];
+-            await bodyStream.ReadExactlyAsync(uploadBuffer, 0, chunkLength);
+-
+-            var success = await UploadChunk(uKey, appId, (uint)chunkStart, sha1StateVs, uploadBuffer);
+-            if (!success) return false;
++            _uploads.Release();
+         }
+-
+-        return true;
+     }
+ 
+-    private async Task<bool> UploadChunk(string uKey, uint appId, uint start, FlashTransferSha1StateV chunkSha1S, byte[] body)
++    private static async Task<FlashTransferSha1StateV> BuildSha1StatesAsync(
++        Stream stream, long size, byte[] buffer, CancellationToken token)
+     {
+-        var req = new FlashTransferUploadReq
++        var sha1 = new Sha1Stream();
++        var states = new FlashTransferSha1StateV { State = [] };
++        stream.Position = 0;
++        try
+         {
+-            FieId1 = 0,
+-            AppId = appId,
+-            FileId3 = 2,
+-            Body = new FlashTransferUploadBody
++            for (long remaining = size; remaining > 0;)
+             {
+-                FieId1 = [],
+-                UKey = uKey,
+-                Start = start,
+-                End = (uint)(start + body.Length - 1),
+-                Sha1 = SHA1.HashData(body),
+-                Sha1StateV = chunkSha1S,
+-                Body = body
++                int length = (int)Math.Min(ChunkSize, remaining);
++                await stream.ReadExactlyAsync(buffer.AsMemory(0, length), token);
++                sha1.Update(buffer, length);
++                remaining -= length;
++
++                var digest = new byte[Sha1Stream.Sha1DigestSize];
++                if (remaining == 0) sha1.Final(digest);
++                else sha1.Hash(digest, false);
++                states.State.Add(digest);
+             }
+-        };
+-        var payload = ProtoHelper.Serialize(req).ToArray();
+-        var request = new HttpRequestMessage(HttpMethod.Post, _url)
++            return states;
++        }
++        finally
+         {
+-            Headers =
+-            {
+-                { "Accept", "*/*" },
+-                { "Expect", "100-continue" },
+-                { "Connection", "Keep-Alive" }
+-            },
+-            Content = new ByteArrayContent(payload)
+-        };
+-        var response = await _client.SendAsync(request);
+-        var responseBytes = await response.Content.ReadAsByteArrayAsync();
+-        var resp = ProtoHelper.Deserialize<FlashTransferUploadResp>(responseBytes);
++            stream.Position = 0;
++        }
++    }
+ 
+-        if (resp.Status != "success")
++    private async Task<bool> UploadChunkAsync(uint appId, long offset, ReadOnlyMemory<byte> payload, CancellationToken token)
++    {
++        for (int attempt = 1; ; attempt++)
+         {
+-            _botContext.LogError(Tag,
+-                $"FlashTransfer Upload chunk {start} failed: {resp.Status}");
+-            return false;
+-        }
++            try
++            {
++                using var request = new HttpRequestMessage(HttpMethod.Post, _endpoint)
++                {
++                    Content = new ReadOnlyMemoryContent(payload)
++                };
++                request.Headers.Accept.ParseAdd("*/*");
++                request.Headers.ExpectContinue = true;
++                request.Headers.ConnectionClose = attempt > 1;
++                using var response = await _client.SendAsync(request, token);
++                response.EnsureSuccessStatusCode();
++                var bytes = await response.Content.ReadAsByteArrayAsync(token);
++                var status = ProtoHelper.Deserialize<FlashTransferUploadResp>(bytes).Status;
++                if (status == "success") return true;
+ 
+-        return true;
++                _context.LogWarning(Tag, "FlashTransfer rejected app {0} at offset {1}: {2}", null, appId, offset, status);
++                return false;
++            }
++            catch (Exception ex) when (!token.IsCancellationRequested &&
++                (ex is HttpRequestException or HttpIOException or OperationCanceledException))
++            {
++                var retry = ex is HttpIOException or OperationCanceledException ||
++                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
++                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
++                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
++                if (!retry || attempt == Attempts)
++                {
++                    _context.LogError(Tag, "FlashTransfer request failed for app {0} at offset {1} after {2} attempt(s)",
++                        ex, appId, offset, attempt);
++                    return false;
++                }
++                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token);
++            }
++        }
+     }
+-}
+\ No newline at end of file
++
++    public void Dispose() => _client.Dispose();
++}
+diff --git a/Lagrange.Core/Internal/Context/HighwayContext.cs b/Lagrange.Core/Internal/Context/HighwayContext.cs
+index a1c8240..59e26c0 100644
+--- a/Lagrange.Core/Internal/Context/HighwayContext.cs
++++ b/Lagrange.Core/Internal/Context/HighwayContext.cs
+@@ -1,182 +1,225 @@
+ using System.Buffers;
+ using System.Buffers.Binary;
++using System.Net;
+ using System.Security.Cryptography;
++using Lagrange.Core.Exceptions;
+ using Lagrange.Core.Internal.Events.System;
+ using Lagrange.Core.Internal.Packets.Service;
+ using Lagrange.Core.Utility;
+-using Lagrange.Core.Utility.Binary;
+-using Lagrange.Core.Utility.Extension;
+ 
+ namespace Lagrange.Core.Internal.Context;
+ 
+-internal class HighwayContext
++internal sealed class HighwayContext : IDisposable
+ {
+     private const string Tag = nameof(HighwayContext);
+-    
+-    private readonly BotContext _context;
+-
+-    private readonly HttpClient _client;
+-    
+-    private readonly ulong _chunkSize;
++    private const int Attempts = 3;
++    private const int FrameOverhead = 10;
++    private readonly HttpClient _client = new()
++    {
++        Timeout = TimeSpan.FromSeconds(45),
++        MaxResponseContentBufferSize = 1024 * 1024
++    };
+ 
+-    private readonly int _concurrent;
+-    
++    private readonly BotContext _context;
++    private readonly int _chunkSize;
++    private readonly SemaphoreSlim _uploads;
++    private readonly SemaphoreSlim _sessionLock = new(1);
+     private int _sequence;
++    private volatile bool _disposed;
++    private (byte[] Ticket, string Url, DateTimeOffset Expires)? _session;
+ 
+-    private (byte[], DateTime)? _ticket;
+-
+-    private string? _url;
+-    
+     public HighwayContext(BotContext context)
+     {
+         _context = context;
++        _chunkSize = checked((int)context.Config.HighwayChunkSize);
++        var concurrent = checked((int)context.Config.HighwayConcurrent);
++        _uploads = new SemaphoreSlim(concurrent, concurrent);
++    }
+ 
+-        _client = new HttpClient(new HttpClientHandler { ServerCertificateCustomValidationCallback = (_, _, _, _) => true });
+-        _client.DefaultRequestHeaders.Add("Accept-Encoding", "identity");
+-        _client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
+-        
+-        _sequence = 0;
+-        _chunkSize = context.Config.HighwayChunkSize;
+-        _concurrent = (int)context.Config.HighwayConcurrent;
++    public async Task UploadRequiredAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
++    {
++        if (!await UploadFile(stream, commandId, extendInfo))
++            throw new OperationException(-1, $"Highway upload failed (command {commandId})");
+     }
+ 
+     public async Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
+     {
+-        if (_ticket == null || _url == null || DateTime.Now - _ticket.Value.Item2 > TimeSpan.FromDays(0.5))
++        // Keep offsets ordered within each file and bound concurrent files per bot.
++        await _uploads.WaitAsync();
++        try
+         {
+-            var resp = await _context.EventContext.SendEvent<HighwaySessionEventResp>(new HighwaySessionEventReq());
+-            _ticket = (resp.SigSession, DateTime.Now);
+-            _url = resp.HighwayUrls[1][0];
++            ObjectDisposedException.ThrowIf(_disposed, this);
++            var (ticket, url, _) = await GetSessionAsync();
++            var fileSize = stream.Length;
++            stream.Position = 0;
++            var fileMd5 = await MD5.HashDataAsync(stream);
++            stream.Position = 0;
++
++            var payload = ArrayPool<byte>.Shared.Rent(_chunkSize);
++            try
++            {
++                for (long offset = 0; offset < fileSize;)
++                {
++                    var length = (int)Math.Min(_chunkSize, fileSize - offset);
++                    var block = payload.AsMemory(0, length);
++                    await stream.ReadExactlyAsync(block);
++                    if (!await SendBlockAsync(url, ticket, commandId, extendInfo, fileMd5, fileSize, offset, block))
++                        return false;
++                    offset += length;
++                }
++                return true;
++            }
++            finally
++            {
++                ArrayPool<byte>.Shared.Return(payload);
++            }
+         }
++        finally
++        {
++            _uploads.Release();
++        }
++    }
+ 
+-        var tasks = new List<Task<bool>>();
+-        bool result = true;
++    private async Task<(byte[] Ticket, string Url, DateTimeOffset Expires)> GetSessionAsync()
++    {
++        await _sessionLock.WaitAsync();
++        try
++        {
++            if (_session is { } session && session.Expires > DateTimeOffset.UtcNow)
++                return session;
++
++            var response = await _context.EventContext.SendEvent<HighwaySessionEventResp>(new HighwaySessionEventReq());
++            if (!response.HighwayUrls.TryGetValue(1, out var urls) || urls.Count == 0)
++                throw new OperationException(-1, "Highway session returned no upload endpoint");
+ 
+-        ulong fileSize = (ulong)stream.Length;
+-        ulong offset = 0;
+-        var fileMd5 = stream.Md5();
+-        while (offset < fileSize)
++            session = (response.SigSession, urls[0], DateTimeOffset.UtcNow.AddHours(12));
++            _session = session;
++            return session;
++        }
++        finally
+         {
+-            var buffer = ArrayPool<byte>.Shared.Rent((int)_chunkSize);
+-            ulong payload = (ulong)await stream.ReadAsync(buffer.AsMemory(0, (int)_chunkSize));
++            _sessionLock.Release();
++        }
++    }
+ 
+-            ulong currentBlockOffset = offset;
+-            var task = Task.Run(async () => // closure
++    private async Task<bool> SendBlockAsync(string url, byte[] ticket, int commandId, ReadOnlyMemory<byte> extendInfo,
++        byte[] fileMd5, long fileSize, long offset, ReadOnlyMemory<byte> block)
++    {
++        var appId = (uint)_context.AppInfo.AppId;
++        var header = ProtoHelper.Serialize(new ReqDataHighwayHead
++        {
++            MsgBaseHead = new DataHighwayHead
+             {
+-                var bufferSpan = buffer.AsSpan(0, (int)payload);
+-                int sequence = GetNewSequence();
+-
+-                var head = new DataHighwayHead
+-                {
+-                    Version = 1,
+-                    Uin = _context.Keystore.Uin.ToString(),
+-                    Command = "PicUp.DataUp",
+-                    Seq = (uint)sequence,
+-                    AppId = (uint)_context.AppInfo.AppId,
+-                    DataFlag = 16,
+-                    CommandId = (uint)commandId,
+-                };
+-                var segHead = new SegHead
+-                {
+-                    Filesize = fileSize,
+-                    DataOffset = currentBlockOffset,
+-                    DataLength = (uint)payload,
+-                    ServiceTicket = _ticket.Value.Item1,
+-                    Md5 = MD5.HashData(bufferSpan),
+-                    FileMd5 = fileMd5,
+-                };
+-                var loginHead = new LoginSigHead
++                Version = 1,
++                Uin = _context.Keystore.Uin.ToString(),
++                Command = "PicUp.DataUp",
++                Seq = (uint)(Interlocked.Increment(ref _sequence) - 1) % 100000 + 1,
++                AppId = appId,
++                DataFlag = 16,
++                CommandId = (uint)commandId
++            },
++            MsgSegHead = new SegHead
++            {
++                Filesize = (ulong)fileSize,
++                DataOffset = (ulong)offset,
++                DataLength = (uint)block.Length,
++                ServiceTicket = ticket,
++                Md5 = MD5.HashData(block.Span),
++                FileMd5 = fileMd5
++            },
++            BytesReqExtendInfo = extendInfo,
++            MsgLoginSigHead = new LoginSigHead
++            {
++                Uint32LoginSigType = 8,
++                BytesLoginSig = _context.Keystore.WLoginSigs.A2,
++                AppId = appId
++            }
++        });
++        var prefix = new byte[9 + header.Length];
++        prefix[0] = 0x28;
++        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(1), (uint)header.Length);
++        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(5), (uint)block.Length);
++        header.Span.CopyTo(prefix.AsSpan(9));
++
++        for (var attempt = 1; ; attempt++)
++        {
++            ObjectDisposedException.ThrowIf(_disposed, this);
++            try
++            {
++                using var request = new HttpRequestMessage(HttpMethod.Post, $"http://{url}/cgi-bin/httpconn?htcmd=0x6FF0087&uin={_context.Keystore.Uin}")
+                 {
+-                    Uint32LoginSigType = 8,
+-                    BytesLoginSig = _context.Keystore.WLoginSigs.A2,
+-                    AppId = (uint)_context.AppInfo.AppId
++                    Content = new BlockContent(prefix, block)
+                 };
+-                var highwayHead = new ReqDataHighwayHead
++                request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
++                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
++                request.Headers.ConnectionClose = attempt > 1 || offset + block.Length == fileSize;
++                using var response = await _client.SendAsync(request);
++                response.EnsureSuccessStatusCode();
++                var bytes = await response.Content.ReadAsByteArrayAsync();
++                var result = ParseResponse(bytes);
++                var segmentCode = result.MsgSegHead?.RetCode ?? 0;
++                if (result.ErrorCode == 0 && segmentCode == 0) return true;
++
++                _context.LogWarning(Tag, "Highway rejected command {0} at offset {1}: {2}/{3}",
++                    null, commandId, offset, result.ErrorCode, segmentCode);
++                return false;
++            }
++            catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException)
++            {
++                if (_disposed) throw new ObjectDisposedException(nameof(HighwayContext));
++                var transient = ex is OperationCanceledException or HttpIOException ||
++                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
++                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
++                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
++                if (!transient || attempt == Attempts)
+                 {
+-                    MsgBaseHead = head,
+-                    MsgSegHead = segHead,
+-                    BytesReqExtendInfo = extendInfo,
+-                    Timestamp = 0,
+-                    MsgLoginSigHead = loginHead
+-                };
+-                var headProto = ProtoHelper.Serialize(highwayHead);
+-
+-                bool end = currentBlockOffset + payload >= fileSize;
+-                var upload = ArrayPool<byte>.Shared.Rent(1 + 1 + 4 + 4 + headProto.Length + (int)payload);
+-                var memory = upload.AsMemory(0, 1 + 1 + 4 + 4 + headProto.Length + (int)payload);
+-
+-                memory.Span[0] = 0x28;
+-                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[1..], (uint)headProto.Length);
+-                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[5..], (uint)payload);
+-                headProto.Span.CopyTo(memory.Span[9..]);
+-                bufferSpan.CopyTo(memory.Span[(9 + headProto.Length)..]);
+-                memory.Span[^1] = 0x29;
++                    _context.LogError(Tag, "Highway request failed for command {0} at offset {1} after {2} attempt(s)",
++                        ex, commandId, offset, attempt);
++                    return false;
++                }
++                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt));
++            }
++        }
++    }
+ 
+-                var request = new HttpRequestMessage(HttpMethod.Post, $"http://{_url}")
+-                {
+-                    Content = new ReadOnlyMemoryContent(memory), Headers = { { "Connection", end ? "close" : "keep-alive" } }
+-                };
++    private sealed class BlockContent(byte[] prefix, ReadOnlyMemory<byte> block) : HttpContent
++    {
++        private static readonly byte[] Suffix = [0x29];
+ 
+-                try
+-                {
+-                    var response = await _client.SendAsync(request);
+-                    var reader = new BinaryPacket((await response.Content.ReadAsByteArrayAsync()).AsSpan());
+-
+-                    if (reader.Read<byte>() == 0x28)
+-                    {
+-                        int headLen = reader.Read<int>();
+-                        int bodyLen = reader.Read<int>();
+-                        var respHead = reader.CreateSpan(headLen);
+-                        var body = GC.AllocateUninitializedArray<byte>(bodyLen);
+-                        reader.ReadBytes(body.AsSpan());
+-
+-                        if (reader.Read<byte>() == 0x29)
+-                        {
+-                            var obj = ProtoHelper.Deserialize<RespDataHighwayHead>(respHead);
+-                            _context.LogDebug(Tag, "Highway Block Result: {0} | {1} | {2}", obj.ErrorCode, obj.MsgSegHead?.RetCode, Convert.ToHexString(body));
+-                            return obj.ErrorCode == 0;
+-                        }
+-                    }
+-                }
+-                catch (Exception e)
+-                {
+-                    _context.LogError(Tag, "Highway HTTP error: {0}", e, e.Message);
+-                    if (e.StackTrace is { } stack) _context.LogDebug(Tag, stack);
+-                }
+-                finally
+-                {
+-                    ArrayPool<byte>.Shared.Return(buffer);
+-                    ArrayPool<byte>.Shared.Return(upload);
+-                    request.Dispose();
+-                    new ReadOnlyMemoryContent(memory).Dispose();
+-                }
++        protected override bool TryComputeLength(out long length)
++        {
++            length = (long)prefix.Length + block.Length + Suffix.Length;
++            return true;
++        }
+ 
+-                return false;
+-            });
+-            offset += payload;
++        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
++            SerializeToStreamAsync(stream, context, CancellationToken.None);
+ 
+-            tasks.Add(task);
+-            if (tasks.Count == (_concurrent))
+-            {
+-                var successBlocks = await Task.WhenAll(tasks);
+-                foreach (bool t in successBlocks) result &= t;
+-                tasks.Clear();
+-            }
+-            
+-            if (tasks.Count != 0)
+-            {
+-                var finalBlocks = await Task.WhenAll(tasks);
+-                foreach (bool t in finalBlocks) result &= t;
+-                tasks.Clear();
+-            }
++        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context,
++            CancellationToken cancellationToken)
++        {
++            await stream.WriteAsync(prefix, cancellationToken);
++            await stream.WriteAsync(block, cancellationToken);
++            await stream.WriteAsync(Suffix, cancellationToken);
+         }
++    }
+ 
+-        return result;
++    public void Dispose()
++    {
++        _disposed = true;
++        _client.Dispose();
+     }
+ 
+-    private int GetNewSequence()
++    private static RespDataHighwayHead ParseResponse(ReadOnlySpan<byte> frame)
+     {
+-        Interlocked.CompareExchange(ref _sequence, 0, 100000);
+-        return Interlocked.Increment(ref _sequence);
++        if (frame.Length < FrameOverhead || frame[0] != 0x28 || frame[^1] != 0x29)
++            throw new InvalidDataException("Invalid Highway response frame");
++
++        var headerSize = BinaryPrimitives.ReadUInt32BigEndian(frame[1..]);
++        var bodySize = BinaryPrimitives.ReadUInt32BigEndian(frame[5..]);
++        if (headerSize == 0 || (ulong)headerSize + bodySize != (ulong)(frame.Length - FrameOverhead))
++            throw new InvalidDataException("Invalid Highway response length");
++
++        return ProtoHelper.Deserialize<RespDataHighwayHead>(frame.Slice(9, (int)headerSize));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Events/Message/NTV2RichMediaUploadEvent.cs b/Lagrange.Core/Internal/Events/Message/NTV2RichMediaUploadEvent.cs
+index b50068d..f6b744e 100644
+--- a/Lagrange.Core/Internal/Events/Message/NTV2RichMediaUploadEvent.cs
++++ b/Lagrange.Core/Internal/Events/Message/NTV2RichMediaUploadEvent.cs
+@@ -48,17 +48,20 @@ internal class RecordGroupUploadEventResp(MsgInfo info, byte[] compat, NTV2RichM
+ internal class VideoUploadEventReq(BotMessage message, RichMediaEntityBase entity)
+     : NTV2RichMediaUploadEventReq(message, entity);
+ 
+-internal class VideoUploadEventResp(MsgInfo info, byte[] compat, NTV2RichMediaHighwayExt? ext, NTV2RichMediaHighwayExt? subExt)
+-    : NTV2RichMediaUploadEventResp(info, compat, ext)
++internal abstract class VideoMediaUploadResponse(MsgInfo info, byte[] compat, string? uKey, NTV2RichMediaHighwayExt? subExt)
++    : ProtocolEvent
+ {
++    public MsgInfo Info { get; } = info;
++    public byte[] Compat { get; } = compat;
++    public string? UKey { get; } = uKey;
+     public NTV2RichMediaHighwayExt? SubExt { get; } = subExt;
+ }
+ 
++internal class VideoUploadEventResp(MsgInfo info, byte[] compat, string? uKey, NTV2RichMediaHighwayExt? subExt)
++    : VideoMediaUploadResponse(info, compat, uKey, subExt);
++
+ internal class VideoGroupUploadEventReq(BotMessage message, RichMediaEntityBase entity)
+     : NTV2RichMediaUploadEventReq(message, entity);
+ 
+-internal class VideoGroupUploadEventResp(MsgInfo info, byte[] compat, NTV2RichMediaHighwayExt? ext, NTV2RichMediaHighwayExt? subExt)
+-    : NTV2RichMediaUploadEventResp(info, compat, ext)
+-{
+-    public NTV2RichMediaHighwayExt? SubExt { get; } = subExt;
+-}
+\ No newline at end of file
++internal class VideoGroupUploadEventResp(MsgInfo info, byte[] compat, string? uKey, NTV2RichMediaHighwayExt? subExt)
++    : VideoMediaUploadResponse(info, compat, uKey, subExt);
+diff --git a/Lagrange.Core/Internal/Packets/Service/FlashTransferUploadReq.cs b/Lagrange.Core/Internal/Packets/Service/FlashTransferUploadReq.cs
+index 7859cf2..f278f61 100644
+--- a/Lagrange.Core/Internal/Packets/Service/FlashTransferUploadReq.cs
++++ b/Lagrange.Core/Internal/Packets/Service/FlashTransferUploadReq.cs
+@@ -21,7 +21,7 @@ internal partial class FlashTransferUploadBody
+     [ProtoMember(4)] public uint End { get; set; } // Start + Size - 1
+     [ProtoMember(5)] public byte[] Sha1 { get; set; }
+     [ProtoMember(6)] public FlashTransferSha1StateV Sha1StateV { get; set; }
+-    [ProtoMember(7)] public byte[] Body { get; set; }
++    [ProtoMember(7)] public ReadOnlyMemory<byte> Body { get; set; }
+ }
+ 
+ [ProtoPackable]
+diff --git a/Lagrange.Core/Internal/Packets/Service/NTV2RichMedia.cs b/Lagrange.Core/Internal/Packets/Service/NTV2RichMedia.cs
+index d5fc857..d921be6 100644
+--- a/Lagrange.Core/Internal/Packets/Service/NTV2RichMedia.cs
++++ b/Lagrange.Core/Internal/Packets/Service/NTV2RichMedia.cs
+@@ -103,7 +103,7 @@ internal static class NTV2RichMedia
+         string sha1 = Convert.ToHexString(entity.Stream.Value.Sha1());
+         var info = new FileInfo
+         {
+-            FileSize = (uint)stream.Length,
++            FileSize = checked((uint)stream.Length),
+             FileHash = md5,
+             FileSha1 = sha1
+         };
+@@ -156,9 +156,12 @@ internal static class NTV2RichMedia
+                 }}";
+                 break;
+             }
+-            case VideoEntity:
++            case VideoEntity video:
+             {
+-                info.Type.Type = 2; // unable to determine video type, skip
++                info.Type = new FileType { Type = 2 };
++                info.Width = (uint)video.VideoSize.X;
++                info.Height = (uint)video.VideoSize.Y;
++                info.Time = video.VideoLength;
+                 info.FileName = $"{md5}.mp4"; // default to mp4
+                 break;
+             }
+diff --git a/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs b/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
+index baefd8e..249a40a 100644
+--- a/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
++++ b/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
+@@ -27,16 +27,22 @@ file class Common
+         };
+     }
+     
+-    public static NTV2RichMediaHighwayExt? GenerateExt(UploadResp upload, SubFileInfo subFileInfo)
++    public const uint VideoThumbnailType = 100;
++
++    public static NTV2RichMediaHighwayExt? GenerateVideoThumbnailExt(UploadResp upload)
+     {
+-        if (subFileInfo.UKey == null) return null;
+-        
+-        var index = upload.MsgInfo.MsgInfoBody[0].Index;
++        var subFileInfo = upload.SubFileInfos?.FirstOrDefault(file => file.SubType == VideoThumbnailType)
++            ?? (upload.SubFileInfos is [var onlyFile] ? onlyFile : null);
++        if (string.IsNullOrEmpty(subFileInfo?.UKey)) return null;
++
++        var index = upload.MsgInfo.MsgInfoBody.FirstOrDefault(body => body.Index.SubType == VideoThumbnailType)?.Index
++            ?? upload.MsgInfo.MsgInfoBody.ElementAtOrDefault(1)?.Index
++            ?? throw new InvalidDataException("Video upload response omitted the thumbnail index");
+         return new NTV2RichMediaHighwayExt
+         {
+-            FileUuid = index.FileUuid,
++            FileUuid = upload.MsgInfo.MsgInfoBody[0].Index.FileUuid,
+             UKey = subFileInfo.UKey,
+-            Network = ConvertIPv4(subFileInfo.IPv4s),
++            Network = ConvertIPv4(subFileInfo.IPv4s is { Count: > 0 } ips ? ips : upload.IPv4s),
+             MsgInfoBody = upload.MsgInfo.MsgInfoBody,
+             BlockSize = BlockSize,
+             Hash = new NTHighwayHash { FileSha1 = [Convert.FromHexString(index.Info.FileSha1)] }
+@@ -195,12 +201,12 @@ internal class VideoUploadService : OidbService<VideoUploadEventReq, VideoUpload
+         };
+         var entity = (VideoEntity)request.Entity;
+         ArgumentNullException.ThrowIfNull(entity.ThumbnailEntity);
+-        return Task.FromResult(NTV2RichMedia.BuildUploadReq(request.Message, request.Entity, ext, (100, entity.ThumbnailEntity)));
++        return Task.FromResult(NTV2RichMedia.BuildUploadReq(request.Message, request.Entity, ext, (Common.VideoThumbnailType, entity.ThumbnailEntity)));
+     }
+ 
+     protected override Task<VideoUploadEventResp> ProcessResponse(NTV2RichMediaResp response, BotContext context)
+     {
+-        return Task.FromResult(new VideoUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, Common.GenerateExt(response.Upload), Common.GenerateExt(response.Upload, response.Upload.SubFileInfos[0])));
++        return Task.FromResult(new VideoUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, response.Upload.UKey, Common.GenerateVideoThumbnailExt(response.Upload)));
+     }
+ }
+ 
+@@ -222,11 +228,11 @@ internal class VideoGroupUploadService : OidbService<VideoGroupUploadEventReq, V
+         };
+         var entity = (VideoEntity)request.Entity;
+         ArgumentNullException.ThrowIfNull(entity.ThumbnailEntity);
+-        return Task.FromResult(NTV2RichMedia.BuildUploadReq(request.Message, request.Entity, ext, (100, entity.ThumbnailEntity)));
++        return Task.FromResult(NTV2RichMedia.BuildUploadReq(request.Message, request.Entity, ext, (Common.VideoThumbnailType, entity.ThumbnailEntity)));
+     }
+ 
+     protected override Task<VideoGroupUploadEventResp> ProcessResponse(NTV2RichMediaResp response, BotContext context)
+     {
+-        return Task.FromResult(new VideoGroupUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, Common.GenerateExt(response.Upload), Common.GenerateExt(response.Upload, response.Upload.SubFileInfos[0])));
++        return Task.FromResult(new VideoGroupUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, response.Upload.UKey, Common.GenerateVideoThumbnailExt(response.Upload)));
+     }
+ }
+\ No newline at end of file
+diff --git a/Lagrange.Core/Message/Entities/ImageEntity.cs b/Lagrange.Core/Message/Entities/ImageEntity.cs
+index 9ac5ddf..68f98d1 100644
+--- a/Lagrange.Core/Message/Entities/ImageEntity.cs
++++ b/Lagrange.Core/Message/Entities/ImageEntity.cs
+@@ -48,7 +48,7 @@ public class ImageEntity : RichMediaEntityBase
+                 // Aot 和 MacOS 下使用 FlashTransfer 上传
+                 if (RuntimeFeature.IsDynamicCodeCompiled && !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                 {
+-                    await context.HighwayContext.UploadFile(Stream.Value, IsGroup ? 1004 : 1003, ProtoHelper.Serialize(result.Ext));
++                    await context.HighwayContext.UploadRequiredAsync(Stream.Value, IsGroup ? 1004 : 1003, ProtoHelper.Serialize(result.Ext));
+                 }
+                 else
+                 {
+diff --git a/Lagrange.Core/Message/Entities/RecordEntity.cs b/Lagrange.Core/Message/Entities/RecordEntity.cs
+index c9fba17..08a3131 100644
+--- a/Lagrange.Core/Message/Entities/RecordEntity.cs
++++ b/Lagrange.Core/Message/Entities/RecordEntity.cs
+@@ -36,7 +36,7 @@ public class RecordEntity : RichMediaEntityBase
+ 
+             if (result.Ext != null)
+             {
+-                await context.HighwayContext.UploadFile(Stream.Value, message.IsGroup() ? 1008 : 1007, ProtoHelper.Serialize(result.Ext));
++                await context.HighwayContext.UploadRequiredAsync(Stream.Value, message.IsGroup() ? 1008 : 1007, ProtoHelper.Serialize(result.Ext));
+             }
+         }  
+         finally
+diff --git a/Lagrange.Core/Message/Entities/VideoEntity.cs b/Lagrange.Core/Message/Entities/VideoEntity.cs
+index c37173f..6cf2076 100644
+--- a/Lagrange.Core/Message/Entities/VideoEntity.cs
++++ b/Lagrange.Core/Message/Entities/VideoEntity.cs
+@@ -1,9 +1,9 @@
+ using System.Numerics;
++using Lagrange.Core.Exceptions;
+ using Lagrange.Core.Internal.Events.Message;
+ using Lagrange.Core.Internal.Packets.Message;
+ using Lagrange.Core.Internal.Packets.Service;
+ using Lagrange.Core.Utility;
+-using Lagrange.Core.Utility.Cryptography;
+ using Lagrange.Core.Utility.Extension;
+ 
+ namespace Lagrange.Core.Message.Entities;
+@@ -40,42 +40,23 @@ public class VideoEntity : RichMediaEntityBase
+ 
+         try
+         {
+-            if (message.IsGroup())
++            IsGroup = message.IsGroup();
++            VideoMediaUploadResponse result = IsGroup
++                ? await context.EventContext.SendEvent<VideoGroupUploadEventResp>(new VideoGroupUploadEventReq(message, this))
++                : await context.EventContext.SendEvent<VideoUploadEventResp>(new VideoUploadEventReq(message, this));
++            _compat = result.Compat;
++            MsgInfo = result.Info;
++
++            if (!string.IsNullOrEmpty(result.UKey))
+             {
+-                IsGroup = true;
+-
+-                var result = await context.EventContext.SendEvent<VideoGroupUploadEventResp>(new VideoGroupUploadEventReq(message, this));
+-                _compat = result.Compat;
+-                MsgInfo = result.Info;
+-
+-                if (result.Ext != null)
+-                {
+-                    result.Ext.Hash.FileSha1 = CalculateStreamBytes(Stream.Value);
+-                    await context.HighwayContext.UploadFile(Stream.Value, 1001, ProtoHelper.Serialize(result.Ext));
+-                }
+-
+-                if (result.SubExt != null)
+-                {
+-                    await context.HighwayContext.UploadFile(ThumbnailStream.Value, 1002, ProtoHelper.Serialize(result.SubExt));
+-                }
++                uint appId = IsGroup ? 1415u : 1413u;
++                if (!await context.FlashTransferContext.UploadFile(result.UKey, appId, Stream.Value))
++                    throw new OperationException(-1, $"FlashTransfer video upload failed (app {appId})");
+             }
+-            else
+-            {
+-                var result = await context.EventContext.SendEvent<VideoUploadEventResp>(new VideoUploadEventReq(message, this));
+-                _compat = result.Compat;
+-                MsgInfo = result.Info;
+ 
+-                if (result.Ext != null)
+-                {
+-                    result.Ext.Hash.FileSha1 = CalculateStreamBytes(Stream.Value);
+-                    await context.HighwayContext.UploadFile(Stream.Value, 1005, ProtoHelper.Serialize(result.Ext));
+-                }
+-
+-                if (result.SubExt != null)
+-                {
+-                    await context.HighwayContext.UploadFile(ThumbnailStream.Value, 1006, ProtoHelper.Serialize(result.SubExt));
+-                }
+-            }
++            if (result.SubExt is { } thumbnail)
++                await context.HighwayContext.UploadRequiredAsync(ThumbnailStream.Value, IsGroup ? 1006 : 1002,
++                    ProtoHelper.Serialize(thumbnail));
+         }
+         finally
+         {
+@@ -100,7 +81,7 @@ public class VideoEntity : RichMediaEntityBase
+ 
+     internal override Elem[] Build()
+     {
+-        if (_compat == null)
++        if (_compat is { Length: > 0 })
+         {
+             return
+             [
+@@ -149,40 +130,4 @@ public class VideoEntity : RichMediaEntityBase
+         }
+         return null;
+     }
+-
+-    private static List<byte[]> CalculateStreamBytes(Stream inputStream)
+-    {
+-        const int blockSize = 1024 * 1024;
+-
+-        inputStream.Seek(0, SeekOrigin.Begin);
+-        var byteArrayList = new List<byte[]>();
+-        var sha1 = new Sha1Stream();
+-
+-        var buffer = new byte[Sha1Stream.Sha1BlockSize];
+-        var digest = new byte[Sha1Stream.Sha1DigestSize];
+-        int lastRead;
+-
+-        while (true)
+-        {
+-            int read = inputStream.Read(buffer);
+-            if (read < Sha1Stream.Sha1BlockSize)
+-            {
+-                lastRead = read;
+-                break;
+-            }
+-
+-            sha1.Update(buffer, Sha1Stream.Sha1BlockSize);
+-            if (inputStream.Position % blockSize == 0)
+-            {
+-                sha1.Hash(digest, false);
+-                byteArrayList.Add((byte[])digest.Clone());
+-            }
+-        }
+-
+-        sha1.Update(buffer, lastRead);
+-        sha1.Final(digest);
+-        byteArrayList.Add((byte[])digest.Clone());
+-
+-        return byteArrayList;
+-    }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Utility/Cryptography/Sha1Stream.cs b/Lagrange.Core/Utility/Cryptography/Sha1Stream.cs
+index 2bcd7fb..3fa6716 100644
+--- a/Lagrange.Core/Utility/Cryptography/Sha1Stream.cs
++++ b/Lagrange.Core/Utility/Cryptography/Sha1Stream.cs
+@@ -7,7 +7,7 @@ namespace Lagrange.Core.Utility.Cryptography;
+ internal class Sha1Stream
+ {
+     private readonly uint[] _state = new uint[5];
+-    private readonly int[] _count = new int[2];
++    private ulong _bitCount;
+     private readonly byte[] _buffer = new byte[Sha1BlockSize];
+ 
+     public const int Sha1BlockSize = 64;
+@@ -38,8 +38,7 @@ internal class Sha1Stream
+         _state[3] = 0x10325476;
+         _state[4] = 0xC3D2E1F0;
+             
+-        _count[0] = 0;
+-        _count[1] = 0;
++        _bitCount = 0;
+     }
+     
+     private unsafe void Transform(byte* data)  // Transform function
+@@ -98,12 +97,8 @@ internal class Sha1Stream
+     
+     private unsafe void UpdateInternal(byte* data, int len)
+     {
+-        int index = (_count[0] >> 3) & 0x3F;
+-        _count[0] += len << 3;
+-
+-        if (_count[0] < (len << 3)) _count[1]++;
+-
+-        _count[1] += len >> 29;
++        int index = (int)((_bitCount >> 3) & 0x3F);
++        _bitCount += (ulong)len * 8;
+ 
+         int partLen = Sha1BlockSize - index;
+         int i = 0;
+@@ -152,19 +147,14 @@ internal class Sha1Stream
+     {
+         if (digest.Length != Sha1DigestSize) throw new ArgumentException($"Digest array must be of size {Sha1DigestSize}");
+ 
+-        var bits = new byte[8];
+-        for (int i = 0; i < 8; i++)
+-        {
+-            int byteIndex = i >= 4 ? 0 : 1;
+-            int shift = (3 - (i & 3)) * 8;
+-            bits[i] = (byte)(_count[byteIndex] >> shift);
+-        }
++        Span<byte> bits = stackalloc byte[8];
++        BinaryPrimitives.WriteUInt64BigEndian(bits, _bitCount);
+ 
+-        int index = (_count[0] >> 3) & 0x3F;
++        int index = (int)((_bitCount >> 3) & 0x3F);
+         int padLen = index < 56 ? 56 - index : 120 - index;
+ 
+         Update(Padding, padLen);
+-        Update(bits, 8);
++        Update(bits);
+ 
+         for (int i = 0; i < Sha1DigestSize; i++) // write the digest
+         {
+diff --git a/Lagrange.Proto/Primitives/ProtoWriter.cs b/Lagrange.Proto/Primitives/ProtoWriter.cs
+index 27eef16..b15ed6d 100644
+--- a/Lagrange.Proto/Primitives/ProtoWriter.cs
++++ b/Lagrange.Proto/Primitives/ProtoWriter.cs
+@@ -68,7 +68,8 @@ public class ProtoWriter : IDisposable
+     {
+         int length = bytes.Length;
+         int count = ProtoHelper.GetVarIntLength(length);
+-        if (_memory.Length - BytesPending < length) Grow(length + count);
++        int required = checked(length + count);
++        if (_memory.Length - BytesPending < required) Grow(required);
+         
+         EncodeVarInt(length);
+         bytes.CopyTo(_memory.Span[BytesPending..]);
+@@ -95,19 +96,22 @@ public class ProtoWriter : IDisposable
+     
+     public void EncodeVarInt<T>(T value) where T : unmanaged, INumber<T>
+     {
+-        if (_memory.Length - BytesPending >= 10)
++        ulong encoded = ulong.CreateTruncating(value);
++        if (encoded < 0x80)
+         {
+-            if (ulong.CreateTruncating(value) < 0x80) // signed negative values must not take the single-byte path
+-            {
+-                Unsafe.Add(ref MemoryMarshal.GetReference(_memory.Span), BytesPending++) = byte.CreateTruncating(value);
+-                return;
+-            }
+-            EncodeVarIntUnsafe(value);
++            WriteRawByte((byte)encoded);
+             return;
+         }
+-        EncodeVarIntSlowPath(value);
++
++        // The SIMD path writes 16 bytes even when the varint occupies fewer.
++        int remaining = _memory.Length - BytesPending;
++        int storeSize = Unsafe.SizeOf<T>() <= 4 ? sizeof(ulong) : Vector128<byte>.Count;
++        if (remaining >= storeSize && (Unsafe.SizeOf<T>() > 4 || encoded <= uint.MaxValue))
++            EncodeVarIntUnsafe(value);
++        else
++            EncodeVarIntSlowPath(value);
+     }
+-    
++
+     [MethodImpl(MethodImplOptions.NoInlining)]
+     private void EncodeVarIntSlowPath<T>(T value) where T : unmanaged, INumber<T>
+     {
+@@ -319,7 +323,8 @@ public class ProtoWriter : IDisposable
+             return;
+         }
+ 
+-        if (Ssse3.IsSupported || AdvSimd.Arm64.IsSupported)
++        if (_memory.Length - BytesPending >= Vector128<byte>.Count && v1 <= uint.MaxValue && v2 <= uint.MaxValue &&
++            (Ssse3.IsSupported || AdvSimd.Arm64.IsSupported))
+         {
+             EncodeTwo32VarIntSimd<TT, TU>(v1, v2);
+         }

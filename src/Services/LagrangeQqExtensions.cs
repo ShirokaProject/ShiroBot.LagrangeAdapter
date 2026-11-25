@@ -458,7 +458,7 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri).ConfigureAwait(false);
+        await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri, bufferHttpResponse: false, cancellationToken).ConfigureAwait(false);
         var result = await session.Context.SendFriendFileWithId(LagrangeMapper.ParseId(userId, "userId"), stream, fileName)
             .ConfigureAwait(false);
         if (string.IsNullOrEmpty(result.FileId)) throw new InvalidDataException("私聊文件上传未返回文件 ID。");
@@ -469,7 +469,7 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
         string parentFolderId = "/", CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri).ConfigureAwait(false);
+        await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri, bufferHttpResponse: false, cancellationToken).ConfigureAwait(false);
         return await session.Context
             .SendGroupFile(LagrangeMapper.ParseId(groupId, "groupId"), stream, fileName, parentFolderId)
             .ConfigureAwait(false);

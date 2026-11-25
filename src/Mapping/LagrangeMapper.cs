@@ -321,12 +321,7 @@ public static class LagrangeMapper
                         disposeOnCompletion: true));
                     break;
                 case VideoSegment video:
-                    chain.Add(new VideoEntity(
-                        await OpenResourceAsync(video.Uri).ConfigureAwait(false),
-                        video.ThumbnailUri is null
-                            ? null
-                            : await OpenResourceAsync(video.ThumbnailUri).ConfigureAwait(false),
-                        disposeOnCompletion: true));
+                    chain.Add(await CreateVideoAsync(video.Uri, video.ThumbnailUri).ConfigureAwait(false));
                     break;
                 case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
                     await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context).ConfigureAwait(false);
@@ -377,10 +372,7 @@ public static class LagrangeMapper
                     disposeOnCompletion: true));
                 break;
             case QOutgoingVideo video:
-                chain.Add(new VideoEntity(
-                    await OpenResourceAsync(video.Uri).ConfigureAwait(false),
-                    video.ThumbUri is null ? null : await OpenResourceAsync(video.ThumbUri).ConfigureAwait(false),
-                    disposeOnCompletion: true));
+                chain.Add(await CreateVideoAsync(video.Uri, video.ThumbUri).ConfigureAwait(false));
                 break;
             case QOutgoingLightApp lightApp:
                 chain.Add(new LightAppEntity(lightApp.JsonPayload));
@@ -421,8 +413,24 @@ public static class LagrangeMapper
         return new MultiMsgEntity(messages);
     }
 
+    private static async Task<VideoEntity> CreateVideoAsync(string uri, string? thumbnailUri)
+    {
+        var video = await OpenResourceAsync(uri, bufferHttpResponse: false).ConfigureAwait(false);
+        try
+        {
+            var thumbnail = thumbnailUri is null ? null : await OpenResourceAsync(thumbnailUri).ConfigureAwait(false);
+            return new VideoEntity(video, thumbnail, disposeOnCompletion: true);
+        }
+        catch
+        {
+            await video.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
     /// <summary>解析 http(s)://、file://、base64:// 三种资源形式为 Stream。</summary>
-    public static async Task<Stream> OpenResourceAsync(string uri)
+    public static async Task<Stream> OpenResourceAsync(string uri, bool bufferHttpResponse = true,
+        CancellationToken cancellationToken = default)
     {
         if (uri.StartsWith("base64://", StringComparison.OrdinalIgnoreCase))
         {
@@ -436,9 +444,34 @@ public static class LagrangeMapper
 
         if (!uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
             !uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return File.OpenRead(uri);
+        if (bufferHttpResponse)
+            return new MemoryStream(await ResourceClient.GetByteArrayAsync(uri, cancellationToken).ConfigureAwait(false));
+
+        using var response = await ResourceClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+            .ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new FileStreamOptions
         {
-            var bytes = await ResourceClient.GetByteArrayAsync(uri).ConfigureAwait(false);
-            return new MemoryStream(bytes);
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.ReadWrite,
+            Options = FileOptions.Asynchronous | FileOptions.DeleteOnClose
+        };
+        if (!OperatingSystem.IsWindows())
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        var file = new FileStream(path, options);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromMinutes(20));
+            await response.Content.CopyToAsync(file, timeout.Token).ConfigureAwait(false);
+            file.Position = 0;
+            return file;
+        }
+        catch
+        {
+            await file.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
     }
 

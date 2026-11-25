@@ -13,6 +13,7 @@ internal static class ParityChecks
     internal static async Task Run()
     {
         ReaderBoundsChecks();
+        WriterBoundsChecks();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
         Equal(wire, "089601120141");
@@ -158,6 +159,42 @@ internal static class ParityChecks
             catch (InvalidDataException) { }
         }
         Console.WriteLine("Bounded protobuf tail/skip, signed int32, overflowing lengths and 20,000 malformed-input checks passed.");
+    }
+
+    private static void WriterBoundsChecks()
+    {
+        foreach (var encode in new Action<Lagrange.Proto.Primitives.ProtoWriter>[]
+        {
+            writer => writer.EncodeVarInt(300UL),
+            writer => writer.EncodeTwo32VarIntUnsafe(300u, 1u)
+        })
+        {
+            var output = new GuardedProtoBuffer();
+            using var writer = new Lagrange.Proto.Primitives.ProtoWriter(output);
+            writer.WriteRawBytes(new byte[54]);
+            encode(writer);
+            writer.Flush();
+            if (output.Bytes.AsSpan(64).ContainsAnyExcept((byte)0xa5))
+                throw new Exception("Protobuf varint writer crossed the destination span boundary.");
+            if (output.Bytes[54] != 0xac || output.Bytes[55] != 0x02)
+                throw new Exception("Protobuf varint changed at the end of a bounded span.");
+        }
+
+        var signed = new System.Buffers.ArrayBufferWriter<byte>();
+        using var signedWriter = new Lagrange.Proto.Primitives.ProtoWriter(signed);
+        signedWriter.EncodeVarInt(-1);
+        signedWriter.Flush();
+        if (!signed.WrittenSpan.SequenceEqual(Convert.FromHexString("ffffffffffffffffff01")))
+            throw new Exception("Protobuf writer lost the sign extension for negative int32.");
+    }
+
+    private sealed class GuardedProtoBuffer : System.Buffers.IBufferWriter<byte>
+    {
+        public byte[] Bytes { get; } = Enumerable.Repeat((byte)0xa5, 80).ToArray();
+        public void Advance(int count) { }
+        public Memory<byte> GetMemory(int sizeHint = 0) => sizeHint <= 64 ? Bytes.AsMemory(0, 64)
+            : throw new InvalidOperationException("Unexpected protobuf buffer growth.");
+        public Span<byte> GetSpan(int sizeHint = 0) => GetMemory(sizeHint).Span;
     }
 
     private static async Task NoticeChecks()

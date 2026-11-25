@@ -15,6 +15,20 @@
     <Exec Condition="'$(LagrangePatchCheck)' != '0'"
           Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeLoginPatch)&quot;" />
   </Target>
+  <Target Name="ApplyLagrangeHighwayUploadPatch" AfterTargets="ApplyLagrangeLoginChallengePatch"
+          Condition="'$(MSBuildProjectName)' == 'ShiroBot.LagrangeAdapter' and '$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <LagrangeHighwayUploadPatch>$(MSBuildThisFileDirectory)../patches/lagrange-highway-upload.patch</LagrangeHighwayUploadPatch>
+    </PropertyGroup>
+    <Exec Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --check &quot;$(LagrangeHighwayUploadPatch)&quot;"
+          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
+      <Output TaskParameter="ExitCode" PropertyName="LagrangeHighwayUploadPatchCheck" />
+    </Exec>
+    <Exec Condition="'$(LagrangeHighwayUploadPatchCheck)' == '0'"
+          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply &quot;$(LagrangeHighwayUploadPatch)&quot;" />
+    <Exec Condition="'$(LagrangeHighwayUploadPatchCheck)' != '0'"
+          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeHighwayUploadPatch)&quot;" />
+  </Target>
   <!--
     .NET 11 runtime-native async (Runtime Async V2). The compiler emits runtime-managed
     suspension instead of async state machines, and the .NET 11 runtime executes it.
