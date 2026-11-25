@@ -26,7 +26,7 @@ public static class LagrangeMapper
         Sex = ToQqSex(friend.Gender),
         Qid = string.IsNullOrEmpty(friend.Qid) ? null : friend.Qid,
         Remark = string.IsNullOrEmpty(friend.Remarks) ? null : friend.Remarks,
-        Category = new QFriendCategory(friend.Category.Id, friend.Category.Name)
+        Category = friend.Category is { } category ? new QFriendCategory(category.Id, category.Name) : null
     };
 
     public static QGroup ToQq(BotGroup group) => new()

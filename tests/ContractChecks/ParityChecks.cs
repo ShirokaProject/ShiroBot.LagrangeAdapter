@@ -66,6 +66,7 @@ internal static class ParityChecks
             IQSystemApi system = new ShiroBot.LagrangeAdapter.Services.LagrangeQqSystemApi(new LagrangeSession { ActiveContext = bot });
             var info = await system.GetImplInfoAsync();
             if (info.QqProtocolType != "android_pad" || info.QqProtocolVersion != bot.AppInfo.PtVersion) throw new Exception("Android implementation info is not Yogurt compatible.");
+            await ColdCachePrivateMessage(bot);
         }
         var selfContact = new Lagrange.Core.Common.Entity.BotFriend(999, "", "self", "", "", "", new(0, "", 0, 0));
         var peerContact = new Lagrange.Core.Common.Entity.BotFriend(123, "", "peer", "", "", "", new(0, "", 0, 0));
@@ -96,6 +97,45 @@ internal static class ParityChecks
         if (chain.Single() is not FaceEntity { FaceId: 14 }) throw new Exception("Generic emoji send mapping failed.");
         Console.WriteLine("Yogurt parity wire fixtures, protocol rejections, files, Web mappings, event mapping and actual FaceEntity encoding passed (offline).");
     }
+    private static async Task ColdCachePrivateMessage(BotContext bot)
+    {
+        var assembly = typeof(BotContext).Assembly;
+        object Packet(string name) => Activator.CreateInstance(
+            assembly.GetType($"Lagrange.Core.Internal.Packets.Message.{name}", throwOnError: true)!)!;
+        static void Set(object target, string name, object value) =>
+            target.GetType().GetProperty(name)!.SetValue(target, value);
+
+        var routing = Packet("RoutingHead");
+        Set(routing, "FromUin", 123L);
+        Set(routing, "FromUid", "sender");
+        Set(routing, "ToUin", 999L);
+        Set(routing, "ToUid", "receiver");
+        var content = Packet("ContentHead");
+        Set(content, "Type", 166);
+        var message = Packet("CommonMessage");
+        Set(message, "RoutingHead", routing);
+        Set(message, "ContentHead", content);
+
+        var packer = Activator.CreateInstance(
+            assembly.GetType("Lagrange.Core.Message.MessagePacker", throwOnError: true)!, bot)!;
+        var parsed = await (Task<Lagrange.Core.Message.BotMessage>)packer.GetType()
+            .GetMethod("Parse")!.Invoke(packer, [message])!;
+        if (parsed.Contact.Uin != 123 || parsed.Contact.Uid != "sender" ||
+            parsed.Receiver.Uin != 999 || parsed.Receiver.Uid != "receiver")
+            throw new Exception("Private message routing must work with an empty friend cache.");
+        var mapped = LagrangeMapper.ToMessageEvent(parsed, "999");
+        if (mapped.Channel?.Id != "123" || mapped.Raw is not QFriendMessage { SenderId: "123" })
+            throw new Exception("Private message mapping must work without cached friend metadata.");
+
+        var messaging = Activator.CreateInstance(
+            assembly.GetType("Lagrange.Core.Internal.Logic.MessagingLogic", throwOnError: true)!, bot)!;
+        var replyTarget = await (Task<Lagrange.Core.Common.Entity.BotFriend>)messaging.GetType()
+            .GetMethod("ResolvePrivateMessageContact", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(messaging, [123L])!;
+        if (replyTarget.Uid != "sender")
+            throw new Exception("A private reply must reuse the UID learned from the inbound message.");
+    }
+
     private static void ReaderBoundsChecks()
     {
         foreach (var hex in new[] { "", "80", "808080808080808080", "ffffffffffffffffff02" })

@@ -1291,7 +1291,7 @@ index 4b7d1fa5..e0f3ebd2 100644
 \ No newline at end of file
 +}
 diff --git a/Lagrange.Core/Message/MessagePacker.cs b/Lagrange.Core/Message/MessagePacker.cs
-index 011f6eca..5ae03560 100644
+index 011f6eca..fa6acb77 100644
 --- a/Lagrange.Core/Message/MessagePacker.cs
 +++ b/Lagrange.Core/Message/MessagePacker.cs
 @@ -32,7 +32,13 @@ internal class MessagePacker(BotContext context)
@@ -1309,24 +1309,40 @@ index 011f6eca..5ae03560 100644
          {
              message.Entities.Add(record);
          }
-@@ -63,7 +69,7 @@ internal class MessagePacker(BotContext context)
+@@ -63,9 +69,11 @@ internal class MessagePacker(BotContext context)
      {
          switch (type)
          {
 -            case 166:
+-                var friend = await context.CacheContext.ResolveFriend(routingHead.FromUin);
+-                return friend ?? new BotFriend(routingHead.FromUin, routingHead.FromUid, string.Empty, string.Empty, string.Empty, string.Empty, null!);
 +            case 166 or 208 or 529:
-                 var friend = await context.CacheContext.ResolveFriend(routingHead.FromUin);
-                 return friend ?? new BotFriend(routingHead.FromUin, routingHead.FromUid, string.Empty, string.Empty, string.Empty, string.Empty, null!);
++                context.CacheContext.RememberPrivateMessageUid(routingHead.FromUin, routingHead.FromUid);
++                return context.CacheContext.ResolveCachedFriend(routingHead.FromUin)
++                    ?? new BotFriend(routingHead.FromUin, string.Empty, routingHead.FromUid, string.Empty, string.Empty, string.Empty, null!);
++
  
-@@ -86,7 +92,7 @@ internal class MessagePacker(BotContext context)
+             case 141:
+                 return (await context.CacheContext.ResolveStranger(routingHead.ToUid)).CloneWithSource(routingHead.CommonC2C.FromTinyId);
+@@ -86,14 +94,11 @@ internal class MessagePacker(BotContext context)
      {
          switch (type)
          {
 -            case 166:
+-                var friend = await context.CacheContext.ResolveFriend(routingHead.ToUin);
+-                if (friend == null)
+-                {
+-                    return new BotFriend(routingHead.ToUin, routingHead.ToUid, string.Empty, string.Empty, string.Empty, string.Empty, null!);
+-                }
 +            case 166 or 208 or 529:
-                 var friend = await context.CacheContext.ResolveFriend(routingHead.ToUin);
-                 if (friend == null)
-                 {
++                context.CacheContext.RememberPrivateMessageUid(routingHead.ToUin, routingHead.ToUid);
++                return context.CacheContext.ResolveCachedFriend(routingHead.ToUin)
++                    ?? new BotFriend(routingHead.ToUin, string.Empty, routingHead.ToUid, string.Empty, string.Empty, string.Empty, null!);
+ 
+-                return friend;
+             case 141:
+                 return (await context.CacheContext.ResolveStranger(routingHead.ToUid)).CloneWithSource(routingHead.CommonC2C.FromTinyId);
+             case 82:
 diff --git a/Lagrange.Proto/Primitives/ProtoReader.cs b/Lagrange.Proto/Primitives/ProtoReader.cs
 index 2b50cbb1..8708565e 100644
 --- a/Lagrange.Proto/Primitives/ProtoReader.cs
@@ -1743,3 +1759,93 @@ index 00000000..924eb7a3
 +    IMessageEntity? IMessageEntity.Parse(List<Elem> elements, Elem target) => null;
 +    string IMessageEntity.ToPreviewString() => $"[文件 {FileName}]";
 +}
+diff --git a/Lagrange.Core/Internal/Context/CacheContext.cs b/Lagrange.Core/Internal/Context/CacheContext.cs
+index b527763f..526f4714 100644
+--- a/Lagrange.Core/Internal/Context/CacheContext.cs
++++ b/Lagrange.Core/Internal/Context/CacheContext.cs
+@@ -53,6 +53,14 @@ internal class CacheContext(BotContext context)
+         return _categories.Values.ToList();
+     }
+ 
++    public BotFriend? ResolveCachedFriend(long uin) => Volatile.Read(ref _friends)?.FirstOrDefault(friend => friend.Uin == uin);
++
++    public void RememberPrivateMessageUid(long uin, string? uid)
++    {
++        if (uin > 0 && !string.IsNullOrEmpty(uid))
++            _uinToUid[uin] = uid;
++    }
++
+     public async Task<BotFriend?> ResolveFriend(long uin)
+     {
+         if (_friends == null) Interlocked.Exchange(ref _friends, await FetchFriends());
+@@ -192,4 +200,4 @@ internal class CacheContext(BotContext context)
+         var result = await context.EventContext.SendEvent<FetchStrangerEventResp>(new FetchStrangerByUidEventReq(uid));
+         return result.Stranger;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Services/System/InfoSyncPushService.cs b/Lagrange.Core/Internal/Services/System/InfoSyncPushService.cs
+index 374f352c..491e4090 100644
+--- a/Lagrange.Core/Internal/Services/System/InfoSyncPushService.cs
++++ b/Lagrange.Core/Internal/Services/System/InfoSyncPushService.cs
+@@ -1,8 +1,6 @@
+ using Lagrange.Core.Common;
+ using Lagrange.Core.Internal.Events.System;
+-using Lagrange.Core.Internal.Packets.System;
+ using Lagrange.Core.Services;
+-using Lagrange.Core.Utility;
+ using Lagrange.Proto.Nodes;
+ 
+ namespace Lagrange.Core.Internal.Services.System;
+@@ -13,9 +11,10 @@ internal class InfoSyncPushService : BaseService<InfoSyncPushEvent, InfoSyncPush
+ {
+     protected override ValueTask<InfoSyncPushEvent> Parse(ReadOnlyMemory<byte> input, BotContext context)
+     {
+-        var obj = ProtoObject.Parse(input.Span);
+-        var push = ProtoHelper.Deserialize<InfoSyncPush>(input.Span);
+-        
++        // This event carries no notification data. Validate the envelope without
++        // decoding nested notifications that the service does not consume.
++        _ = ProtoObject.Parse(input.Span);
++
+         return ValueTask.FromResult(new InfoSyncPushEvent());
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Lagrange.Core/Internal/Logic/MessagingLogic.cs b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
+index d5c8661e..41712200 100644
+--- a/Lagrange.Core/Internal/Logic/MessagingLogic.cs
++++ b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
+@@ -43,8 +43,8 @@ internal class MessagingLogic(BotContext context) : ILogic
+ 
+     public async Task<BotMessage> SendFriendMessage(long friendUin, MessageChain chain)
+     {
+-        var friend = await context.CacheContext.ResolveFriend(friendUin) ?? throw new InvalidTargetException(friendUin);
+-        var self = await context.CacheContext.ResolveFriend(context.BotUin) ?? throw new InvalidTargetException(context.BotUin);
++        var friend = await ResolvePrivateMessageContact(friendUin);
++        var self = await ResolvePrivateMessageContact(context.BotUin);
+         var message = await BuildMessage(chain, self, friend);
+         var result = await context.EventContext.SendEvent<SendMessageEventResp>(new SendMessageEventReq(message));
+ 
+@@ -57,6 +57,19 @@ internal class MessagingLogic(BotContext context) : ILogic
+         return message;
+     }
+ 
++    private async Task<BotFriend> ResolvePrivateMessageContact(long uin)
++    {
++        var cached = context.CacheContext.ResolveCachedFriend(uin);
++        if (cached is { Uid.Length: > 0 }) return cached;
++
++        var uid = uin == context.BotUin ? context.Keystore.Uid : context.CacheContext.ResolveCachedUid(uin);
++        if (string.IsNullOrEmpty(uid)) uid = context.CacheContext.ResolveCachedUid(uin);
++        if (!string.IsNullOrEmpty(uid))
++            return new BotFriend(uin, string.Empty, uid, string.Empty, string.Empty, string.Empty, null!);
++
++        return await context.CacheContext.ResolveFriend(uin) ?? throw new InvalidTargetException(uin);
++    }
++
+     public async Task<BotMessage> SendGroupMessage(long groupUin, MessageChain chain)
+     {
+         var (group, self) = await context.CacheContext.ResolveMember(groupUin, context.BotUin) ?? throw new InvalidTargetException(context.BotUin, groupUin);

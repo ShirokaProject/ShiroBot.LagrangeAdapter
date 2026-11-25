@@ -1,6 +1,6 @@
 # QQ 能力与验证范围
 
-版本：0.1.5。基于 ShiroBot.SDK 1.0.3 和固定的 Lagrange.Core 子模块；参考 Acidify/Yogurt 的 Milky API、协议结构及事件转换补齐内核公共 API 的缺项。新增协议代码位于 `src/Protocol`，内核修改由 `patches/lagrange-login-challenges.patch` 管理，不改变子模块 gitlink。
+版本：0.1.6。基于 ShiroBot.SDK 1.0.3 和固定的 Lagrange.Core 子模块；参考 Acidify/Yogurt 的 Milky API、协议结构及事件转换补齐内核公共 API 的缺项。新增协议代码位于 `src/Protocol`，内核修改由 `patches/lagrange-login-challenges.patch` 管理，不改变子模块 gitlink。
 
 | 范围 | 已实现 | 边界 |
 | --- | --- | --- |
