@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Net;
-using System.Text;
 using System.Text.Json.Nodes;
 using Lagrange.Core;
 using Lagrange.Core.Common.Interface;
@@ -19,11 +18,9 @@ internal sealed class LagrangeGroupWeb(BotContext context)
     }
     private async Task<(string Key, string Cookie)> Credentials(CancellationToken token)
     {
-        var key = Encoding.UTF8.GetString(context.Keystore.WLoginSigs.SKey);
-        if (key.Length == 0) throw new InvalidOperationException("当前会话缺少 SKey，无法访问群 Web API。");
-        var keys = await context.FetchCookies("qun.qq.com").WaitAsync(token);
-        if (!keys.TryGetValue("qun.qq.com", out var pskey) || pskey.Length == 0)
-            throw new InvalidOperationException("未获取到群 Web API 的 p_skey。");
+        var tickets = LagrangeWebTickets.For(context);
+        var key = await tickets.GetSKeyAsync(token);
+        var pskey = await tickets.GetPSKeyAsync("qun.qq.com", token);
         return (key, $"uin=o{context.BotUin}; p_uin=o{context.BotUin}; skey={key}; p_skey={pskey}");
     }
     private async Task<JsonObject> Request(string url, Dictionary<string, string> values, bool post, CancellationToken token,

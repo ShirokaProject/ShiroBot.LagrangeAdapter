@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Lagrange.Core.Common.Interface;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Dashboard;
 
 namespace ShiroBot.LagrangeAdapter;
@@ -116,7 +117,14 @@ public partial class LagrangeAdapter
                 }
                 var system = new Services.LagrangeQqSystemApi(_services);
                 var friend = new Services.LagrangeQqFriendApi(_services);
+                var messaging = new Services.LagrangeQqMessageApi(_services);
+                var group = new Services.LagrangeQqGroupApi(_services);
+                await Check("login-info", async () => { await ((IQSystemApi)system).GetLoginInfoAsync(token); });
+                await Check("version-info", async () => { await ((IQSystemApi)system).GetImplInfoAsync(token); });
+                await Check("self-profile", async () => { await system.GetUserProfileAsync(_services.Context.BotUin.ToString(), token); });
                 await Check("friends", async () => { await system.GetFriendListAsync(true, token); });
+                await Check("csrf", async () => { await system.GetCsrfTokenAsync(token); });
+                await Check("cookies-qun", async () => { await system.GetCookiesAsync("qun.qq.com", token); });
                 await Check("groups", async () => { await system.GetGroupListAsync(true, token); });
                 await Check("pins", async () => { await system.GetPeerPinsAsync(token); });
                 await Check("custom-face", async () => { await system.GetCustomFaceUrlListAsync(token); });
@@ -125,8 +133,13 @@ public partial class LagrangeAdapter
                 await Check("face-catalog", async () => { await LagrangeFaceCatalog.Create(_services.Context, 300, false); });
                 if (arguments?["groupId"]?.GetValue<string>() is { Length: > 0 } groupId)
                 {
-                    var group = new Services.LagrangeQqGroupApi(_services);
                     var files = new Services.LagrangeQqFileApi(_services);
+                    await Check("group-info", async () => { await group.GetGroupInfoAsync(groupId, false, token); });
+                    await Check("self-member-info", async () => { await group.GetGroupMemberInfoAsync(groupId, _services.Context.BotUin.ToString(), false, token); });
+                    await Check("group-notifications", async () => { await group.GetNotificationsAsync(limit: 5, cancellationToken: token); });
+                    await Check("filtered-group-notifications", async () => { await group.GetNotificationsAsync(isFiltered: true, limit: 5, cancellationToken: token); });
+                    await Check("group-join-requests", async () => { await group.GetJoinRequestsAsync(groupId, limit: 5, cancellationToken: token); });
+                    await Check("group-history", async () => { await messaging.GetHistoryMessagesAsync(QMessageScene.Group, groupId, limit: 5, cancellationToken: token); });
                     await Check("group-members", async () => { await group.GetGroupMemberListAsync(groupId, true, token); });
                     await Check("group-files", async () => { await files.GetGroupFilesAsync(groupId, "/", token); });
                     await Check("group-announcements", async () => { await group.GetAnnouncementsAsync(groupId, token); });

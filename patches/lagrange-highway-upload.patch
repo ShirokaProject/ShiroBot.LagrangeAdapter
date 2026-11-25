@@ -1068,3 +1068,127 @@ index 44be011..338971a 100644
      public async Task Postprocess(BotContext context, BotMessage message)
      {
          if (string.IsNullOrEmpty(ResId)) return;
+diff --git a/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs b/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs
+index 571616f..70d7923 100644
+--- a/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs
++++ b/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs
+@@ -41,15 +41,17 @@ internal class FetchFriendsService : OidbService<FetchFriendsEventReq, FetchFrie
+ 
+         foreach (var f in response.FriendList)
+         {
+-            string nickname = f.SubBiz[1].Data[20002];
+-            string personalSign = f.SubBiz[1].Data[102];
+-            string remark = f.SubBiz[1].Data[103];
+-            string qid = f.SubBiz[1].Data[27394];
+-
+-            var friend = new BotFriend(f.Uin, nickname, f.Uid, remark, personalSign, qid, categoryMap[f.CategoryId])
++            var profile = f.SubBiz?.GetValueOrDefault(1);
++            var text = profile?.Data;
++            var numbers = profile?.NumData;
++            var category = categoryMap.GetValueOrDefault(f.CategoryId)
++                ?? new BotFriendCategory(f.CategoryId, string.Empty, 0, 0);
++            var friend = new BotFriend(f.Uin, text?.GetValueOrDefault(20002) ?? string.Empty, f.Uid,
++                text?.GetValueOrDefault(103) ?? string.Empty, text?.GetValueOrDefault(102) ?? string.Empty,
++                text?.GetValueOrDefault(27394) ?? string.Empty, category)
+             {
+-                Age = f.SubBiz[1].NumData[20037],
+-                Gender = (BotGender)f.SubBiz[1].NumData[20009]
++                Age = numbers?.GetValueOrDefault(20037) ?? 0,
++                Gender = (BotGender)(numbers?.GetValueOrDefault(20009) ?? 0)
+             };
+             friends.Add(friend);
+         }
+diff --git a/Lagrange.Proto/Serialization/Metadata/ProtoFieldInfo.cs b/Lagrange.Proto/Serialization/Metadata/ProtoFieldInfo.cs
+index ddbf7a9..1d07b3c 100644
+--- a/Lagrange.Proto/Serialization/Metadata/ProtoFieldInfo.cs
++++ b/Lagrange.Proto/Serialization/Metadata/ProtoFieldInfo.cs
+@@ -271,64 +271,36 @@ public class ProtoMapFieldInfo<TMap, TKey, TValue>(int field, WireType keyWireTy
+     {
+         Debug.Assert(_typedSet != null);
+ 
+-        var map = new TMap();
+-        int tag;
+-        
+-        while (true)
++        var entry = new ProtoReader(reader.CreateSpan(reader.DecodeVarInt<int>()));
++        TKey? key = typeof(TKey) == typeof(string) ? (TKey)(object)string.Empty : default;
++        TValue? value = typeof(TValue) == typeof(string) ? (TValue)(object)string.Empty : default;
++
++        while (!entry.IsCompleted)
+         {
+-            reader.SkipField(WireType.VarInt); // skip the length of the map
+-            
+-            TKey? key = default; bool foundKey = false;
+-            TValue? value = default; bool foundValue = false;
+-            
+-            if (NumberHandling == ProtoNumberHandling.Default && ValueNumberHandling == ProtoNumberHandling.Default)
+-            {
+-                while ((key is null || !foundKey) || (value is null || !foundValue))
+-                {
+-                    switch (reader.DecodeVarInt<byte>() >> 3)
+-                    {
+-                        case 1:
+-                            key = KeyEffectiveConverter.Read(Field, KeyWireType, ref reader);
+-                            foundKey = true;
+-                            break;
+-                        case 2:
+-                            value = ValueEffectiveConverter.Read(Field, ValueWireType, ref reader);
+-                            foundValue = true;
+-                            break;
+-                        default:
+-                            ThrowHelper.ThrowInvalidDataException_MalformedMessage();
+-                            break;
+-                    }
+-                }
+-            }
+-            else
++            var tag = entry.DecodeVarInt<uint>();
++            var wireType = (WireType)(tag & 7);
++            switch (tag >> 3)
+             {
+-                while ((key is null || !foundKey) || (value is null || !foundValue))
+-                {
+-                    switch (reader.DecodeVarInt<byte>() >> 3)
+-                    {
+-                        case 1:
+-                            key = KeyEffectiveConverter.ReadWithNumberHandling(Field, KeyWireType, ref reader, NumberHandling);
+-                            foundKey = true;
+-                            break;
+-                        case 2:
+-                            value = ValueEffectiveConverter.ReadWithNumberHandling(Field, ValueWireType, ref reader, ValueNumberHandling);
+-                            foundValue = true;
+-                            break;
+-                        default:
+-                            ThrowHelper.ThrowInvalidDataException_MalformedMessage();
+-                            break;
+-                    }
+-                }
++                case 1 when wireType == KeyWireType:
++                    key = KeyEffectiveConverter.ReadWithNumberHandling(1, wireType, ref entry, NumberHandling);
++                    break;
++                case 2 when wireType == ValueWireType:
++                    value = ValueEffectiveConverter.ReadWithNumberHandling(2, wireType, ref entry, ValueNumberHandling);
++                    break;
++                default:
++                    entry.SkipField(wireType);
++                    break;
+             }
+-            
+-            map.Add(key, value);
+-            if ((tag = reader.DecodeVarInt<int>() >> 3) != Field) break;
+         }
+ 
+-        reader.Rewind(-ProtoHelper.GetVarIntLength(ProtoHelper.GetTag(tag, WireType.VarInt)));
+-        
+-        _typedSet(target, map);
++        if (key is null || value is null) return;
++        var map = _typedGet!(target);
++        if (map is null)
++        {
++            map = new TMap();
++            _typedSet!(target, map);
++        }
++        map[key] = value;
+     }
+ 
+     public override void Write(ProtoWriter writer, object target)

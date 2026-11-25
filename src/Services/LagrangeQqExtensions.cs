@@ -663,11 +663,11 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
         cancellationToken.ThrowIfCancellationRequested();
         if (domain.Length is 0 or > 253 || domain.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '-')))
             throw new ArgumentException("Cookie 域名无效。", nameof(domain));
-        var cookies = await session.Context.FetchCookies(domain).WaitAsync(cancellationToken);
-        if (!cookies.TryGetValue(domain, out var pskey) || pskey.Length == 0)
-            throw new InvalidOperationException("服务器未返回该域名的 p_skey。");
-        var uin = session.Context.BotUin;
-        var skey = System.Text.Encoding.UTF8.GetString(session.Context.Keystore.WLoginSigs.SKey);
+        var context = session.Context;
+        var tickets = LagrangeWebTickets.For(context);
+        var pskey = await tickets.GetPSKeyAsync(domain.ToLowerInvariant(), cancellationToken);
+        var uin = context.BotUin;
+        var skey = await tickets.GetSKeyAsync(cancellationToken);
         return $"uin=o{uin}; p_uin=o{uin}; skey={skey}; p_skey={pskey}";
     }
 
@@ -719,14 +719,11 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
         await new LagrangeProtocol(session.Context).Profile((ulong)session.Context.BotUin, 102, bio, cancellationToken);
     }
 
-    public Task<string> GetCsrfTokenAsync(CancellationToken cancellationToken = default)
+    public async Task<string> GetCsrfTokenAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var key = System.Text.Encoding.UTF8.GetString(session.Context.Keystore.WLoginSigs.SKey);
-        if (key.Length == 0) throw new InvalidOperationException("当前会话缺少 SKey，请刷新登录凭据。");
-        uint value = 5381;
-        foreach (var ch in key) value = unchecked(value * 33 + ch);
-        return Task.FromResult((value & 0x7fffffff).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var key = await LagrangeWebTickets.For(session.Context).GetSKeyAsync(cancellationToken);
+        return LagrangeGroupWeb.Csrf(key);
     }
 
     public async Task<IReadOnlyList<string>> GetCustomFaceUrlListAsync(CancellationToken cancellationToken = default)

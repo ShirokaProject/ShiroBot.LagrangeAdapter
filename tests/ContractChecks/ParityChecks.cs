@@ -15,6 +15,7 @@ internal static class ParityChecks
     internal static async Task Run()
     {
         ReaderBoundsChecks();
+        MapEntryBoundsChecks();
         WriterBoundsChecks();
         await ForwardMediaPreparationChecks();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
@@ -195,6 +196,36 @@ internal static class ParityChecks
             catch (InvalidDataException) { }
         }
         Console.WriteLine("Bounded protobuf tail/skip, signed int32, overflowing lengths and 20,000 malformed-input checks passed.");
+    }
+
+    private static void MapEntryBoundsChecks()
+    {
+        // Each call starts at the declared entry length, as it does in generated code.
+        var field = new Lagrange.Proto.Serialization.Metadata.ProtoMapFieldInfo<Dictionary<int, int>, int, int>(
+            1, Lagrange.Proto.Serialization.WireType.VarInt, Lagrange.Proto.Serialization.WireType.VarInt,
+            typeof(MapFixture))
+        {
+            Get = obj => ((MapFixture)obj).Entries!,
+            Set = (obj, value) => ((MapFixture)obj).Entries = value
+        };
+        var target = new MapFixture();
+        var first = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString("050801180310"));
+        // A truncated value must stay inside the entry, even when the container has more data.
+        try { field.Read(ref first, target); throw new Exception("Truncated map value accepted."); }
+        catch (InvalidDataException) { }
+        var last = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString("06080118031002"));
+        field.Read(ref last, target);
+        if (!last.IsCompleted || target.Entries![1] != 2) throw new Exception("Map at end of parent message failed.");
+        var repeated = new Lagrange.Proto.Primitives.ProtoReader(Convert.FromHexString("04080110030408021004"));
+        field.Read(ref repeated, target);
+        field.Read(ref repeated, target);
+        if (!repeated.IsCompleted || target.Entries[1] != 3 || target.Entries[2] != 4)
+            throw new Exception("Map entries were not merged with last-key-wins semantics.");
+    }
+
+    private sealed class MapFixture
+    {
+        public Dictionary<int, int>? Entries { get; set; }
     }
 
     private static void WriterBoundsChecks()
