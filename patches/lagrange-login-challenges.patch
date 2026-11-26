@@ -1849,3 +1849,28 @@ index d5c8661e..41712200 100644
      public async Task<BotMessage> SendGroupMessage(long groupUin, MessageChain chain)
      {
          var (group, self) = await context.CacheContext.ResolveMember(groupUin, context.BotUin) ?? throw new InvalidTargetException(context.BotUin, groupUin);
+diff --git a/Lagrange.Core/Message/Entities/LightAppEntity.cs b/Lagrange.Core/Message/Entities/LightAppEntity.cs
+index 5315e78c..6b85f242 100644
+--- a/Lagrange.Core/Message/Entities/LightAppEntity.cs
++++ b/Lagrange.Core/Message/Entities/LightAppEntity.cs
+@@ -3,3 +3,2 @@ using System.Text.Json.Nodes;
+ using Lagrange.Core.Internal.Packets.Message;
+-using Lagrange.Core.Utility.Binary;
+ using Lagrange.Core.Utility.Compression;
+@@ -25,5 +24,3 @@ public class LightAppEntity : IMessageEntity
+     {
+-        using var payload = new BinaryPacket();
+-        payload.Write<byte>(0x01);
+-        payload.Write(ZCompression.ZCompress(Encoding.UTF8.GetBytes(Payload)));
++        var payload = ZCompression.ZCompress(Payload, [0x01]);
+
+@@ -35,3 +32,3 @@ public class LightAppEntity : IMessageEntity
+                 {
+-                    BytesData = payload.ToArray()
++                    BytesData = payload
+                 }
+@@ -66,2 +63,2 @@ public class LightAppEntity : IMessageEntity
+     }
+-}
+\ No newline at end of file
++}

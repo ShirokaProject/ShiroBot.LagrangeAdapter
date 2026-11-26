@@ -17,6 +17,7 @@ internal static class ParityChecks
         ReaderBoundsChecks();
         MapEntryBoundsChecks();
         WriterBoundsChecks();
+        LightAppEncodingCheck();
         await ForwardMediaPreparationChecks();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
@@ -284,6 +285,21 @@ internal static class ParityChecks
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(wrapped.AsSpan(5), (ushort)inner.Length);inner.CopyTo(wrapped, 7);
         if ((await LagrangeNoticeMapper.Map(new BotExtendedNoticeEvent(732, 16, 0, wrapped), "999", Resolve))?.Raw is not QGroupNameChange { NewGroupName: "name", OperatorId: "456" }) throw new Exception("Wrapped group notice mapping failed.");
     }
+    private static void LightAppEncodingCheck()
+    {
+        const string payload = """{"app":"com.tencent.music.lua","view":"music","meta":{"music":{"title":"开不了口"}}}""";
+        var entity = new LightAppEntity(payload);
+        var build = typeof(IMessageEntity).GetMethod("Build", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var elements = (Array)build.Invoke(entity, null)!;
+        var element = elements.GetValue(0)!;
+        var lightApp = element.GetType().GetProperty("LightAppElem")!.GetValue(element)!;
+        var bytes = (ReadOnlyMemory<byte>)lightApp.GetType().GetProperty("BytesData")!.GetValue(lightApp)!;
+        if (bytes.Span[0] != 1) throw new Exception("LightApp compression marker is missing.");
+        var decoded = Lagrange.Core.Utility.Compression.ZCompression.ZDecompress(bytes.Span[1..]);
+        if (System.Text.Encoding.UTF8.GetString(decoded) != payload)
+            throw new Exception("LightApp encoding changed the card JSON.");
+    }
+
     private static void Equal(byte[] actual, string expected)
     {
         if (!actual.SequenceEqual(Convert.FromHexString(expected))) throw new Exception($"Wire fixture mismatch: {Convert.ToHexString(actual)} != {expected}");
