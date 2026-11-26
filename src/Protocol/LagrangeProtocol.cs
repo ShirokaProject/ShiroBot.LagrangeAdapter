@@ -35,6 +35,20 @@ internal sealed class LagrangeProtocol
     }
     internal Task<List<ProtoWire.Field>> Like(string uid, int count, CancellationToken token) =>
         Oidb(0x7e5, 104, new ProtoWire().Text(11, uid).UInt(12, 71).UInt(13, checked((ulong)count)), token);
+
+    internal static async Task<string> ResolveLikeTargetUid(BotContext context, long uin, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (uin == context.BotUin && !string.IsNullOrEmpty(context.Keystore.Uid)) return context.Keystore.Uid;
+        if (context.GetCachedContactUid(uin) is { Length: > 0 } cachedUid) return cachedUid;
+
+        // The stranger profile API does not provide a UID. Refresh the friend list on a cache miss.
+        await context.FetchFriends(refresh: true).WaitAsync(token);
+        return context.GetCachedContactUid(uin) is { Length: > 0 } uid
+            ? uid
+            : throw new InvalidOperationException($"无法解析 QQ {uin} 的 UID，请确认目标是好友或已缓存的群成员。");
+    }
+
     internal Task<List<ProtoWire.Field>> DeleteFriend(string uid, CancellationToken token) =>
         Oidb(0x126b, 0, new ProtoWire().Message(1, new ProtoWire().Text(1, uid).Message(2,
             new ProtoWire().UInt(1, 130).UInt(2, 109).Message(3, new ProtoWire().UInt(1, 8).UInt(2, 8).UInt(3, 50)))), token);

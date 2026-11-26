@@ -1,21 +1,55 @@
 diff --git a/Lagrange.Core/BotContext.cs b/Lagrange.Core/BotContext.cs
-index ed40abc..b5de279 100644
+index ed40abc..642ce34 100644
 --- a/Lagrange.Core/BotContext.cs
 +++ b/Lagrange.Core/BotContext.cs
-@@ -95,6 +95,8 @@ public class BotContext : IDisposable
+@@ -6,8 +6,11 @@ using Lagrange.Core.Internal.Context;
  
-     public void Dispose()
+ namespace Lagrange.Core;
+ 
+-public class BotContext : IDisposable
++public class BotContext : IDisposable, IAsyncDisposable
+ {
++    private readonly object _disposeGate = new();
++    private Task? _disposeTask;
++
+     internal BotContext(BotConfig config, BotKeystore keystore, BotAppInfo appInfo)
      {
-+        HighwayContext.Dispose();
-+        FlashTransferContext.Dispose();
-         EventInvoker.Dispose();
-         SocketContext.Dispose();
-         EventContext.Dispose();
+         Config = config;
+@@ -93,10 +96,25 @@ public class BotContext : IDisposable
+ 
+     #endregion
+ 
+-    public void Dispose()
++    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
++
++    public ValueTask DisposeAsync()
++    {
++        lock (_disposeGate)
++            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
++    }
++
++    private async Task DisposeCoreAsync()
+     {
+-        EventInvoker.Dispose();
+-        SocketContext.Dispose();
+-        EventContext.Dispose();
++        try
++        {
++            await Task.WhenAll(HighwayContext.StopAsync(), FlashTransferContext.StopAsync()).ConfigureAwait(false);
++        }
++        finally
++        {
++            EventInvoker.Dispose();
++            SocketContext.Dispose();
++            EventContext.Dispose();
++        }
+     }
+ }
 diff --git a/Lagrange.Core/Internal/Context/FlashTransferContext.cs b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
-index f9d248a..42b4620 100644
+index f9d248a..ac6a27a 100644
 --- a/Lagrange.Core/Internal/Context/FlashTransferContext.cs
 +++ b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
-@@ -1,113 +1,157 @@
+@@ -1,113 +1,164 @@
 -﻿using System.Security.Cryptography;
 +using System.Buffers;
 +using System.Net;
@@ -41,6 +75,7 @@ index f9d248a..42b4620 100644
 -    private const uint ChunkSize = 1024 * 1024;
 +    private readonly Uri _endpoint;
 +    private readonly SemaphoreSlim _uploads;
++    private readonly UploadLifetime _lifetime = new();
  
 -    internal FlashTransferContext(BotContext botContext)
 +    internal FlashTransferContext(BotContext context)
@@ -67,7 +102,11 @@ index f9d248a..42b4620 100644
 +        _uploads = new SemaphoreSlim(concurrent, concurrent);
      }
  
-     public async Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream)
+-    public async Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream)
++    public Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream) =>
++        _lifetime.RunAsync(token => UploadFileAsync(uKey, appId, bodyStream, token));
++
++    private async Task<bool> UploadFileAsync(string uKey, uint appId, Stream bodyStream, CancellationToken stopping)
      {
 -        var sha1StateVs = new FlashTransferSha1StateV { State = [] };
 -        var chunkCount = (uint)((bodyStream.Length + ChunkSize - 1) / ChunkSize);
@@ -78,9 +117,10 @@ index f9d248a..42b4620 100644
  
 -        var sha1Stream = new Sha1Stream();
 -        for (uint i = 0; i < chunkCount; i++)
-+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(20));
++        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stopping);
++        timeout.CancelAfter(TimeSpan.FromMinutes(20));
 +        var token = timeout.Token;
-+        await _uploads.WaitAsync(token);
++        await _uploads.WaitAsync(token).ConfigureAwait(false);
 +        try
          {
 -            if (i != chunkCount - 1)
@@ -99,7 +139,7 @@ index f9d248a..42b4620 100644
 -                sha1Stream.Hash(digest, false);
 -                sha1Stream.Reset();
 -                sha1StateVs.State.Add(digest.ToArray());
-+                var states = await BuildSha1StatesAsync(bodyStream, fileSize, buffer, token);
++                var states = await BuildSha1StatesAsync(bodyStream, fileSize, buffer, token).ConfigureAwait(false);
 +                var writer = new ArrayBufferWriter<byte>(ChunkSize);
 +                var body = new FlashTransferUploadBody { FieId1 = [], UKey = uKey, Sha1StateV = states };
 +                var request = new FlashTransferUploadReq { AppId = appId, FileId3 = 2, Body = body };
@@ -107,14 +147,14 @@ index f9d248a..42b4620 100644
 +                {
 +                    int length = (int)Math.Min(ChunkSize, fileSize - offset);
 +                    var chunk = buffer.AsMemory(0, length);
-+                    await bodyStream.ReadExactlyAsync(chunk, token);
++                    await bodyStream.ReadExactlyAsync(chunk, token).ConfigureAwait(false);
 +                    body.Start = checked((uint)offset);
 +                    body.End = checked((uint)(offset + length - 1));
 +                    body.Sha1 = SHA1.HashData(chunk.Span);
 +                    body.Body = chunk;
 +                    writer.ResetWrittenCount();
 +                    ProtoSerializer.SerializeProtoPackable(writer, request);
-+                    if (!await UploadChunkAsync(appId, offset, writer.WrittenMemory, token))
++                    if (!await UploadChunkAsync(appId, offset, writer.WrittenMemory, token).ConfigureAwait(false))
 +                        return false;
 +                    offset += length;
 +                }
@@ -171,7 +211,7 @@ index f9d248a..42b4620 100644
 -                Sha1StateV = chunkSha1S,
 -                Body = body
 +                int length = (int)Math.Min(ChunkSize, remaining);
-+                await stream.ReadExactlyAsync(buffer.AsMemory(0, length), token);
++                await stream.ReadExactlyAsync(buffer.AsMemory(0, length), token).ConfigureAwait(false);
 +                sha1.Update(buffer, length);
 +                remaining -= length;
 +
@@ -220,9 +260,9 @@ index f9d248a..42b4620 100644
 +                request.Headers.Accept.ParseAdd("*/*");
 +                request.Headers.ExpectContinue = true;
 +                request.Headers.ConnectionClose = attempt > 1;
-+                using var response = await _client.SendAsync(request, token);
++                using var response = await _client.SendAsync(request, token).ConfigureAwait(false);
 +                response.EnsureSuccessStatusCode();
-+                var bytes = await response.Content.ReadAsByteArrayAsync(token);
++                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
 +                var status = ProtoHelper.Deserialize<FlashTransferUploadResp>(bytes).Status;
 +                if (status == "success") return true;
  
@@ -243,20 +283,22 @@ index f9d248a..42b4620 100644
 +                        ex, appId, offset, attempt);
 +                    return false;
 +                }
-+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token);
++                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token).ConfigureAwait(false);
 +            }
 +        }
      }
 -}
 \ No newline at end of file
 +
-+    public void Dispose() => _client.Dispose();
++    internal Task StopAsync() => _lifetime.StopAsync(_client.Dispose);
++
++    public void Dispose() => StopAsync().GetAwaiter().GetResult();
 +}
 diff --git a/Lagrange.Core/Internal/Context/HighwayContext.cs b/Lagrange.Core/Internal/Context/HighwayContext.cs
-index a1c8240..59e26c0 100644
+index a1c8240..e183b89 100644
 --- a/Lagrange.Core/Internal/Context/HighwayContext.cs
 +++ b/Lagrange.Core/Internal/Context/HighwayContext.cs
-@@ -1,182 +1,225 @@
+@@ -1,182 +1,226 @@
  using System.Buffers;
  using System.Buffers.Binary;
 +using System.Net;
@@ -295,7 +337,7 @@ index a1c8240..59e26c0 100644
 +    private readonly SemaphoreSlim _uploads;
 +    private readonly SemaphoreSlim _sessionLock = new(1);
      private int _sequence;
-+    private volatile bool _disposed;
++    private readonly UploadLifetime _lifetime = new();
 +    private (byte[] Ticket, string Url, DateTimeOffset Expires)? _session;
  
 -    private (byte[], DateTime)? _ticket;
@@ -305,11 +347,7 @@ index a1c8240..59e26c0 100644
      public HighwayContext(BotContext context)
      {
          _context = context;
-+        _chunkSize = checked((int)context.Config.HighwayChunkSize);
-+        var concurrent = checked((int)context.Config.HighwayConcurrent);
-+        _uploads = new SemaphoreSlim(concurrent, concurrent);
-+    }
- 
+-
 -        _client = new HttpClient(new HttpClientHandler { ServerCertificateCustomValidationCallback = (_, _, _, _) => true });
 -        _client.DefaultRequestHeaders.Add("Accept-Encoding", "identity");
 -        _client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
@@ -317,93 +355,52 @@ index a1c8240..59e26c0 100644
 -        _sequence = 0;
 -        _chunkSize = context.Config.HighwayChunkSize;
 -        _concurrent = (int)context.Config.HighwayConcurrent;
-+    public async Task UploadRequiredAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
-+    {
-+        if (!await UploadFile(stream, commandId, extendInfo))
-+            throw new OperationException(-1, $"Highway upload failed (command {commandId})");
++        _chunkSize = checked((int)context.Config.HighwayChunkSize);
++        var concurrent = checked((int)context.Config.HighwayConcurrent);
++        _uploads = new SemaphoreSlim(concurrent, concurrent);
      }
  
-     public async Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
+-    public async Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
++    public async Task UploadRequiredAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
      {
 -        if (_ticket == null || _url == null || DateTime.Now - _ticket.Value.Item2 > TimeSpan.FromDays(0.5))
-+        // Keep offsets ordered within each file and bound concurrent files per bot.
-+        await _uploads.WaitAsync();
-+        try
-         {
+-        {
 -            var resp = await _context.EventContext.SendEvent<HighwaySessionEventResp>(new HighwaySessionEventReq());
 -            _ticket = (resp.SigSession, DateTime.Now);
 -            _url = resp.HighwayUrls[1][0];
-+            ObjectDisposedException.ThrowIf(_disposed, this);
-+            var (ticket, url, _) = await GetSessionAsync();
-+            var fileSize = stream.Length;
-+            stream.Position = 0;
-+            var fileMd5 = await MD5.HashDataAsync(stream);
-+            stream.Position = 0;
-+
-+            var payload = ArrayPool<byte>.Shared.Rent(_chunkSize);
-+            try
-+            {
-+                for (long offset = 0; offset < fileSize;)
-+                {
-+                    var length = (int)Math.Min(_chunkSize, fileSize - offset);
-+                    var block = payload.AsMemory(0, length);
-+                    await stream.ReadExactlyAsync(block);
-+                    if (!await SendBlockAsync(url, ticket, commandId, extendInfo, fileMd5, fileSize, offset, block))
-+                        return false;
-+                    offset += length;
-+                }
-+                return true;
-+            }
-+            finally
-+            {
-+                ArrayPool<byte>.Shared.Return(payload);
-+            }
-         }
-+        finally
-+        {
-+            _uploads.Release();
-+        }
+-        }
++        if (!await UploadFile(stream, commandId, extendInfo).ConfigureAwait(false))
++            throw new OperationException(-1, $"Highway upload failed (command {commandId})");
 +    }
  
 -        var tasks = new List<Task<bool>>();
 -        bool result = true;
-+    private async Task<(byte[] Ticket, string Url, DateTimeOffset Expires)> GetSessionAsync()
-+    {
-+        await _sessionLock.WaitAsync();
-+        try
-+        {
-+            if (_session is { } session && session.Expires > DateTimeOffset.UtcNow)
-+                return session;
-+
-+            var response = await _context.EventContext.SendEvent<HighwaySessionEventResp>(new HighwaySessionEventReq());
-+            if (!response.HighwayUrls.TryGetValue(1, out var urls) || urls.Count == 0)
-+                throw new OperationException(-1, "Highway session returned no upload endpoint");
++    public Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo) =>
++        _lifetime.RunAsync(token => UploadFileAsync(stream, commandId, extendInfo, token));
  
 -        ulong fileSize = (ulong)stream.Length;
 -        ulong offset = 0;
 -        var fileMd5 = stream.Md5();
 -        while (offset < fileSize)
-+            session = (response.SigSession, urls[0], DateTimeOffset.UtcNow.AddHours(12));
-+            _session = session;
-+            return session;
-+        }
-+        finally
++    private async Task<bool> UploadFileAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo, CancellationToken token)
++    {
++        // Keep offsets ordered within each file and bound concurrent files per bot.
++        await _uploads.WaitAsync(token).ConfigureAwait(false);
++        try
          {
 -            var buffer = ArrayPool<byte>.Shared.Rent((int)_chunkSize);
 -            ulong payload = (ulong)await stream.ReadAsync(buffer.AsMemory(0, (int)_chunkSize));
-+            _sessionLock.Release();
-+        }
-+    }
- 
+-
 -            ulong currentBlockOffset = offset;
 -            var task = Task.Run(async () => // closure
-+    private async Task<bool> SendBlockAsync(string url, byte[] ticket, int commandId, ReadOnlyMemory<byte> extendInfo,
-+        byte[] fileMd5, long fileSize, long offset, ReadOnlyMemory<byte> block)
-+    {
-+        var appId = (uint)_context.AppInfo.AppId;
-+        var header = ProtoHelper.Serialize(new ReqDataHighwayHead
-+        {
-+            MsgBaseHead = new DataHighwayHead
++            var (ticket, url, _) = await GetSessionAsync(token).ConfigureAwait(false);
++            var fileSize = stream.Length;
++            stream.Position = 0;
++            var fileMd5 = await MD5.HashDataAsync(stream, token).ConfigureAwait(false);
++            stream.Position = 0;
++
++            var payload = ArrayPool<byte>.Shared.Rent(_chunkSize);
++            try
              {
 -                var bufferSpan = buffer.AsSpan(0, (int)payload);
 -                int sequence = GetNewSequence();
@@ -428,6 +425,112 @@ index a1c8240..59e26c0 100644
 -                    FileMd5 = fileMd5,
 -                };
 -                var loginHead = new LoginSigHead
+-                {
+-                    Uint32LoginSigType = 8,
+-                    BytesLoginSig = _context.Keystore.WLoginSigs.A2,
+-                    AppId = (uint)_context.AppInfo.AppId
+-                };
+-                var highwayHead = new ReqDataHighwayHead
++                for (long offset = 0; offset < fileSize;)
+                 {
+-                    MsgBaseHead = head,
+-                    MsgSegHead = segHead,
+-                    BytesReqExtendInfo = extendInfo,
+-                    Timestamp = 0,
+-                    MsgLoginSigHead = loginHead
+-                };
+-                var headProto = ProtoHelper.Serialize(highwayHead);
++                    var length = (int)Math.Min(_chunkSize, fileSize - offset);
++                    var block = payload.AsMemory(0, length);
++                    await stream.ReadExactlyAsync(block, token).ConfigureAwait(false);
++                    if (!await SendBlockAsync(url, ticket, commandId, extendInfo, fileMd5, fileSize, offset, block, token).ConfigureAwait(false))
++                        return false;
++                    offset += length;
++                }
++                return true;
++            }
++            finally
++            {
++                ArrayPool<byte>.Shared.Return(payload);
++            }
++        }
++        finally
++        {
++            _uploads.Release();
++        }
++    }
+ 
+-                bool end = currentBlockOffset + payload >= fileSize;
+-                var upload = ArrayPool<byte>.Shared.Rent(1 + 1 + 4 + 4 + headProto.Length + (int)payload);
+-                var memory = upload.AsMemory(0, 1 + 1 + 4 + 4 + headProto.Length + (int)payload);
++    private async Task<(byte[] Ticket, string Url, DateTimeOffset Expires)> GetSessionAsync(CancellationToken token)
++    {
++        await _sessionLock.WaitAsync(token).ConfigureAwait(false);
++        try
++        {
++            if (_session is { } session && session.Expires > DateTimeOffset.UtcNow)
++                return session;
+ 
+-                memory.Span[0] = 0x28;
+-                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[1..], (uint)headProto.Length);
+-                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[5..], (uint)payload);
+-                headProto.Span.CopyTo(memory.Span[9..]);
+-                bufferSpan.CopyTo(memory.Span[(9 + headProto.Length)..]);
+-                memory.Span[^1] = 0x29;
++            var response = await _context.EventContext.SendEvent<HighwaySessionEventResp>(new HighwaySessionEventReq())
++                .AsTask().WaitAsync(token).ConfigureAwait(false);
++            if (!response.HighwayUrls.TryGetValue(1, out var urls) || urls.Count == 0)
++                throw new OperationException(-1, "Highway session returned no upload endpoint");
+ 
+-                var request = new HttpRequestMessage(HttpMethod.Post, $"http://{_url}")
+-                {
+-                    Content = new ReadOnlyMemoryContent(memory), Headers = { { "Connection", end ? "close" : "keep-alive" } }
+-                };
++            session = (response.SigSession, urls[0], DateTimeOffset.UtcNow.AddHours(12));
++            _session = session;
++            return session;
++        }
++        finally
++        {
++            _sessionLock.Release();
++        }
++    }
+ 
+-                try
+-                {
+-                    var response = await _client.SendAsync(request);
+-                    var reader = new BinaryPacket((await response.Content.ReadAsByteArrayAsync()).AsSpan());
+-
+-                    if (reader.Read<byte>() == 0x28)
+-                    {
+-                        int headLen = reader.Read<int>();
+-                        int bodyLen = reader.Read<int>();
+-                        var respHead = reader.CreateSpan(headLen);
+-                        var body = GC.AllocateUninitializedArray<byte>(bodyLen);
+-                        reader.ReadBytes(body.AsSpan());
+-
+-                        if (reader.Read<byte>() == 0x29)
+-                        {
+-                            var obj = ProtoHelper.Deserialize<RespDataHighwayHead>(respHead);
+-                            _context.LogDebug(Tag, "Highway Block Result: {0} | {1} | {2}", obj.ErrorCode, obj.MsgSegHead?.RetCode, Convert.ToHexString(body));
+-                            return obj.ErrorCode == 0;
+-                        }
+-                    }
+-                }
+-                catch (Exception e)
+-                {
+-                    _context.LogError(Tag, "Highway HTTP error: {0}", e, e.Message);
+-                    if (e.StackTrace is { } stack) _context.LogDebug(Tag, stack);
+-                }
+-                finally
++    private async Task<bool> SendBlockAsync(string url, byte[] ticket, int commandId, ReadOnlyMemory<byte> extendInfo,
++        byte[] fileMd5, long fileSize, long offset, ReadOnlyMemory<byte> block, CancellationToken token)
++    {
++        var appId = (uint)_context.AppInfo.AppId;
++        var header = ProtoHelper.Serialize(new ReqDataHighwayHead
++        {
++            MsgBaseHead = new DataHighwayHead
++            {
 +                Version = 1,
 +                Uin = _context.Keystore.Uin.ToString(),
 +                Command = "PicUp.DataUp",
@@ -461,151 +564,93 @@ index a1c8240..59e26c0 100644
 +
 +        for (var attempt = 1; ; attempt++)
 +        {
-+            ObjectDisposedException.ThrowIf(_disposed, this);
++            token.ThrowIfCancellationRequested();
 +            try
 +            {
 +                using var request = new HttpRequestMessage(HttpMethod.Post, $"http://{url}")
                  {
--                    Uint32LoginSigType = 8,
--                    BytesLoginSig = _context.Keystore.WLoginSigs.A2,
--                    AppId = (uint)_context.AppInfo.AppId
+-                    ArrayPool<byte>.Shared.Return(buffer);
+-                    ArrayPool<byte>.Shared.Return(upload);
+-                    request.Dispose();
+-                    new ReadOnlyMemoryContent(memory).Dispose();
+-                }
+-
 +                    Content = new BlockContent(prefix, block)
-                 };
--                var highwayHead = new ReqDataHighwayHead
++                };
 +                request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
 +                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
 +                request.Headers.ConnectionClose = attempt > 1 || offset + block.Length == fileSize;
-+                using var response = await _client.SendAsync(request);
++                using var response = await _client.SendAsync(request, token).ConfigureAwait(false);
 +                response.EnsureSuccessStatusCode();
-+                var bytes = await response.Content.ReadAsByteArrayAsync();
++                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
 +                var result = ParseResponse(bytes);
 +                var segmentCode = result.MsgSegHead?.RetCode ?? 0;
 +                if (result.ErrorCode == 0 && segmentCode == 0) return true;
 +
 +                _context.LogWarning(Tag, "Highway rejected command {0} at offset {1}: {2}/{3}",
 +                    null, commandId, offset, result.ErrorCode, segmentCode);
-+                return false;
-+            }
-+            catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException)
-+            {
-+                if (_disposed) throw new ObjectDisposedException(nameof(HighwayContext));
-+                var transient = ex is OperationCanceledException or HttpIOException ||
-+                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
-+                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
-+                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
-+                if (!transient || attempt == Attempts)
-                 {
--                    MsgBaseHead = head,
--                    MsgSegHead = segHead,
--                    BytesReqExtendInfo = extendInfo,
--                    Timestamp = 0,
--                    MsgLoginSigHead = loginHead
--                };
--                var headProto = ProtoHelper.Serialize(highwayHead);
--
--                bool end = currentBlockOffset + payload >= fileSize;
--                var upload = ArrayPool<byte>.Shared.Rent(1 + 1 + 4 + 4 + headProto.Length + (int)payload);
--                var memory = upload.AsMemory(0, 1 + 1 + 4 + 4 + headProto.Length + (int)payload);
--
--                memory.Span[0] = 0x28;
--                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[1..], (uint)headProto.Length);
--                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[5..], (uint)payload);
--                headProto.Span.CopyTo(memory.Span[9..]);
--                bufferSpan.CopyTo(memory.Span[(9 + headProto.Length)..]);
--                memory.Span[^1] = 0x29;
-+                    _context.LogError(Tag, "Highway request failed for command {0} at offset {1} after {2} attempt(s)",
-+                        ex, commandId, offset, attempt);
-+                    return false;
-+                }
-+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt));
-+            }
-+        }
-+    }
- 
--                var request = new HttpRequestMessage(HttpMethod.Post, $"http://{_url}")
--                {
--                    Content = new ReadOnlyMemoryContent(memory), Headers = { { "Connection", end ? "close" : "keep-alive" } }
--                };
-+    private sealed class BlockContent(byte[] prefix, ReadOnlyMemory<byte> block) : HttpContent
-+    {
-+        private static readonly byte[] Suffix = [0x29];
- 
--                try
--                {
--                    var response = await _client.SendAsync(request);
--                    var reader = new BinaryPacket((await response.Content.ReadAsByteArrayAsync()).AsSpan());
--
--                    if (reader.Read<byte>() == 0x28)
--                    {
--                        int headLen = reader.Read<int>();
--                        int bodyLen = reader.Read<int>();
--                        var respHead = reader.CreateSpan(headLen);
--                        var body = GC.AllocateUninitializedArray<byte>(bodyLen);
--                        reader.ReadBytes(body.AsSpan());
--
--                        if (reader.Read<byte>() == 0x29)
--                        {
--                            var obj = ProtoHelper.Deserialize<RespDataHighwayHead>(respHead);
--                            _context.LogDebug(Tag, "Highway Block Result: {0} | {1} | {2}", obj.ErrorCode, obj.MsgSegHead?.RetCode, Convert.ToHexString(body));
--                            return obj.ErrorCode == 0;
--                        }
--                    }
--                }
--                catch (Exception e)
--                {
--                    _context.LogError(Tag, "Highway HTTP error: {0}", e, e.Message);
--                    if (e.StackTrace is { } stack) _context.LogDebug(Tag, stack);
--                }
--                finally
--                {
--                    ArrayPool<byte>.Shared.Return(buffer);
--                    ArrayPool<byte>.Shared.Return(upload);
--                    request.Dispose();
--                    new ReadOnlyMemoryContent(memory).Dispose();
--                }
-+        protected override bool TryComputeLength(out long length)
-+        {
-+            length = (long)prefix.Length + block.Length + Suffix.Length;
-+            return true;
-+        }
- 
--                return false;
+                 return false;
 -            });
 -            offset += payload;
-+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
-+            SerializeToStreamAsync(stream, context, CancellationToken.None);
- 
+-
 -            tasks.Add(task);
 -            if (tasks.Count == (_concurrent))
 -            {
 -                var successBlocks = await Task.WhenAll(tasks);
 -                foreach (bool t in successBlocks) result &= t;
 -                tasks.Clear();
--            }
+             }
 -            
 -            if (tasks.Count != 0)
--            {
++            catch (Exception ex) when (!token.IsCancellationRequested &&
++                (ex is HttpRequestException or IOException or OperationCanceledException))
+             {
 -                var finalBlocks = await Task.WhenAll(tasks);
 -                foreach (bool t in finalBlocks) result &= t;
 -                tasks.Clear();
--            }
++                var transient = ex is OperationCanceledException or HttpIOException ||
++                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
++                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
++                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
++                if (!transient || attempt == Attempts)
++                {
++                    _context.LogError(Tag, "Highway request failed for command {0} at offset {1} after {2} attempt(s)",
++                        ex, commandId, offset, attempt);
++                    return false;
++                }
++                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token).ConfigureAwait(false);
+             }
+         }
++    }
++
++    private sealed class BlockContent(byte[] prefix, ReadOnlyMemory<byte> block) : HttpContent
++    {
++        private static readonly byte[] Suffix = [0x29];
++
++        protected override bool TryComputeLength(out long length)
++        {
++            length = (long)prefix.Length + block.Length + Suffix.Length;
++            return true;
++        }
++
++        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
++            SerializeToStreamAsync(stream, context, CancellationToken.None);
+ 
+-        return result;
 +        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context,
 +            CancellationToken cancellationToken)
 +        {
 +            await stream.WriteAsync(prefix, cancellationToken);
 +            await stream.WriteAsync(block, cancellationToken);
 +            await stream.WriteAsync(Suffix, cancellationToken);
-         }
-+    }
- 
--        return result;
-+    public void Dispose()
-+    {
-+        _disposed = true;
-+        _client.Dispose();
++        }
      }
  
 -    private int GetNewSequence()
++    public Task StopAsync() => _lifetime.StopAsync(_client.Dispose);
++
++    public void Dispose() => StopAsync().GetAwaiter().GetResult();
++
 +    private static RespDataHighwayHead ParseResponse(ReadOnlySpan<byte> frame)
      {
 -        Interlocked.CompareExchange(ref _sequence, 0, 100000);
@@ -1282,3 +1327,63 @@ index ddbf7a9..1d07b3c 100644
      }
  
      public override void Write(ProtoWriter writer, object target)
+diff --git a/Lagrange.Core/Internal/Context/UploadLifetime.cs b/Lagrange.Core/Internal/Context/UploadLifetime.cs
+new file mode 100644
+index 0000000..9f5fcba
+--- /dev/null
++++ b/Lagrange.Core/Internal/Context/UploadLifetime.cs
+@@ -0,0 +1,54 @@
++namespace Lagrange.Core.Internal.Context;
++
++internal sealed class UploadLifetime
++{
++    private readonly object _gate = new();
++    private readonly CancellationTokenSource _stopping = new();
++    private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
++    private int _active;
++    private Task? _stopTask;
++
++    public async Task<bool> RunAsync(Func<CancellationToken, Task<bool>> upload)
++    {
++        lock (_gate)
++        {
++            if (_stopTask is not null)
++                throw new OperationCanceledException("Media upload cancelled because the QQ session is closing.");
++            _active++;
++        }
++
++        try
++        {
++            return await upload(_stopping.Token).ConfigureAwait(false);
++        }
++        finally
++        {
++            lock (_gate)
++            {
++                if (--_active == 0 && _stopTask is not null)
++                    _drained.TrySetResult();
++            }
++        }
++    }
++
++    public Task StopAsync(Action dispose)
++    {
++        lock (_gate)
++            return _stopTask ??= StopCoreAsync(dispose);
++    }
++
++    private async Task StopCoreAsync(Action dispose)
++    {
++        if (_active == 0) _drained.TrySetResult();
++        try
++        {
++            await _stopping.CancelAsync().ConfigureAwait(false);
++        }
++        finally
++        {
++            await _drained.Task.ConfigureAwait(false);
++            _stopping.Dispose();
++            dispose();
++        }
++    }
++}

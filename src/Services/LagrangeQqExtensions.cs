@@ -62,8 +62,9 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (count is < 1 or > 20) throw new ArgumentOutOfRangeException(nameof(count));
-        var uid = await LagrangeProtocol.Uid(session.Context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
-        await new LagrangeProtocol(session.Context).Like(uid, count, cancellationToken);
+        var context = session.Context;
+        var uid = await LagrangeProtocol.ResolveLikeTargetUid(context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
+        await new LagrangeProtocol(context).Like(uid, count, cancellationToken);
     }
 
     public async Task DeleteFriendAsync(string userId, CancellationToken cancellationToken = default)
@@ -755,18 +756,19 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var context = session.Context;
         var chain = new Lagrange.Core.Message.MessageChain();
         foreach (var segment in segments)
         {
             await LagrangeMapper.AppendQqSegmentAsync(chain, segment,
                 id => session.ResolveMessageAsync(id, LagrangeMapper.ParseId(peerId, "peerId"),
-                    scene == QMessageScene.Group, cancellationToken), session.Context).ConfigureAwait(false);
+                    scene == QMessageScene.Group, cancellationToken), context).ConfigureAwait(false);
         }
 
         var sent = scene == QMessageScene.Group
-            ? await session.Context.SendGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
+            ? await context.SendGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
                 .ConfigureAwait(false)
-            : await session.Context.SendFriendMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
+            : await context.SendFriendMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
                 .ConfigureAwait(false);
 
         session.CacheMessage(sent);

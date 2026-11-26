@@ -1,0 +1,242 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+#if NET
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
+
+namespace ManagedCodecs.H264;
+
+/// <summary>Weighted sample prediction (8.4.2.3.2): by the definition for any sample type, and in vectors.</summary>
+internal static partial class InterPrediction
+{
+    /// <summary>
+    /// Weighted prediction from one list (8-449, 8-450): Clip1(((p * w + 2^(logWd - 1)) >> logWd) + o), or p * w + o
+    /// when logWd is 0; <paramref name="o"/> already scaled to the bit depth.
+    /// </summary>
+    public static void WeightOneReference<TPixel>(ReadOnlySpan<TPixel> prediction, int stride, int width, int height, Span<TPixel> output, int outputStride, int w, int o, int logWd, int max)
+        where TPixel : unmanaged
+    {
+        int round = logWd >= 1 ? 1 << (logWd - 1) : 0;
+        for (int j = 0; j < height; j++)
+        {
+            for (int i = 0; i < width; i++)
+            {
+                int p = Samples.ToInt(prediction[(j * stride) + i]);
+                int value = logWd >= 1 ? (((p * w) + round) >> logWd) + o : (p * w) + o;
+                output[(j * outputStride) + i] = Samples.From<TPixel>(Math.Clamp(value, 0, max));
+            }
+        }
+    }
+
+    /// <summary>Weighted bi-prediction (8-451): Clip1(((p0 * w0 + p1 * w1 + 2^logWd) >> (logWd + 1)) + o).</summary>
+    public static void WeightBothReference<TPixel>(ReadOnlySpan<TPixel> prediction0, ReadOnlySpan<TPixel> prediction1, int stride, int width, int height, Span<TPixel> output, int outputStride, int w0, int w1, int o, int logWd, int max)
+        where TPixel : unmanaged
+    {
+        for (int j = 0; j < height; j++)
+        {
+            for (int i = 0; i < width; i++)
+            {
+                int p0 = Samples.ToInt(prediction0[(j * stride) + i]);
+                int p1 = Samples.ToInt(prediction1[(j * stride) + i]);
+                int value = (((p0 * w0) + (p1 * w1) + (1 << logWd)) >> (logWd + 1)) + o;
+                output[(j * outputStride) + i] = Samples.From<TPixel>(Math.Clamp(value, 0, max));
+            }
+        }
+    }
+
+#if NET
+    /// <summary>
+    /// <see cref="WeightOneReference"/> for 8-bit samples, a row of up to 16 at a time in 16-bit lanes: with weights
+    /// and offsets of -128 to 127 (7.4.3.2) every step stays within 16 bits. Rows are read as 16 bytes.
+    /// </summary>
+    public static void WeightOne(ReadOnlySpan<byte> prediction, int stride, int width, int height, Span<byte> output, int outputStride, int w, int o, int logWd)
+    {
+        CheckWeightBounds(prediction.Length, stride, height, output.Length, outputStride, width);
+        ref byte source = ref MemoryMarshal.GetReference(prediction);
+        ref byte dest = ref MemoryMarshal.GetReference(output);
+        var weight = Vector128.Create((short)w);
+        var offset = Vector128.Create((short)o);
+        var round = Vector128.Create((short)(logWd >= 1 ? 1 << (logWd - 1) : 0));
+        for (int j = 0; j < height; j++)
+        {
+            var p = Load(ref source, j * stride);
+            var low = (((Lower(p) * weight) + round) >> logWd) + offset;
+            var high = (((Upper(p) * weight) + round) >> logWd) + offset;
+            StorePartial(Clip(low, high), ref Unsafe.Add(ref dest, j * outputStride), width);
+        }
+    }
+#endif
+
+#if NET
+    /// <summary><see cref="WeightBothReference"/> for 8-bit samples, in 32-bit lanes (the sum of two products needs 17 bits).</summary>
+    public static void WeightBoth(ReadOnlySpan<byte> prediction0, ReadOnlySpan<byte> prediction1, int stride, int width, int height, Span<byte> output, int outputStride, int w0, int w1, int o, int logWd)
+    {
+        CheckWeightBounds(Math.Min(prediction0.Length, prediction1.Length), stride, height, output.Length, outputStride, width);
+        ref byte source0 = ref MemoryMarshal.GetReference(prediction0);
+        ref byte source1 = ref MemoryMarshal.GetReference(prediction1);
+        ref byte dest = ref MemoryMarshal.GetReference(output);
+        if (Sse2.IsSupported)
+        {
+            WeightBothSse2(ref source0, ref source1, stride, width, height, ref dest, outputStride, w0, w1, o, logWd);
+            return;
+        }
+
+        var weight0 = Vector128.Create(w0);
+        var weight1 = Vector128.Create(w1);
+        var offset = Vector128.Create(o);
+        var round = Vector128.Create(1 << logWd);
+        int shift = logWd + 1;
+        for (int j = 0; j < height; j++)
+        {
+            var p0 = Load(ref source0, j * stride);
+            var p1 = Load(ref source1, j * stride);
+            var low = Vector128.Narrow(
+                Sum(Vector128.WidenLower(Lower(p0)), Vector128.WidenLower(Lower(p1)), weight0, weight1, round, shift, offset),
+                Sum(Vector128.WidenUpper(Lower(p0)), Vector128.WidenUpper(Lower(p1)), weight0, weight1, round, shift, offset));
+            var high = Vector128.Narrow(
+                Sum(Vector128.WidenLower(Upper(p0)), Vector128.WidenLower(Upper(p1)), weight0, weight1, round, shift, offset),
+                Sum(Vector128.WidenUpper(Upper(p0)), Vector128.WidenUpper(Upper(p1)), weight0, weight1, round, shift, offset));
+            StorePartial(ClampNarrow(low, high), ref Unsafe.Add(ref dest, j * outputStride), width);
+        }
+    }
+#endif
+
+#if NET
+    /// <summary>
+    /// <see cref="WeightBoth"/> with SSE2: each sample of the two predictions paired with the other's as 16-bit words, so
+    /// that one multiply-add (<c>pmaddwd</c>) gives p0 w0 + p1 w1 for four samples, exactly, in 32 bits (samples to 255,
+    /// weights -128 to 128); the clip to 0..255 is the saturating packs to 16 bits and then to bytes. Blocks up to 8
+    /// wide take only the row's first half.
+    /// </summary>
+    private static void WeightBothSse2(ref byte source0, ref byte source1, int stride, int width, int height, ref byte dest, int outputStride, int w0, int w1, int o, int logWd)
+    {
+        var weights = Vector128.Create((w0 & 0xFFFF) | (w1 << 16)).AsInt16();
+        var offset = Vector128.Create(o);
+        var round = Vector128.Create(1 << logWd);
+        int shift = logWd + 1;
+        for (int j = 0; j < height; j++)
+        {
+            var p0 = Load(ref source0, j * stride);
+            var p1 = Load(ref source1, j * stride);
+            var pairs = Sse2.UnpackLow(p0, p1);
+            var first = Sse2.PackSignedSaturate(
+                Weigh(Sse2.UnpackLow(pairs, Vector128<byte>.Zero).AsInt16(), weights, round, shift, offset),
+                Weigh(Sse2.UnpackHigh(pairs, Vector128<byte>.Zero).AsInt16(), weights, round, shift, offset));
+            var second = first;
+            if (width == 16)
+            {
+                pairs = Sse2.UnpackHigh(p0, p1);
+                second = Sse2.PackSignedSaturate(
+                    Weigh(Sse2.UnpackLow(pairs, Vector128<byte>.Zero).AsInt16(), weights, round, shift, offset),
+                    Weigh(Sse2.UnpackHigh(pairs, Vector128<byte>.Zero).AsInt16(), weights, round, shift, offset));
+            }
+
+            StorePartial(Sse2.PackUnsignedSaturate(first, second), ref Unsafe.Add(ref dest, j * outputStride), width);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector128<int> Weigh(Vector128<short> pairs, Vector128<short> weights, Vector128<int> round, int shift, Vector128<int> offset) =>
+            ((Sse2.MultiplyAddAdjacent(pairs, weights) + round) >> shift) + offset;
+    }
+#endif
+
+    // One bi-predicted lane group, clamped to 0..255 already, so that it narrows to 16 bits as it is.
+#if NET
+    private static Vector128<int> Sum(Vector128<int> p0, Vector128<int> p1, Vector128<int> w0, Vector128<int> w1, Vector128<int> round, int shift, Vector128<int> offset) =>
+        Vector128.Min(Vector128.Max((((p0 * w0) + (p1 * w1) + round) >> shift) + offset, Vector128<int>.Zero), Vector128.Create(255));
+#endif
+
+    // Clip1 of sixteen 16-bit values, as bytes: with SSE2 the saturating pack (packuswb) is exactly the clip.
+#if NET
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<byte> Clip(Vector128<short> low, Vector128<short> high) =>
+        Sse2.IsSupported ? Sse2.PackUnsignedSaturate(low, high) : ClampNarrow(low, high);
+
+    private static Vector128<byte> ClampNarrow(Vector128<short> low, Vector128<short> high)
+    {
+        var max = Vector128.Create((short)255);
+        return Vector128.Narrow(
+            Vector128.Min(Vector128.Max(low, Vector128<short>.Zero), max).AsUInt16(),
+            Vector128.Min(Vector128.Max(high, Vector128<short>.Zero), max).AsUInt16());
+    }
+#endif
+
+#if NET
+    /// <summary>
+    /// <see cref="WeightOneReference"/> for samples of more than 8 bits, 8 at a time in 32-bit lanes (a 10-bit sample
+    /// times a weight of up to 128 needs 18 bits). Rows are read as 8 samples, 16 for a block 16 wide.
+    /// </summary>
+    public static void WeightOne16(ReadOnlySpan<ushort> prediction, int stride, int width, int height, Span<ushort> output, int outputStride, int w, int o, int logWd, int max)
+    {
+        CheckWeightBounds16(prediction.Length, stride, height, output.Length, outputStride, width);
+        ref ushort source = ref MemoryMarshal.GetReference(prediction);
+        ref ushort dest = ref MemoryMarshal.GetReference(output);
+        var weight = Vector128.Create(w);
+        var offset = Vector128.Create(o);
+        var round = Vector128.Create(logWd >= 1 ? 1 << (logWd - 1) : 0);
+        var top = Vector128.Create(max);
+        for (int j = 0; j < height; j++)
+        {
+            ref ushort outRow = ref Unsafe.Add(ref dest, j * outputStride);
+            for (int x = 0; x < width; x += 8)
+            {
+                var p = Vector128.LoadUnsafe(ref source, (nuint)((j * stride) + x));
+                var low = (((Vector128.WidenLower(p).AsInt32() * weight) + round) >> logWd) + offset;
+                var high = (((Vector128.WidenUpper(p).AsInt32() * weight) + round) >> logWd) + offset;
+                StoreRow16(ClampNarrow16(low, high, top), ref Unsafe.Add(ref outRow, x), width);
+            }
+        }
+    }
+
+    /// <summary><see cref="WeightBothReference"/> for samples of more than 8 bits, 8 at a time in 32-bit lanes.</summary>
+    public static void WeightBoth16(ReadOnlySpan<ushort> prediction0, ReadOnlySpan<ushort> prediction1, int stride, int width, int height, Span<ushort> output, int outputStride, int w0, int w1, int o, int logWd, int max)
+    {
+        CheckWeightBounds16(Math.Min(prediction0.Length, prediction1.Length), stride, height, output.Length, outputStride, width);
+        ref ushort source0 = ref MemoryMarshal.GetReference(prediction0);
+        ref ushort source1 = ref MemoryMarshal.GetReference(prediction1);
+        ref ushort dest = ref MemoryMarshal.GetReference(output);
+        var weight0 = Vector128.Create(w0);
+        var weight1 = Vector128.Create(w1);
+        var offset = Vector128.Create(o);
+        var round = Vector128.Create(1 << logWd);
+        var top = Vector128.Create(max);
+        int shift = logWd + 1;
+        for (int j = 0; j < height; j++)
+        {
+            ref ushort outRow = ref Unsafe.Add(ref dest, j * outputStride);
+            for (int x = 0; x < width; x += 8)
+            {
+                var p0 = Vector128.LoadUnsafe(ref source0, (nuint)((j * stride) + x));
+                var p1 = Vector128.LoadUnsafe(ref source1, (nuint)((j * stride) + x));
+                var low = (((Vector128.WidenLower(p0).AsInt32() * weight0) + (Vector128.WidenLower(p1).AsInt32() * weight1) + round) >> shift) + offset;
+                var high = (((Vector128.WidenUpper(p0).AsInt32() * weight0) + (Vector128.WidenUpper(p1).AsInt32() * weight1) + round) >> shift) + offset;
+                StoreRow16(ClampNarrow16(low, high, top), ref Unsafe.Add(ref outRow, x), width);
+            }
+        }
+    }
+
+    // Clip1 of eight 32-bit values to 0 .. max, as ushorts.
+    private static Vector128<ushort> ClampNarrow16(Vector128<int> low, Vector128<int> high, Vector128<int> max) =>
+        Vector128.Narrow(
+            Vector128.Min(Vector128.Max(low, Vector128<int>.Zero), max).AsUInt32(),
+            Vector128.Min(Vector128.Max(high, Vector128<int>.Zero), max).AsUInt32());
+
+    private static void CheckWeightBounds16(int predictionLength, int stride, int height, int outputLength, int outputStride, int width)
+    {
+        if (height < 1 || ((height - 1) * stride) + Math.Max(width, 8) > predictionLength || ((height - 1) * outputStride) + width > outputLength || width is not (2 or 4 or 8 or 16))
+        {
+            throw new ArgumentOutOfRangeException(nameof(height));
+        }
+    }
+#endif
+
+    private static void CheckWeightBounds(int predictionLength, int stride, int height, int outputLength, int outputStride, int width)
+    {
+        if (height < 1 || ((height - 1) * stride) + 16 > predictionLength || ((height - 1) * outputStride) + width > outputLength || width is not (2 or 4 or 8 or 16))
+        {
+            throw new ArgumentOutOfRangeException(nameof(height));
+        }
+    }
+}

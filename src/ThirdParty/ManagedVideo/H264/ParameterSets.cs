@@ -1,0 +1,428 @@
+namespace ManagedCodecs.H264;
+
+/// <summary>seq_parameter_set_rbsp (7.3.2.1.1), with the fields a frame decoder needs.</summary>
+internal sealed class SequenceParameterSet
+{
+    public int ProfileIdc { get; internal init; }
+
+    public int ConstraintFlags { get; internal init; }
+
+    public int LevelIdc { get; internal init; }
+
+    public int Id { get; internal init; }
+
+    public int ChromaFormatIdc { get; internal init; } = 1;
+
+    /// <summary>
+    /// MbHeightC (6.2): the chroma rows of a macroblock, 8 in 4:2:0 and 16 in 4:2:2 and 4:4:4, 0 in monochrome (4:0:0). As the
+    /// picture's planes have them: 16 with separate colour planes too, where 6.2 has 0 (each plane decodes as monochrome).
+    /// </summary>
+    public int MbHeightC => ChromaFormatIdc switch { 0 => 0, 1 => 8, _ => 16 };
+
+    /// <summary>MbWidthC (6.2): the chroma columns of a macroblock, 16 in 4:4:4, 0 in monochrome and 8 otherwise; as <see cref="MbHeightC"/>.</summary>
+    public int MbWidthC => ChromaFormatIdc switch { 0 => 0, 3 => 16, _ => 8 };
+
+    /// <summary>ChromaArrayType (7.4.2.1.1): chroma_format_idc, or 0 with separate colour planes, each coded as a monochrome picture.</summary>
+    public int ChromaArrayType => SeparateColourPlanes ? 0 : ChromaFormatIdc;
+
+    public int BitDepthLuma { get; internal init; } = 8;
+
+    /// <summary>separate_colour_plane_flag: 4:4:4 coded as three monochrome pictures (colour_plane_id in each slice header).</summary>
+    public bool SeparateColourPlanes { get; internal init; }
+
+    /// <summary>qpprime_y_zero_transform_bypass_flag: lossless macroblocks at QP'Y 0 (not supported).</summary>
+    public bool TransformBypass { get; internal init; }
+
+    public int BitDepthChroma { get; internal init; } = 8;
+
+    /// <summary>The sequence's scaling matrix, or null for flat scaling (no seq_scaling_matrix_present_flag).</summary>
+    public ScalingMatrix? Scaling { get; internal init; }
+
+    public int Log2MaxFrameNum { get; internal init; }
+
+    public int PicOrderCntType { get; internal init; }
+
+    public int Log2MaxPicOrderCntLsb { get; internal init; }
+
+    public bool DeltaPicOrderAlwaysZero { get; internal init; }
+
+    public int OffsetForNonRefPic { get; internal init; }
+
+    public int OffsetForTopToBottomField { get; internal init; }
+
+    public int[] OffsetForRefFrame { get; internal init; } = [];
+
+    public int MaxNumRefFrames { get; internal init; }
+
+    public bool GapsInFrameNumAllowed { get; internal init; }
+
+    public int WidthInMbs { get; internal init; }
+
+    public int HeightInMapUnits { get; internal init; }
+
+    public bool FrameMbsOnly { get; internal init; }
+
+    /// <summary>mb_adaptive_frame_field_flag: frames may code each macroblock pair as two fields (MBAFF).</summary>
+    public bool MbAdaptiveFrameField { get; internal init; }
+
+    public bool Direct8x8Inference { get; internal init; }
+
+    /// <summary>max_num_reorder_frames from the VUI's bitstream restriction, if it has one.</summary>
+    public int? MaxNumReorderFrames { get; internal init; }
+
+    /// <summary>max_dec_frame_buffering from the VUI's bitstream restriction, if it has one.</summary>
+    public int? MaxDecFrameBuffering { get; internal init; }
+
+    /// <summary>
+    /// The VUI's pic_struct_present_flag and what the picture timing SEI's layout (D.1.3) takes from the HRD
+    /// parameters; null without the flag (or a VUI), when the SEI says nothing of interlacing.
+    /// </summary>
+    public PictureTimingLayout? PictureTiming { get; internal init; }
+
+    /// <summary>What the VUI says the samples mean (colour properties, chroma location, aspect ratio); <see cref="VideoSignal.None"/> without a VUI.</summary>
+    public VideoSignal Signal { get; internal init; } = VideoSignal.None;
+
+    /// <summary>Crop offsets in luma samples (already scaled by CropUnitX/Y).</summary>
+    public (int Left, int Right, int Top, int Bottom) Crop { get; internal init; }
+
+    public int HeightInMbs => FrameMbsOnly ? HeightInMapUnits : HeightInMapUnits * 2;
+
+    public int Width => (WidthInMbs * 16) - Crop.Left - Crop.Right;
+
+    public int Height => (HeightInMbs * 16) - Crop.Top - Crop.Bottom;
+
+    public static SequenceParameterSet Parse(BitReader r)
+    {
+        int profile = (int)r.ReadBits(8);
+        int constraints = (int)r.ReadBits(8);
+        int level = (int)r.ReadBits(8);
+        int id = r.ReadUe(31, "seq_parameter_set_id");
+
+        int chromaFormat = 1;
+        int bitDepthLuma = 8;
+        int bitDepthChroma = 8;
+        bool separatePlanes = false;
+        bool bypass = false;
+        ScalingMatrix? scaling = null;
+        if (profile is 100 or 110 or 122 or 244 or 44 or 83 or 86 or 118 or 128 or 138 or 139 or 134 or 135)
+        {
+            chromaFormat = r.ReadUe(3, "chroma_format_idc");
+            if (chromaFormat == 3)
+            {
+                separatePlanes = r.ReadFlag();
+            }
+
+            bitDepthLuma = 8 + r.ReadUe(6, "bit_depth_luma_minus8");
+            bitDepthChroma = 8 + r.ReadUe(6, "bit_depth_chroma_minus8");
+            bypass = r.ReadFlag();
+            if (r.ReadFlag())
+            {
+                // Lists the SPS leaves out fall back by rule A (Table 7-2).
+                scaling = ScalingMatrix.Resolve(ScalingMatrix.ParseLists(r, chromaFormat != 3 ? 8 : 12), sequence: null);
+            }
+        }
+
+        int log2MaxFrameNum = 4 + r.ReadUe(12, "log2_max_frame_num_minus4");
+        int pocType = r.ReadUe(2, "pic_order_cnt_type");
+        int log2MaxPocLsb = 0;
+        bool deltaAlwaysZero = false;
+        int offsetNonRef = 0;
+        int offsetTopBottom = 0;
+        int[] offsets = [];
+        if (pocType == 0)
+        {
+            log2MaxPocLsb = 4 + r.ReadUe(12, "log2_max_pic_order_cnt_lsb_minus4");
+        }
+        else if (pocType == 1)
+        {
+            deltaAlwaysZero = r.ReadFlag();
+            offsetNonRef = r.ReadSe();
+            offsetTopBottom = r.ReadSe();
+            offsets = new int[r.ReadUe(255, "num_ref_frames_in_pic_order_cnt_cycle")];
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                offsets[i] = r.ReadSe();
+            }
+        }
+
+        int maxRefFrames = r.ReadUe(16, "max_num_ref_frames");
+        bool gaps = r.ReadFlag();
+        int widthInMbs = 1 + r.ReadUe(1023, "pic_width_in_mbs_minus1");
+        int heightInMapUnits = 1 + r.ReadUe(1023, "pic_height_in_map_units_minus1");
+        bool frameMbsOnly = r.ReadFlag();
+        bool mbAdaptive = !frameMbsOnly && r.ReadFlag(); // mb_adaptive_frame_field_flag
+
+        bool direct8x8 = r.ReadFlag();
+        var crop = (0, 0, 0, 0);
+        if (r.ReadFlag())
+        {
+            // Crop units (Table 6-1, equations 7-19 to 7-22): chroma samples, of 4:2:0 or 4:2:2.
+            int unitX = chromaFormat is 1 or 2 ? 2 : 1;
+            int unitY = (chromaFormat == 1 ? 2 : 1) * (frameMbsOnly ? 1 : 2);
+
+            // Bounded by the largest picture (1024 macroblocks either way), so that no product overflows; the check below
+            // then sees whether anything is left.
+            const int maxCrop = 1024 * 16;
+            crop = (r.ReadUe(maxCrop, "frame_crop_left_offset") * unitX, r.ReadUe(maxCrop, "frame_crop_right_offset") * unitX,
+                r.ReadUe(maxCrop, "frame_crop_top_offset") * unitY, r.ReadUe(maxCrop, "frame_crop_bottom_offset") * unitY);
+        }
+
+        // Of the VUI, the bitstream restriction says how far output is reordered, pic_struct_present_flag with the
+        // HRD parameters how to read the picture timing SEI, and the rest what the samples mean (the frames' colour
+        // properties and aspect ratio).
+        var (restriction, timing, signal) = r.ReadFlag() ? ReadVui(r) : (null, null, VideoSignal.None);
+
+        var sps = new SequenceParameterSet
+        {
+            ProfileIdc = profile,
+            ConstraintFlags = constraints,
+            LevelIdc = level,
+            Id = id,
+            ChromaFormatIdc = chromaFormat,
+            BitDepthLuma = bitDepthLuma,
+            BitDepthChroma = bitDepthChroma,
+            SeparateColourPlanes = separatePlanes,
+            TransformBypass = bypass,
+            Scaling = scaling,
+            Log2MaxFrameNum = log2MaxFrameNum,
+            PicOrderCntType = pocType,
+            Log2MaxPicOrderCntLsb = log2MaxPocLsb,
+            DeltaPicOrderAlwaysZero = deltaAlwaysZero,
+            OffsetForNonRefPic = offsetNonRef,
+            OffsetForTopToBottomField = offsetTopBottom,
+            OffsetForRefFrame = offsets,
+            MaxNumRefFrames = maxRefFrames,
+            GapsInFrameNumAllowed = gaps,
+            WidthInMbs = widthInMbs,
+            HeightInMapUnits = heightInMapUnits,
+            FrameMbsOnly = frameMbsOnly,
+            MbAdaptiveFrameField = mbAdaptive,
+            Direct8x8Inference = direct8x8,
+            Crop = crop,
+            MaxNumReorderFrames = restriction?.Reorder,
+            MaxDecFrameBuffering = restriction?.Buffering,
+            PictureTiming = timing,
+            Signal = signal,
+        };
+
+        if (sps.Width <= 0 || sps.Height <= 0)
+        {
+            throw new InvalidDataException("Frame cropping removes the whole picture.");
+        }
+
+        return sps;
+    }
+
+    /// <summary>
+    /// vui_parameters (E.1.1), read up to and including bitstream_restriction; the restriction and timing null when
+    /// absent. The signal as FFmpeg reads it: the chroma location left where the VUI does not say (FFmpeg's default for
+    /// a VUI, whatever the chroma format), only the top field's.
+    /// </summary>
+    private static ((int Reorder, int Buffering)? Restriction, PictureTimingLayout? Timing, VideoSignal Signal) ReadVui(BitReader r)
+    {
+        var aspectRatio = new Rational(0, 1);
+        if (r.ReadFlag())
+        {
+            int idc = (int)r.ReadBits(8); // aspect_ratio_idc
+            int sarWidth = idc == 255 ? (int)r.ReadBits(16) : 0;
+            int sarHeight = idc == 255 ? (int)r.ReadBits(16) : 0;
+            aspectRatio = VideoSignal.AspectRatioOf(idc, sarWidth, sarHeight);
+        }
+
+        if (r.ReadFlag())
+        {
+            r.ReadFlag(); // overscan_appropriate_flag
+        }
+
+        var range = ColorRange.Unspecified;
+        var (primaries, transfer, matrix) = (ColorPrimaries.Unspecified, ColorTransfer.Unspecified, ColorMatrix.Unspecified);
+        bool colourSent = false;
+        if (r.ReadFlag())
+        {
+            r.ReadBits(3); // video_format
+            range = r.ReadFlag() ? ColorRange.Full : ColorRange.Limited; // video_full_range_flag
+            if (r.ReadFlag())
+            {
+                colourSent = true;
+                primaries = VideoSignal.PrimariesOf((int)r.ReadBits(8));
+                transfer = VideoSignal.TransferOf((int)r.ReadBits(8));
+                matrix = VideoSignal.MatrixOf((int)r.ReadBits(8));
+            }
+        }
+
+        var location = ChromaLocation.Left;
+        if (r.ReadFlag())
+        {
+            location = VideoSignal.LocationOf(r.ReadUe()); // chroma_sample_loc_type_top_field
+            r.ReadUe(); // chroma_sample_loc_type_bottom_field
+        }
+
+        var signal = new VideoSignal(range, primaries, transfer, matrix, location, aspectRatio, RangeSent: range != ColorRange.Unspecified, ColourSent: colourSent);
+
+        if (r.ReadFlag())
+        {
+            r.ReadBits(32); // num_units_in_tick
+            r.ReadBits(32); // time_scale
+            r.ReadFlag(); // fixed_frame_rate_flag
+        }
+
+        // The lengths are the last hrd_parameters' (the same in both, by E.2.2), as FFmpeg reads them; without any, 24
+        // (E.2.2's inferred time_offset_length; the delays are then absent).
+        var lengths = (Cpb: 24, Dpb: 24, TimeOffset: 24);
+        bool nalHrd = r.ReadFlag();
+        if (nalHrd)
+        {
+            lengths = ReadHrdParameters(r);
+        }
+
+        bool vclHrd = r.ReadFlag();
+        if (vclHrd)
+        {
+            lengths = ReadHrdParameters(r);
+        }
+
+        if (nalHrd || vclHrd)
+        {
+            r.ReadFlag(); // low_delay_hrd_flag
+        }
+
+        var timing = r.ReadFlag() // pic_struct_present_flag
+            ? new PictureTimingLayout(nalHrd || vclHrd, lengths.Cpb, lengths.Dpb, lengths.TimeOffset)
+            : null;
+        if (!r.ReadFlag())
+        {
+            return (null, timing, signal);
+        }
+
+        r.ReadFlag(); // motion_vectors_over_pic_boundaries_flag
+        r.ReadUe(); // max_bytes_per_pic_denom
+        r.ReadUe(); // max_bits_per_mb_denom
+        r.ReadUe(); // log2_max_mv_length_horizontal
+        r.ReadUe(); // log2_max_mv_length_vertical
+        int reorder = r.ReadUe(16, "max_num_reorder_frames");
+        int buffering = r.ReadUe(16, "max_dec_frame_buffering");
+        return ((reorder, buffering), timing, signal);
+    }
+
+    /// <summary>hrd_parameters (E.1.2): the lengths of cpb_removal_delay, dpb_output_delay and time_offset.</summary>
+    private static (int Cpb, int Dpb, int TimeOffset) ReadHrdParameters(BitReader r)
+    {
+        int cpbCount = 1 + r.ReadUe(31, "cpb_cnt_minus1");
+        r.ReadBits(8); // bit_rate_scale, cpb_size_scale
+        for (int i = 0; i < cpbCount; i++)
+        {
+            r.ReadUe(); // bit_rate_value_minus1
+            r.ReadUe(); // cpb_size_value_minus1
+            r.ReadFlag(); // cbr_flag
+        }
+
+        r.ReadBits(5); // initial_cpb_removal_delay_length_minus1
+        int cpb = 1 + (int)r.ReadBits(5); // cpb_removal_delay_length_minus1
+        int dpb = 1 + (int)r.ReadBits(5); // dpb_output_delay_length_minus1
+        return (cpb, dpb, (int)r.ReadBits(5)); // time_offset_length
+    }
+}
+
+/// <summary>pic_parameter_set_rbsp (7.3.2.2).</summary>
+internal sealed class PictureParameterSet
+{
+    public int Id { get; internal init; }
+
+    public int SpsId { get; internal init; }
+
+    public bool EntropyCodingModeCabac { get; internal init; }
+
+    public bool BottomFieldPicOrderInFramePresent { get; internal init; }
+
+    public int NumSliceGroups { get; internal init; }
+
+    public int NumRefIdxL0DefaultActive { get; internal init; }
+
+    public int NumRefIdxL1DefaultActive { get; internal init; }
+
+    public bool WeightedPred { get; internal init; }
+
+    public int WeightedBipredIdc { get; internal init; }
+
+    public int PicInitQp { get; internal init; }
+
+    public int ChromaQpIndexOffset { get; internal init; }
+
+    public bool DeblockingFilterControlPresent { get; internal init; }
+
+    public bool ConstrainedIntraPred { get; internal init; }
+
+    public bool RedundantPicCntPresent { get; internal init; }
+
+    public bool Transform8x8Mode { get; internal init; }
+
+    /// <summary>
+    /// The picture-level scaling lists (null entries absent, filled in by <see cref="ScalingMatrix.For"/>),
+    /// or null without pic_scaling_matrix_present_flag.
+    /// </summary>
+    public byte[]?[]? ScalingLists { get; internal init; }
+
+    public int SecondChromaQpIndexOffset { get; internal init; }
+
+    /// <param name="sequences">The SPSs received so far: the one this PPS names says how many 8x8 scaling lists it has.</param>
+    public static PictureParameterSet Parse(BitReader r, IReadOnlyDictionary<int, SequenceParameterSet>? sequences = null)
+    {
+        int id = r.ReadUe(255, "pic_parameter_set_id");
+        int spsId = r.ReadUe(31, "seq_parameter_set_id");
+        bool cabac = r.ReadFlag();
+        bool bottomFieldPoc = r.ReadFlag();
+        int sliceGroups = 1 + r.ReadUe(7, "num_slice_groups_minus1");
+        if (sliceGroups > 1)
+        {
+            throw new NotSupportedException("Slice groups (FMO) are not supported.");
+        }
+
+        int refL0 = 1 + r.ReadUe(31, "num_ref_idx_l0_default_active_minus1");
+        int refL1 = 1 + r.ReadUe(31, "num_ref_idx_l1_default_active_minus1");
+        bool weighted = r.ReadFlag();
+        int weightedBipred = (int)r.ReadBits(2);
+        int qp = 26 + r.ReadSe();
+        r.ReadSe(); // pic_init_qs_minus26 (SP/SI slices only)
+        int chromaOffset = r.ReadSe();
+        bool deblockingControl = r.ReadFlag();
+        bool constrainedIntra = r.ReadFlag();
+        bool redundant = r.ReadFlag();
+
+        bool transform8x8 = false;
+        byte[]?[]? scaling = null;
+        int secondChromaOffset = chromaOffset;
+        if (r.MoreRbspData())
+        {
+            transform8x8 = r.ReadFlag();
+            if (r.ReadFlag())
+            {
+                // 6 + 2 * transform_8x8_mode_flag lists, 6 + 6 * transform_8x8_mode_flag in 4:4:4.
+                bool chroma444 = sequences is not null && sequences.TryGetValue(spsId, out var sps) && sps.ChromaFormatIdc == 3;
+                scaling = ScalingMatrix.ParseLists(r, 6 + (transform8x8 ? (chroma444 ? 6 : 2) : 0));
+            }
+
+            secondChromaOffset = r.ReadSe();
+        }
+
+        return new PictureParameterSet
+        {
+            Id = id,
+            SpsId = spsId,
+            EntropyCodingModeCabac = cabac,
+            BottomFieldPicOrderInFramePresent = bottomFieldPoc,
+            NumSliceGroups = sliceGroups,
+            NumRefIdxL0DefaultActive = refL0,
+            NumRefIdxL1DefaultActive = refL1,
+            WeightedPred = weighted,
+            WeightedBipredIdc = weightedBipred,
+            PicInitQp = qp,
+            ChromaQpIndexOffset = chromaOffset,
+            DeblockingFilterControlPresent = deblockingControl,
+            ConstrainedIntraPred = constrainedIntra,
+            RedundantPicCntPresent = redundant,
+            Transform8x8Mode = transform8x8,
+            ScalingLists = scaling,
+            SecondChromaQpIndexOffset = secondChromaOffset,
+        };
+    }
+}

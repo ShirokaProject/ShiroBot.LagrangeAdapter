@@ -1,0 +1,406 @@
+namespace ManagedCodecs;
+
+/// <summary>A rational number, used for time bases (e.g. 1/25 or 1/12800 seconds per tick).</summary>
+internal readonly record struct Rational(int Numerator, int Denominator)
+{
+    /// <summary>The value as a double; 0 when <see cref="Denominator"/> is 0.</summary>
+    public double ToDouble() => Denominator == 0 ? 0 : (double)Numerator / Denominator;
+
+    /// <summary>Divides out the greatest common divisor, e.g. 40000/1000000 becomes 1/25.</summary>
+    public static Rational Reduce(long numerator, long denominator)
+    {
+        long a = Math.Abs(numerator);
+        long b = Math.Abs(denominator);
+        while (b != 0)
+        {
+            (a, b) = (b, a % b);
+        }
+
+        return a == 0 ? new Rational(0, 1) : new Rational(checked((int)(numerator / a)), checked((int)(denominator / a)));
+    }
+
+    /// <summary>The fraction as written, e.g. "1/25".</summary>
+    public override string ToString() => $"{Numerator}/{Denominator}";
+}
+
+/// <summary>Normalized codec identifiers used in <see cref="VideoStreamInfo.Codec"/>.</summary>
+internal static class CodecIds
+{
+    /// <summary>Motion JPEG: each packet one JPEG image (or, interlaced, two fields).</summary>
+    public const string Mjpeg = "MJPG";
+
+    /// <summary>H.264 / AVC, packets of length-prefixed NAL units as MP4 stores them.</summary>
+    public const string H264 = "H264";
+
+    /// <summary>MPEG-4 Part 2 Visual.</summary>
+    public const string Mpeg4Visual = "MP4V";
+
+    /// <summary>MPEG-4 / MPEG-2 AAC.</summary>
+    public const string Aac = "AAC";
+
+    /// <summary>
+    /// MPEG-1 or MPEG-2 audio, MP3 (Layer III) as a rule: the MP4 object types 0x6B and 0x69, which don't tell the layers
+    /// apart, its QuickTime sample entries, Matroska's A_MPEG/L3, AVI's format tag 0x55 and raw .mp3 files.
+    /// </summary>
+    public const string Mp3 = "MP3";
+
+    /// <summary>
+    /// PCM, unsigned 8-bit samples, channels interleaved (AVI's format tag 1 at 8 bits, QuickTime's 'raw ', Matroska's
+    /// A_PCM/INT/LIT and BIG at BitDepth 8); <see cref="PcmDecoder"/>.
+    /// </summary>
+    public const string PcmU8 = "PCM_U8";
+
+    /// <summary>
+    /// PCM, signed 16-bit little-endian samples, channels interleaved (AVI's format tag 1 at 16 bits, QuickTime's 'sowt',
+    /// Matroska's A_PCM/INT/LIT at BitDepth 16); <see cref="PcmDecoder"/>.
+    /// </summary>
+    public const string PcmS16Le = "PCM_S16LE";
+
+    /// <summary>PCM, signed 16-bit big-endian samples (QuickTime's 'twos', Matroska's A_PCM/INT/BIG at BitDepth 16); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmS16Be = "PCM_S16BE";
+
+    /// <summary>PCM, signed 24-bit little-endian samples (QuickTime's 'in24' with 'enda' 1, Matroska's A_PCM/INT/LIT at BitDepth 24); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmS24Le = "PCM_S24LE";
+
+    /// <summary>PCM, signed 24-bit big-endian samples (QuickTime's 'in24', Matroska's A_PCM/INT/BIG at BitDepth 24); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmS24Be = "PCM_S24BE";
+
+    /// <summary>PCM, signed 32-bit little-endian samples (QuickTime's 'in32' with 'enda' 1, Matroska's A_PCM/INT/LIT at BitDepth 32); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmS32Le = "PCM_S32LE";
+
+    /// <summary>PCM, signed 32-bit big-endian samples (QuickTime's 'in32', Matroska's A_PCM/INT/BIG at BitDepth 32); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmS32Be = "PCM_S32BE";
+
+    /// <summary>PCM, 32-bit IEEE float little-endian samples (QuickTime's 'fl32' with 'enda' 1, Matroska's A_PCM/FLOAT/IEEE at BitDepth 32); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmF32Le = "PCM_F32LE";
+
+    /// <summary>PCM, 32-bit IEEE float big-endian samples (QuickTime's 'fl32'); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmF32Be = "PCM_F32BE";
+
+    /// <summary>PCM, 64-bit IEEE float little-endian samples (QuickTime's 'fl64' with 'enda' 1, Matroska's A_PCM/FLOAT/IEEE at BitDepth 64); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmF64Le = "PCM_F64LE";
+
+    /// <summary>PCM, 64-bit IEEE float big-endian samples (QuickTime's 'fl64'); <see cref="PcmDecoder"/>.</summary>
+    public const string PcmF64Be = "PCM_F64BE";
+
+    /// <summary>
+    /// IMA ADPCM at 4 bits as Microsoft's WAVE format stores it, in blocks with a header a channel (AVI's format tag 0x11
+    /// at 4 bits; FFmpeg's adpcm_ima_wav); <see cref="ImaAdpcmDecoder"/>.
+    /// </summary>
+    public const string AdpcmImaWav = "ADPCM_IMA_WAV";
+
+    /// <summary>
+    /// ITU-T G.711 A-law, a byte a sample, channels interleaved (the WAVE format tag 0x06 in .wav and AVI files,
+    /// QuickTime's 'alaw'; FFmpeg's pcm_alaw); <see cref="PcmDecoder"/>.
+    /// </summary>
+    public const string PcmAlaw = "PCM_ALAW";
+
+    /// <summary>
+    /// ITU-T G.711 μ-law, a byte a sample, channels interleaved (the WAVE format tag 0x07 in .wav and AVI files,
+    /// QuickTime's 'ulaw'; FFmpeg's pcm_mulaw); <see cref="PcmDecoder"/>.
+    /// </summary>
+    public const string PcmMulaw = "PCM_MULAW";
+
+    /// <summary>
+    /// Microsoft ADPCM at 4 bits, in blocks with a header a channel (the WAVE format tag 0x02 at 4 bits, in .wav and AVI
+    /// files; FFmpeg's adpcm_ms); <see cref="MsAdpcmDecoder"/>.
+    /// </summary>
+    public const string AdpcmMs = "ADPCM_MS";
+
+    /// <summary>
+    /// ITU-T G.726 ADPCM (16, 24, 32 or 40 kbit/s: codes of 2 to 5 bits, the stream's CodecPrivate byte), the codes packed
+    /// from each byte's most significant bit (the WAVE format tag 0x45 as FFmpeg writes it, RTP's AAL2-G726-*; FFmpeg's
+    /// adpcm_g726); <see cref="G726Decoder"/>.
+    /// </summary>
+    public const string AdpcmG726 = "ADPCM_G726";
+
+    /// <summary>
+    /// ITU-T G.726 ADPCM as <see cref="AdpcmG726"/>, the codes packed from each byte's least significant bit (RTP's
+    /// G726-16, G726-24, G726-32 and G726-40, RFC 3551; FFmpeg's adpcm_g726le); <see cref="G726Decoder"/>.
+    /// </summary>
+    public const string AdpcmG726Le = "ADPCM_G726LE";
+}
+
+/// <summary>One compressed unit of data pulled out of a container, e.g. one MJPEG frame.</summary>
+/// <param name="Sequence">Position of the packet in decode order, starting at 0.</param>
+/// <param name="Dts">Decode timestamp in the stream's <see cref="VideoStreamInfo.TimeBase"/>.</param>
+/// <param name="Pts">Presentation timestamp in the stream's time base; equals <paramref name="Dts"/> without frame reordering.</param>
+/// <param name="Duration">Duration in the stream's time base.</param>
+/// <param name="SkipSamples">
+/// Audio: how many decoded samples (per channel) at the start of this packet come before the
+/// presentation starts, such as encoder priming that an edit list cuts off; the decoder drops them. More than the packet
+/// decodes to (a delay given for the whole stream) runs on into the next packets.
+/// </param>
+/// <param name="Discard">
+/// To be decoded but not shown: a packet an edit list leaves out that later ones need, such as the frames from the
+/// keyframe before an edit's start, or audio before it (whose decoding primes the next frames). The decoders decode it
+/// and return nothing for it. Its timestamps follow the edit's.
+/// </param>
+internal readonly record struct Packet(
+    int StreamIndex,
+    long Sequence,
+    ReadOnlyMemory<byte> Data,
+    bool IsKeyframe,
+    long Dts,
+    long Pts,
+    long Duration,
+    int SkipSamples = 0,
+    bool Discard = false)
+{
+    /// <summary>
+    /// Audio: how many decoded samples (per channel) at the end of this packet come after the presentation ends, such as
+    /// the padding an encoder adds to fill its last frame (Matroska's DiscardPadding); the decoder drops them, after
+    /// <see cref="SkipSamples"/>. 0 for none.
+    /// </summary>
+    public int SkipEndSamples { get; init; }
+}
+
+/// <summary>
+/// A <see cref="Packet"/> without its data: what a demuxer knows of it from the container's index alone, for a caller that
+/// needs only the timing and sizes (a duration, a packet list, a bitrate graph).
+/// </summary>
+/// <param name="Size">The packet's <see cref="Packet.Data"/> length in bytes.</param>
+internal readonly record struct PacketInfo(
+    int StreamIndex,
+    long Sequence,
+    int Size,
+    bool IsKeyframe,
+    long Dts,
+    long Pts,
+    long Duration,
+    int SkipSamples = 0,
+    bool Discard = false)
+{
+    /// <summary>The packet's <see cref="Packet.SkipEndSamples"/>.</summary>
+    public int SkipEndSamples { get; init; }
+}
+
+/// <summary>Basic facts about a container's video stream.</summary>
+/// <param name="Codec">
+/// One of <see cref="CodecIds"/> when the codec is recognized, otherwise the container's own
+/// tag (an AVI FourCC or an MP4 sample entry type).
+/// </param>
+/// <param name="TimeBase">Seconds per tick of the packet timestamps.</param>
+/// <param name="CodecPrivate">
+/// Codec configuration from the container, e.g. the avcC payload for H.264; empty if none.
+/// </param>
+/// <param name="StreamIndex">The <see cref="Packet.StreamIndex"/> of this stream's packets.</param>
+internal sealed record VideoStreamInfo(
+    string Codec,
+    int Width,
+    int Height,
+    double FramesPerSecond,
+    long FrameCount,
+    Rational TimeBase,
+    ReadOnlyMemory<byte> CodecPrivate,
+    int StreamIndex)
+{
+    /// <summary>
+    /// The samples' range as the container says it (MP4's 'colr' of type 'nclx'), <see cref="ColorRange.Unspecified"/>
+    /// where it says nothing. A decoder given this stream takes it for frames whose bitstream does not say (as FFmpeg's).
+    /// </summary>
+    public ColorRange ColorRange { get; init; }
+
+    /// <summary>The colour primaries as the container says them (MP4's 'colr', 'nclx' or QuickTime's 'nclc').</summary>
+    public ColorPrimaries ColorPrimaries { get; init; } = ColorPrimaries.Unspecified;
+
+    /// <summary>The transfer characteristics as the container says them (MP4's 'colr').</summary>
+    public ColorTransfer ColorTransfer { get; init; } = ColorTransfer.Unspecified;
+
+    /// <summary>The YCbCr to RGB matrix as the container says it (MP4's 'colr').</summary>
+    public ColorMatrix ColorMatrix { get; init; } = ColorMatrix.Unspecified;
+
+    /// <summary>
+    /// The sample aspect ratio as the container says it (MP4's 'pasp', AVI's 'vprp'), in lowest terms; 0:1 where it says nothing. A
+    /// decoder given this stream gives its frames this ratio where there is one, as ffprobe shows frames (FFmpeg's
+    /// <c>av_guess_sample_aspect_ratio</c> prefers the container's).
+    /// </summary>
+    public Rational SampleAspectRatio { get; init; } = new(0, 1);
+
+    /// <summary>
+    /// How far to turn the frames counter-clockwise to show them, in degrees: 0, 90, 180 or 270, from MP4's track and
+    /// movie matrices ('tkhd', 'mvhd'), as ffprobe's display matrix <c>rotation</c> (-90 there is 270 here). 0 for a
+    /// matrix that turns by another angle or mirrors. The decoders do not turn frames.
+    /// </summary>
+    public int Rotation { get; init; }
+
+    /// <summary>
+    /// The stream's length in <c>TimeBase</c> ticks as the container gives it, as FFmpeg's stream duration: MP4's edits'
+    /// summed length (a leading empty edit only moves the start), else the shorter of the track's 'mdhd' duration and
+    /// its samples' summed durations (the longer in fragmented MP4, whose 'mdhd' leaves the fragments out); AVI's
+    /// 'strh' length in frames; MXF's material package track duration (the sound's rescaled to samples, rounded to the
+    /// nearest). 0 where the container says nothing.
+    /// </summary>
+    public long Duration { get; init; }
+
+    /// <summary>
+    /// An Annex B H.264 stream whose frames are numbered from 0 in output order (a raw stream, as FFmpeg's command line
+    /// numbers them), not the reorder delay after its packets' decoding-order times (AVI's, as FFmpeg's frames are).
+    /// </summary>
+    internal bool FramesFromZero { get; init; }
+}
+
+/// <summary>Basic facts about a container's audio stream.</summary>
+/// <param name="Codec">One of <see cref="CodecIds"/> when recognized, otherwise the container's own tag.</param>
+/// <param name="SampleRate">Samples per second, from the codec configuration where there is one.</param>
+/// <param name="FrameCount">Number of packets, each one coded audio frame (1024 samples per channel for AAC LC).</param>
+/// <param name="CodecPrivate">Codec configuration, e.g. the AudioSpecificConfig for AAC; empty if none.</param>
+/// <param name="StreamIndex">The <see cref="Packet.StreamIndex"/> of this stream's packets.</param>
+internal sealed record AudioStreamInfo(
+    string Codec,
+    int SampleRate,
+    int Channels,
+    long FrameCount,
+    Rational TimeBase,
+    ReadOnlyMemory<byte> CodecPrivate,
+    int StreamIndex)
+{
+    /// <summary>
+    /// The stream's length in <c>TimeBase</c> ticks as the container gives it, as FFmpeg's stream duration: MP4's edits'
+    /// summed length (a leading empty edit only moves the start), else the shorter of the track's 'mdhd' duration and
+    /// its samples' summed durations (the longer in fragmented MP4, whose 'mdhd' leaves the fragments out); AVI's
+    /// 'strh' length in frames; MXF's material package track duration (the sound's rescaled to samples, rounded to the
+    /// nearest). 0 where the container says nothing.
+    /// </summary>
+    public long Duration { get; init; }
+
+    /// <summary>
+    /// The track's language as the container gives it and ffprobe reports it (its <c>language</c> tag): ISO 639-2 in
+    /// MP4 (the 'mdhd' language, "und" included) and Matroska (its Language, "eng" where the element is missing as the
+    /// specification's default, null for "und"); null where the container has none.
+    /// </summary>
+    public string? Language { get; init; }
+
+    /// <summary>The track's name as the container gives it and ffprobe reports it (its <c>title</c> tag: Matroska's Name), or null.</summary>
+    public string? Title { get; init; }
+
+    /// <summary>
+    /// Whether the container marks the track as one to play by default, as ffprobe's <c>disposition:default</c>:
+    /// Matroska's FlagDefault (set where the element is missing, the specification's default), MP4's 'tkhd'
+    /// track_enabled. A container without such a flag leaves it false. <see cref="IDemuxer.Audio"/> is, until the
+    /// caller chooses (<see cref="IDemuxer.SelectAudio"/>), the track FFmpeg's command line plays: of those marked
+    /// default (or, where none is, of them all) the one with the most channels, the first of equals.
+    /// </summary>
+    public bool IsDefault { get; init; }
+
+    /// <summary>
+    /// The speakers of the channels, as WAVE's channel mask, where the container
+    /// names them (WAVEFORMATEXTENSIBLE in WAV and AVI); 0 where it doesn't.
+    /// </summary>
+    internal ulong ChannelMask { get; init; }
+}
+
+/// <summary>Reads packets out of a container format (AVI, MP4, ...).</summary>
+internal interface IDemuxer : IDisposable
+{
+    /// <summary>The first video stream, or null if there is none.</summary>
+    VideoStreamInfo? Video { get; }
+
+    /// <summary>
+    /// The audio stream <see cref="ReadPackets"/> gives: the first of those chosen with <see cref="SelectAudio"/>, and
+    /// until a choice is made the one FFmpeg's command line plays (<see cref="AudioStreamInfo.IsDefault"/>; the file's
+    /// first where no track is marked, as in MXF). Null if there is none (or the container does not expose audio).
+    /// </summary>
+    AudioStreamInfo? Audio { get; }
+
+    /// <summary>
+    /// Every audio stream of the file that the demuxer can give packets of, in the file's order (as FFmpeg numbers its
+    /// streams): several languages or a commentary, or broadcast MXF's mono track a channel. <see cref="Audio"/> is one
+    /// of them. This default, for a demuxer that reads one audio stream, is <see cref="Audio"/> alone.
+    /// </summary>
+    IReadOnlyList<AudioStreamInfo> AudioTracks => Audio is { } audio ? [audio] : [];
+
+    /// <summary>
+    /// Chooses the audio streams the next <see cref="ReadPackets"/> (or another read started after this call) gives,
+    /// beside the video: one, or several to read them in one pass, interleaved in file order.
+    /// <see cref="Audio"/> becomes the first one named. Until it is called <see cref="Audio"/> is read alone.
+    /// A stream's packets are the same whichever others are read with it. This default, for a demuxer that reads one
+    /// audio stream, takes that stream only.
+    /// </summary>
+    /// <param name="streamIndexes">The <see cref="AudioStreamInfo.StreamIndex"/> of one or more of <see cref="AudioTracks"/>, each once.</param>
+    /// <exception cref="ArgumentException">No stream is named, or one twice.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">No audio stream of the demuxer has one of the indexes.</exception>
+    void SelectAudio(params int[] streamIndexes)
+    {
+        ArgumentNullException.ThrowIfNull(streamIndexes);
+        if (streamIndexes.Length == 0)
+        {
+            throw new ArgumentException("At least one audio stream must be selected.", nameof(streamIndexes));
+        }
+
+        if (streamIndexes.Length > 1 && streamIndexes.Distinct().Count() != streamIndexes.Length)
+        {
+            throw new ArgumentException("An audio stream is selected twice.", nameof(streamIndexes));
+        }
+
+        if (streamIndexes.Length > 1 || streamIndexes[0] != Audio?.StreamIndex)
+        {
+            throw new ArgumentOutOfRangeException(nameof(streamIndexes), "No audio stream of the demuxer has this index.");
+        }
+    }
+
+    /// <summary>
+    /// Packets of the video stream and of <see cref="Audio"/> (and the other audio streams chosen with
+    /// <see cref="SelectAudio"/>), interleaved in file order; each stream's packets
+    /// are in decode order. <see cref="Packet.StreamIndex"/> tells them apart.
+    /// </summary>
+    IEnumerable<Packet> ReadPackets();
+
+    /// <summary>
+    /// <see cref="ReadPackets"/> as an asynchronous sequence, for <c>await foreach</c>. This library's demuxers await every
+    /// read of the file; this default, for a demuxer that has only <see cref="ReadPackets"/>, reads each packet
+    /// synchronously and yields the thread and checks cancellation between them.
+    /// </summary>
+    IAsyncEnumerable<Packet> ReadPacketsAsync(CancellationToken cancellationToken = default) => AsyncPackets.Of(ReadPackets(), cancellationToken);
+
+    /// <summary>
+    /// Moves where reading starts: the next <see cref="ReadPackets"/> (or another read started after this call) begins
+    /// at the keyframe at or before <paramref name="pts"/> of the stream <paramref name="streamIndex"/>, and the file's
+    /// other stream at the same instant. A time before the first keyframe starts at the beginning, one past the end at
+    /// the last keyframe. The packets are those a read from the start gives from there, each stream's in its order and
+    /// with the same values (<see cref="Packet.Sequence"/> too), so a decoder for them starts afresh (a new one, or one
+    /// flushed) and the frames shown before <paramref name="pts"/> are dropped by whoever wants that time, as FFmpeg's
+    /// <c>-ss</c> drops them. This default, for a demuxer that cannot seek, throws.
+    /// </summary>
+    /// <param name="pts">A presentation time in the stream's <c>TimeBase</c>.</param>
+    /// <param name="streamIndex">The stream the time belongs to: <see cref="VideoStreamInfo.StreamIndex"/> or <see cref="AudioStreamInfo.StreamIndex"/>.</param>
+    /// <exception cref="ArgumentOutOfRangeException">No stream of the demuxer has <paramref name="streamIndex"/>.</exception>
+    /// <exception cref="NotSupportedException">The demuxer, or this stream's codec in it, cannot seek.</exception>
+    void Seek(long pts, int streamIndex) => throw new NotSupportedException("This demuxer cannot seek.");
+}
+
+/// <summary>
+/// Turns compressed packets, given in decode order, into frames in display order. A codec with
+/// frame reordering (H.264 with B frames) holds frames back until every frame that is shown
+/// before them has been decoded, so one packet can give no frame or several.
+/// </summary>
+internal interface IVideoDecoder
+{
+    /// <summary>
+    /// Decodes one packet and returns the frames that are now ready to be shown, in display
+    /// order. Each frame's <see cref="VideoFrame.Pts"/> is the <see cref="Packet.Pts"/> of the
+    /// packet it was coded in; a <see cref="Packet.Discard"/> packet's frame is decoded but never returned.
+    /// </summary>
+    IReadOnlyList<VideoFrame> Decode(Packet packet);
+
+    /// <summary>At the end of the stream: returns the frames still held back, in display order.</summary>
+    IReadOnlyList<VideoFrame> Flush();
+
+    /// <summary>
+    /// <see cref="Decode"/> for asynchronous callers: a decoder that would block the calling thread (H.264 with
+    /// several threads, waiting for a picture to finish) awaits instead. Cancelling stops the waiting, not the decoding of
+    /// a picture already started. Exceptions are the ones <see cref="Decode"/> throws.
+    /// </summary>
+    ValueTask<IReadOnlyList<VideoFrame>> DecodeAsync(Packet packet, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return new(Decode(packet));
+    }
+
+    /// <summary><see cref="Flush"/> for asynchronous callers, awaiting where it would block.</summary>
+    ValueTask<IReadOnlyList<VideoFrame>> FlushAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return new(Flush());
+    }
+}

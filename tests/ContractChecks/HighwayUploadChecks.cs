@@ -48,7 +48,73 @@ internal static class HighwayUploadChecks
             !Payload(blocks[2]).SequenceEqual(content.AsSpan(1024, 476)) ||
             !Payload(blocks[3]).SequenceEqual(content.AsSpan(0, 1024)))
             throw new Exception("Highway changed the retried block or its payload order.");
-        Console.WriteLine("FlashTransfer video and Highway upload retry/rejection checks passed.");
+        await CheckHighwayShutdownAsync(content);
+        await CheckFlashTransferShutdownAsync(content);
+        Console.WriteLine("FlashTransfer and Highway upload, retry, rejection and shutdown checks passed.");
+    }
+
+    private static async Task CheckHighwayShutdownAsync(byte[] content)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await using var bot = BotFactory.Create(new BotConfig { HighwayConcurrent = 1 });
+        var highway = typeof(BotContext).GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(bot)!;
+        var (ticket, url) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)listener.LocalEndpoint).Port);
+        highway.GetType().GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(highway, (ticket, url, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var method = highway.GetType().GetMethod("UploadFile")!;
+        Task Upload(Stream stream) => (Task)method.Invoke(highway, [stream, 1001, ReadOnlyMemory<byte>.Empty])!;
+
+        using var first = new MemoryStream(content, 0, 1024);
+        var inFlight = Upload(first);
+        using var socket = await listener.AcceptTcpClientAsync(timeout.Token);
+        using var connection = socket.GetStream();
+        await ReadRequestAsync(connection, timeout.Token);
+        using var second = new MemoryStream(content, 0, 1024);
+        var queued = Upload(second);
+        await bot.DisposeAsync().AsTask().WaitAsync(timeout.Token);
+
+        await ExpectCancellationAsync(inFlight, timeout.Token);
+        await ExpectCancellationAsync(queued, timeout.Token);
+        await ExpectCancellationAsync(Upload(second), timeout.Token);
+    }
+
+    private static async Task CheckFlashTransferShutdownAsync(byte[] content)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var bot = BotFactory.Create(new BotConfig { HighwayConcurrent = 1 });
+        using var flash = (FlashTransferContext)Activator.CreateInstance(typeof(FlashTransferContext),
+            BindingFlags.Instance | BindingFlags.NonPublic, null,
+            [bot, new Uri($"http://{listener.LocalEndpoint}/sliceupload")], null)!;
+        using var first = new MemoryStream(content, 0, 1024);
+        var inFlight = flash.UploadFile("test-upload-key", 1415, first);
+        using var socket = await listener.AcceptTcpClientAsync(timeout.Token);
+        using var connection = socket.GetStream();
+        await ReadRequestAsync(connection, timeout.Token);
+        using var second = new MemoryStream(content, 0, 1024);
+        var queued = flash.UploadFile("test-upload-key", 1415, second);
+        await Task.Run(flash.Dispose, timeout.Token).WaitAsync(timeout.Token);
+
+        await ExpectCancellationAsync(inFlight, timeout.Token);
+        await ExpectCancellationAsync(queued, timeout.Token);
+        await ExpectCancellationAsync(flash.UploadFile("test-upload-key", 1415, second), timeout.Token);
+    }
+
+    private static async Task ExpectCancellationAsync(Task upload, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await upload.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (upload.IsCanceled)
+        {
+            return;
+        }
+        throw new Exception("Media upload was not cancelled during shutdown.");
     }
 
     private static async Task<(byte[] Ticket, string Url)> ParseHighwaySessionAsync(BotContext bot, int port)

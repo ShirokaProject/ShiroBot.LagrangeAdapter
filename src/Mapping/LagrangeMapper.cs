@@ -418,8 +418,15 @@ public static class LagrangeMapper
         var video = await OpenResourceAsync(uri, bufferHttpResponse: false).ConfigureAwait(false);
         try
         {
-            var thumbnail = thumbnailUri is null ? null : await OpenResourceAsync(thumbnailUri).ConfigureAwait(false);
-            return new VideoEntity(video, thumbnail, disposeOnCompletion: true);
+            var (size, duration) = LagrangeVideoMedia.ReadMetadata(video);
+            var thumbnail = thumbnailUri is not null
+                ? await OpenResourceAsync(thumbnailUri).ConfigureAwait(false)
+                : await LagrangeVideoMedia.TryCreateThumbnailAsync(video, size).ConfigureAwait(false);
+            return new VideoEntity(video, thumbnail, disposeOnCompletion: true)
+            {
+                VideoSize = size,
+                VideoLength = duration
+            };
         }
         catch
         {

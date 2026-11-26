@@ -2,9 +2,9 @@
   <Import Project="../build/Package.props" />
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
-    <Version>0.1.11</Version>
-    <AssemblyVersion>0.1.11.0</AssemblyVersion>
-    <FileVersion>0.1.11.0</FileVersion>
+    <Version>0.1.12</Version>
+    <AssemblyVersion>0.1.12.0</AssemblyVersion>
+    <FileVersion>0.1.12.0</FileVersion>
     <Authors>ShirokaProject</Authors>
     <Company>ShirokaProject</Company>
     <Product>ShiroBot Lagrange V2 Adapter</Product>
@@ -16,6 +16,7 @@
     <ShiroBotDevExecutable Condition="'$(OS)' != 'Windows_NT'">ShiroBot</ShiroBotDevExecutable>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' == 'Release'">true</ShiroBotPluginPackagingEnabled>
     <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
@@ -26,6 +27,7 @@
     <ProjectReference Include="../external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
     <EmbeddedResource Include="Configuration/Presets/*.json" />
     <EmbeddedResource Include="Dashboard/index.html" LogicalName="dashboard/index.html" />
+    <EmbeddedResource Include="ThirdParty/ManagedCodecs.NOTICE.md" />
   </ItemGroup>
   <Import Project="../build/Adapter.targets" />
 </Project>

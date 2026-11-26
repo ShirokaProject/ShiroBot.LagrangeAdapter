@@ -1,0 +1,1282 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+namespace ManagedCodecs.H264;
+
+/// <summary>Inter prediction for P and B slices (H.264 clause 8.4).</summary>
+internal sealed partial class PictureDecoder<TPixel>
+{
+    // Partitions of the 16x16, 16x8 and 8x16 macroblock types (Tables 7-13, 7-14) as (x, y, width, height).
+    private static readonly (int X, int Y, int W, int H)[][] MbPartitions =
+    [
+        [(0, 0, 16, 16)],
+        [(0, 0, 16, 8), (0, 8, 16, 8)],
+        [(0, 0, 8, 16), (8, 0, 8, 16)],
+    ];
+
+    // Sub-macroblock partitions of the 8x8, 8x4, 4x8 and 4x4 sub-macroblock types (Tables 7-17, 7-18).
+    private static readonly (int X, int Y, int W, int H)[][] SubPartitions =
+    [
+        [(0, 0, 8, 8)],
+        [(0, 0, 8, 4), (0, 4, 8, 4)],
+        [(0, 0, 4, 8), (4, 0, 4, 8)],
+        [(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)],
+    ];
+
+    // B macroblock types 0 to 21 (Table 7-14): shape (index into MbPartitions) and the lists each
+    // partition predicts from (bit 0 list 0, bit 1 list 1). Type 0 is B_Direct_16x16.
+    private static readonly (int Shape, int Pred0, int Pred1)[] BMbTypes =
+    [
+        (0, 0, 0),
+        (0, 1, 0), (0, 2, 0), (0, 3, 0),
+        (1, 1, 1), (2, 1, 1), (1, 2, 2), (2, 2, 2),
+        (1, 1, 2), (2, 1, 2), (1, 2, 1), (2, 2, 1),
+        (1, 1, 3), (2, 1, 3), (1, 2, 3), (2, 2, 3),
+        (1, 3, 1), (2, 3, 1), (1, 3, 2), (2, 3, 2),
+        (1, 3, 3), (2, 3, 3),
+    ];
+
+    // B sub-macroblock types 0 to 12 (Table 7-18): shape (index into SubPartitions) and lists.
+    // Type 0 is B_Direct_8x8.
+    private static readonly (int Shape, int Pred)[] BSubMbTypes =
+    [
+        (0, 0),
+        (0, 1), (0, 2), (0, 3),
+        (1, 1), (2, 1), (1, 2), (2, 2), (1, 3), (2, 3),
+        (3, 1), (3, 2), (3, 3),
+    ];
+
+    // Per list (0, 1) and luma 4x4 block: motion vector in quarter samples; per list and 8x8 block:
+    // reference index (-1 = list not used) and the referenced picture's Id. These are the current
+    // picture's own arrays (Picture.MvX ...), kept for direct prediction of later pictures.
+    private short[][] _mvX = [[], []];
+    private short[][] _mvY = [[], []];
+    private sbyte[][] _refIdx = [[], []];
+    private long[][] _refId = [[], []];
+    private sbyte[][] _refParity = [[], []];
+
+    // Per list and 8x8 block: the referenced picture, for motion compensation and deblocking, as its index in
+    // _handlePictures (0: the list is unused). Bytes rather than references: no write barrier a partition, a quarter
+    // of the memory to clear a picture, and a macroblock's four compared as one uint.
+    private byte[][] _refHandle = [[], []];
+
+    // The pictures the current picture's partitions refer to (each view, frame or field, its own entry), from 1.
+    // Every one is in the reference lists, so the decoded picture buffer bounds them (16 frames, 3 views each).
+    private readonly Picture?[] _handlePictures = new Picture?[256];
+    private int _handleCount = 1;
+
+    // The Id of the picture whose decoding gave the handles out (Picture objects are reused, Ids are not): a second
+    // field decoded here after its first keeps them.
+    private long _handlesOf = -1;
+
+    // Per 8x8 block: predicted in direct mode (B_Skip, B_Direct_16x16, B_Direct_8x8).
+    private bool[] _direct = [];
+
+    // Bi-prediction: each list's prediction of one partition before they are averaged.
+    // 16 x 16, and slack for whole-vector row reads (16 bytes) of a 4:2:2 Cr block at column 8 (PredictFromTwo).
+    private readonly TPixel[] _predictionL0 = new TPixel[(16 * 16) + 16];
+    private readonly TPixel[] _predictionL1 = new TPixel[(16 * 16) + 16];
+
+    private enum PartitionShape
+    {
+        Other,
+        Wide16x8,
+        Tall8x16,
+    }
+
+    private void InitInter()
+    {
+        _refHandle = [new byte[_mbCount * 4], new byte[_mbCount * 4]];
+        _direct = new bool[_mbCount * 4];
+    }
+
+    /// <summary>
+    /// Takes the picture's motion arrays as the ones to fill, and clears all motion state. Each
+    /// macroblock is decoded once, so a macroblock without motion (intra, or a list it does not
+    /// use) keeps these values: refIdx -1, zero motion, no picture.
+    /// </summary>
+    private void ResetInter(Picture picture)
+    {
+        _mvX = picture.MvX;
+        _mvY = picture.MvY;
+        _refIdx = picture.RefIdx;
+        _refId = picture.RefId;
+        _refParity = picture.RefParity;
+        for (int list = 0; list < 2; list++)
+        {
+            Array.Clear(_mvX[list]);
+            Array.Clear(_mvY[list]);
+            Array.Fill(_refIdx[list], (sbyte)-1);
+            Array.Clear(_refId[list]);
+            Array.Clear(_refHandle[list]);
+        }
+
+        Array.Clear(_direct);
+        ResetHandles(picture);
+    }
+
+    /// <summary>
+    /// For a second field: keeps the handles if this decoder gave them out for the first field, else (the second field
+    /// on a decoder of its own) forgets them, with every partition's.
+    /// </summary>
+    private void ContinueHandles(Picture picture)
+    {
+        if (_handlesOf != picture.Id)
+        {
+            Array.Clear(_refHandle[0]);
+            Array.Clear(_refHandle[1]);
+            ResetHandles(picture);
+        }
+    }
+
+    /// <summary>Forgets the pictures of <see cref="_refHandle"/>'s handles.</summary>
+    private void ResetHandles(Picture picture)
+    {
+        _handlePictures.AsSpan(1, _handleCount - 1).Clear();
+        _handleCount = 1;
+        _handlesOf = picture.Id;
+    }
+
+    /// <summary>
+    /// The handle of <paramref name="picture"/> in <see cref="_refHandle"/>, given one if it has none; partitions
+    /// read their slice's (<see cref="SliceState.Handles"/>), so this runs about once a reference picture a slice.
+    /// </summary>
+    private byte HandleOf(Picture picture)
+    {
+        for (int i = 1; i < _handleCount; i++)
+        {
+            if (_handlePictures[i] == picture)
+            {
+                return (byte)i;
+            }
+        }
+
+        if (_handleCount == _handlePictures.Length)
+        {
+            throw new InvalidDataException("A picture refers to more pictures than the decoded picture buffer holds.");
+        }
+
+        _handlePictures[_handleCount] = picture;
+        return (byte)_handleCount++;
+    }
+
+    /// <summary>The picture a handle of <see cref="_refHandle"/> stands for; null for 0.</summary>
+    private Picture? PictureOf(byte handle) => _handlePictures[handle];
+
+    /// <summary>P_Skip (8.4.1.1: reference 0, predicted motion) or B_Skip (direct prediction); no residual.</summary>
+    private void DecodeSkip(SliceState slice, int mbAddr)
+    {
+        StartInterMacroblock(slice, mbAddr, MbKind.PSkip);
+        ClearCounts(mbAddr);
+        _qp[mbAddr] = slice.Qp;
+        slice.LastQpDeltaNonZero = false;
+
+        if (slice.Header.Type == SliceType.B)
+        {
+            bool uniform = DirectMotion(slice, mbAddr, 0, 4);
+            PredictDirect(slice, mbAddr, 0, 4, uniform);
+            return;
+        }
+
+        var a = MotionNeighbor(0, mbAddr, -1, 0, 0);
+        var b = MotionNeighbor(0, mbAddr, 0, -1, 0);
+        (int X, int Y) mv = (0, 0);
+        if (a.Available && b.Available && !(a.RefIdx == 0 && a.MvX == 0 && a.MvY == 0) && !(b.RefIdx == 0 && b.MvX == 0 && b.MvY == 0))
+        {
+            mv = PredictMv(0, mbAddr, 0, 0, 16, 0, PartitionShape.Other, a, b);
+        }
+
+        StoreMotion(slice, 0, mbAddr, 0, 0, 16, 16, 0, mv.X, mv.Y);
+        PredictPartition(slice, mbAddr, 0, 0, 16, 16);
+    }
+
+    /// <summary>
+    /// An inter macroblock of a P slice (types 0 to 4, Table 7-13) or B slice (0 to 22, Table 7-14):
+    /// mb_pred or sub_mb_pred, the prediction, then the residual.
+    /// </summary>
+    private void DecodeInterMacroblock(SliceState slice, BitReader r, int mbAddr, int mbType)
+    {
+        StartInterMacroblock(slice, mbAddr, MbKind.Inter);
+        bool isB = slice.Header.Type == SliceType.B;
+
+        // A field macroblock refers to fields: twice as many as the frames (8.4.2.1).
+        int fieldScale = IsMbaffFieldMb(mbAddr) ? 2 : 1;
+        int maxRef0 = (slice.Header.NumRefIdxL0Active * fieldScale) - 1;
+        int maxRef1 = (slice.Header.NumRefIdxL1Active * fieldScale) - 1;
+
+        // Whether transform_size_8x8_flag may follow coded_block_pattern: no partitions below 8x8 (7.3.5).
+        bool noPartitionBelow8x8 = true;
+        if (isB && mbType == 0)
+        {
+            noPartitionBelow8x8 = Sps.Direct8x8Inference;
+
+            // B_Direct_16x16.
+            _directMb[mbAddr] = true;
+            bool uniform = DirectMotion(slice, mbAddr, 0, 4);
+            PredictDirect(slice, mbAddr, 0, 4, uniform);
+        }
+        else if (isB ? mbType < 22 : mbType < 3)
+        {
+            var (shapeIndex, pred0, pred1) = isB ? BMbTypes[mbType] : (mbType, 1, 1);
+            var partitions = MbPartitions[shapeIndex];
+            var shape = (PartitionShape)shapeIndex;
+            Span<int> preds = [pred0, pred1];
+            Span<int> refs = [-1, -1, -1, -1]; // list * 2 + partition
+
+            // All ref_idx_l0, all ref_idx_l1, all mvd_l0, all mvd_l1 (7.3.5.1).
+            for (int list = 0; list < 2; list++)
+            {
+                for (int p = 0; p < partitions.Length; p++)
+                {
+                    if ((preds[p] & (1 << list)) != 0)
+                    {
+                        var (x, y, w, h) = partitions[p];
+                        refs[(list * 2) + p] = ReadRefIdx(slice, r, list, mbAddr, x, y, w, h, list == 0 ? maxRef0 : maxRef1);
+                    }
+                }
+            }
+
+            for (int list = 0; list < 2; list++)
+            {
+                for (int p = 0; p < partitions.Length; p++)
+                {
+                    if ((preds[p] & (1 << list)) != 0)
+                    {
+                        var (x, y, w, h) = partitions[p];
+                        DecodeMotion(slice, r, list, mbAddr, x, y, w, h, refs[(list * 2) + p], shape);
+                    }
+                }
+            }
+
+            foreach (var (x, y, w, h) in partitions)
+            {
+                PredictPartition(slice, mbAddr, x, y, w, h);
+            }
+        }
+        else
+        {
+            noPartitionBelow8x8 = DecodeSubMacroblocks(slice, r, mbAddr, isB, refIdxZero: !isB && mbType == 4, maxRef0, maxRef1);
+        }
+
+        DecodeInterResidual(slice, r, mbAddr, noPartitionBelow8x8);
+    }
+
+    /// <summary>
+    /// P_8x8 / P_8x8ref0 / B_8x8: four sub_mb_types, then ref_idx_l0, ref_idx_l1, mvd_l0 and mvd_l1
+    /// for the sub-macroblocks that use each list. B_Direct_8x8 sub-macroblocks are direct predicted.
+    /// Returns noSubMbPartSizeLessThan8x8Flag (7.3.5).
+    /// </summary>
+    private bool DecodeSubMacroblocks(SliceState slice, BitReader r, int mbAddr, bool isB, bool refIdxZero, int maxRef0, int maxRef1)
+    {
+        Span<int> subTypes = stackalloc int[4];
+        for (int i = 0; i < 4; i++)
+        {
+            subTypes[i] = slice.Cabac is not { } c ? r.ReadUe(isB ? 12 : 3, "sub_mb_type")
+                : isB ? CabacBSubMbType(c)
+                : CabacSubMbType(c);
+        }
+
+        // Shape and lists per sub-macroblock; shape -1 marks B_Direct_8x8.
+        Span<int> shapes = stackalloc int[4];
+        Span<int> preds = stackalloc int[4];
+        for (int i = 0; i < 4; i++)
+        {
+            (shapes[i], preds[i]) = !isB ? (subTypes[i], 1) : subTypes[i] == 0 ? (-1, 0) : BSubMbTypes[subTypes[i]];
+            if (shapes[i] < 0)
+            {
+                // Known before any other partition's motion vector prediction can look at it.
+                DirectMotion(slice, mbAddr, i, 1);
+            }
+        }
+
+        Span<int> refs = [-1, -1, -1, -1, -1, -1, -1, -1]; // list * 4 + sub-macroblock
+        for (int list = 0; list < 2; list++)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                if ((preds[i] & (1 << list)) != 0)
+                {
+                    refs[(list * 4) + i] = refIdxZero ? 0 : ReadRefIdx(slice, r, list, mbAddr, (i & 1) * 8, (i >> 1) * 8, 8, 8, list == 0 ? maxRef0 : maxRef1);
+                }
+            }
+        }
+
+        for (int list = 0; list < 2; list++)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                if ((preds[i] & (1 << list)) != 0)
+                {
+                    foreach (var (x, y, w, h) in SubPartitions[shapes[i]])
+                    {
+                        DecodeMotion(slice, r, list, mbAddr, ((i & 1) * 8) + x, ((i >> 1) * 8) + y, w, h, refs[(list * 4) + i], PartitionShape.Other);
+                    }
+                }
+            }
+        }
+
+        bool noPartitionBelow8x8 = true;
+        for (int i = 0; i < 4; i++)
+        {
+            if (shapes[i] < 0)
+            {
+                noPartitionBelow8x8 &= Sps.Direct8x8Inference;
+                PredictDirect(slice, mbAddr, i, 1);
+                continue;
+            }
+
+            noPartitionBelow8x8 &= shapes[i] == 0;
+            foreach (var (x, y, w, h) in SubPartitions[shapes[i]])
+            {
+                PredictPartition(slice, mbAddr, ((i & 1) * 8) + x, ((i >> 1) * 8) + y, w, h);
+            }
+        }
+
+        return noPartitionBelow8x8;
+    }
+
+    /// <summary>
+    /// coded_block_pattern, transform_size_8x8_flag, mb_qp_delta and the residual of an inter
+    /// macroblock, added to its prediction.
+    /// </summary>
+    private void DecodeInterResidual(SliceState slice, BitReader r, int mbAddr, bool noPartitionBelow8x8)
+    {
+        int cbp = slice.Cabac is { } cabac
+            ? CabacCbp(cabac, mbAddr)
+            : (_noChromaSyntax ? CavlcTables.CodedBlockPatternInter444 : CavlcTables.CodedBlockPatternInter)[r.ReadUe(_noChromaSyntax ? 15 : 47, "coded_block_pattern")];
+        int cbpLuma = cbp & 15;
+        int cbpChroma = cbp >> 4;
+        _cbp[mbAddr] = (byte)cbp;
+        if (cbpLuma != 0 && slice.Pps.Transform8x8Mode && noPartitionBelow8x8)
+        {
+            _transform8x8[mbAddr] = ReadTransformSize8x8Flag(slice, r, mbAddr);
+        }
+
+        var residual = _residual;
+        if (cbp != 0)
+        {
+            UpdateQp(slice, r);
+            ReadResidual(slice, r, mbAddr, residual, is16x16: false, cbpLuma, cbpChroma);
+        }
+        else
+        {
+            ClearCounts(mbAddr);
+            slice.LastQpDeltaNonZero = false;
+        }
+
+        _qp[mbAddr] = slice.Qp;
+
+        // Nothing to add where coded_block_pattern codes nothing (the prediction is the macroblock's samples).
+        if (cbp == 0)
+        {
+            return;
+        }
+
+        var target = PictureTarget(mbAddr);
+        if (cbpLuma != 0)
+        {
+            AddInterResidual(slice, mbAddr, target, cbpLuma, 0);
+            if (_chroma444)
+            {
+                AddInterResidual(slice, mbAddr, target, cbpLuma, 1);
+                AddInterResidual(slice, mbAddr, target, cbpLuma, 2);
+            }
+        }
+
+        if (_chroma444 || _monochrome || cbpChroma == 0)
+        {
+            return;
+        }
+
+        ReconstructChroma(slice, mbAddr, target, residual, cbpChroma, intraMode: -1, default);
+    }
+
+    /// <summary>The residual of an inter macroblock's luma, or in 4:4:4 of its Cb or Cr, added to the prediction.</summary>
+    private void AddInterResidual(SliceState slice, int mbAddr, in MbTarget target, int cbpLuma, int component)
+    {
+        int qp = QpPrime(slice, mbAddr, component);
+        if (_transform8x8[mbAddr])
+        {
+            for (int b8 = 0; b8 < 4; b8++)
+            {
+                AddLuma8x8Residual(slice, mbAddr, target, cbpLuma, b8, qp, component);
+            }
+
+            return;
+        }
+
+        var (plane, origin, stride) = ComponentOf(target, component);
+        var counts = _totalCoeff[component].AsSpan(mbAddr * 16, 16);
+        var residual = _residuals[component];
+        bool lossless = IsLossless(mbAddr);
+        var levelScale = slice.Scaling.LevelScale4x4(3 + component); // Inter Y, Cb or Cr
+
+        // The 8x8 quadrants coded_block_pattern codes, and in each its 4x4 blocks with coefficients.
+        for (int quadrants = cbpLuma & 15; quadrants != 0; quadrants &= quadrants - 1)
+        {
+            int b8 = BitOperations.TrailingZeroCount((uint)quadrants);
+            for (int k = 0; k < 4; k++)
+            {
+                int x = ((b8 & 1) * 2) + (k & 1);
+                int y = ((b8 >> 1) * 2) + (k >> 1);
+                int i = (y * 4) + x;
+                if (counts[i] == 0)
+                {
+                    continue;
+                }
+
+                var block = residual.Luma[i];
+                var dest = plane.AsSpan(origin + (y * 4 * stride) + (x * 4));
+                if (lossless)
+                {
+                    Transform.AddBypass(block, 4, 4, BypassDpcm.None, dest, stride, _bitDepth);
+                    continue;
+                }
+
+                Transform.Dequantize(block, qp, skipDc: false, levelScale);
+                Transform.InverseTransformAdd(block, dest, stride, _bitDepth);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void StartInterMacroblock(SliceState slice, int mbAddr, MbKind kind)
+    {
+        _sliceOfMb[mbAddr] = slice.Number;
+        DecodedMbCount++;
+        _kind[mbAddr] = kind;
+        _transform8x8[mbAddr] = false;
+        _intra4x4Mode.AsSpan(mbAddr * 16, 16).Fill(-1);
+        _cbp[mbAddr] = 0;
+        _dcCoded[mbAddr] = 0;
+        _chromaPredMode[mbAddr] = 0;
+        _directMb[mbAddr] = kind == MbKind.PSkip && slice.Header.Type == SliceType.B;
+    }
+
+    /// <summary>ref_idx_lX of the partition at (x, y), w x h; with CABAC it is stored at once, as later partitions' contexts read it.</summary>
+    private int ReadRefIdx(SliceState slice, BitReader r, int list, int mbAddr, int x, int y, int w, int h, int maxRef)
+    {
+        if (maxRef == 0)
+        {
+            return 0;
+        }
+
+        if (slice.Cabac is { } c)
+        {
+            int value = CabacRefIdx(c, list, mbAddr, x, y, maxRef);
+            for (int by = y / 8; by < (y + h) / 8; by++)
+            {
+                for (int bx = x / 8; bx < (x + w) / 8; bx++)
+                {
+                    _refIdx[list][(mbAddr * 4) + (by * 2) + bx] = (sbyte)value;
+                }
+            }
+
+            return value;
+        }
+
+        uint refIdx = r.ReadTe(maxRef);
+        if (refIdx > (uint)maxRef)
+        {
+            throw new InvalidDataException($"ref_idx_l{list} {refIdx} is out of range.");
+        }
+
+        return (int)refIdx;
+    }
+
+    /// <summary>Reads one mvd pair of list <paramref name="list"/>, adds the prediction and stores the motion.</summary>
+    private void DecodeMotion(SliceState slice, BitReader r, int list, int mbAddr, int x, int y, int w, int h, int refIdx, PartitionShape shape)
+    {
+        int mvdX;
+        int mvdY;
+        if (slice.Cabac is { } c)
+        {
+            mvdX = CabacMvd(c, list, mbAddr, x, y, 0);
+            mvdY = CabacMvd(c, list, mbAddr, x, y, 1);
+            StoreAbsMvd(list, mbAddr, x, y, w, h, mvdX, mvdY);
+        }
+        else
+        {
+            mvdX = r.ReadSe();
+            mvdY = r.ReadSe();
+        }
+
+        var (predX, predY) = PredictMv(list, mbAddr, x, y, w, h, refIdx, shape);
+        StoreMotion(slice, list, mbAddr, x, y, w, h, refIdx, predX + mvdX, predY + mvdY);
+    }
+
+    /// <summary>Stores one list's motion of a partition, for later neighbours, deblocking and later pictures.</summary>
+    private void StoreMotion(SliceState slice, int list, int mbAddr, int x, int y, int w, int h, int refIdx, int mvX, int mvY)
+    {
+        // A field macroblock's index names a field: of frame refIdx / 2, the same parity as the
+        // macroblock for even indices, the other one for odd (8.4.2.1).
+        var refList = slice.RefList(list);
+        bool field = IsMbaffFieldMb(mbAddr);
+        int frameIdx = field ? refIdx >> 1 : refIdx;
+        if (frameIdx >= refList.Length)
+        {
+            throw new InvalidDataException($"ref_idx_l{list} {refIdx} names no reference picture.");
+        }
+
+        if (mvX is < short.MinValue or > short.MaxValue || mvY is < short.MinValue or > short.MaxValue)
+        {
+            throw new InvalidDataException("Motion vector out of range.");
+        }
+
+        var reference = refList[frameIdx];
+        if (reference.IsNonExisting)
+        {
+            throw new InvalidDataException($"ref_idx_l{list} {refIdx} names a frame inferred for a gap in frame_num (8.2.5.2).");
+        }
+
+        long referenceId = reference.Id;
+        int handleSlot = frameIdx;
+        if (field)
+        {
+            int parity = (mbAddr & 1) ^ (refIdx & 1);
+            reference = reference.Field(parity);
+            Statistics.OppositeParity += refIdx & 1;
+            handleSlot = 32 + (frameIdx * 2) + parity;
+        }
+
+        if (_fieldParity >= 0)
+        {
+            FieldStatistics.FromOwnFirstField += reference.Whole == Picture ? 1 : 0;
+        }
+
+        // Motion vectors are stored a 4x4 block, references an 8x8 partition: each row and each
+        // partition is written once, and the rows of a partition as wide as the macroblock in one go.
+        var mvXs = _mvX[list].AsSpan(mbAddr * 16, 16);
+        var mvYs = _mvY[list].AsSpan(mbAddr * 16, 16);
+        if (w == 16)
+        {
+            mvXs.Slice(y, h).Fill((short)mvX);
+            mvYs.Slice(y, h).Fill((short)mvY);
+        }
+        else
+        {
+            for (int by = y / 4; by < (y + h) / 4; by++)
+            {
+                for (int bx = x / 4; bx < (x + w) / 4; bx++)
+                {
+                    mvXs[(by * 4) + bx] = (short)mvX;
+                    mvYs[(by * 4) + bx] = (short)mvY;
+                }
+            }
+        }
+
+        var refIdxs = _refIdx[list].AsSpan(mbAddr * 4, 4);
+        var refIds = _refId[list].AsSpan(mbAddr * 4, 4);
+        var refParities = _refParity[list].AsSpan(mbAddr * 4, 4);
+        var refHandles = _refHandle[list].AsSpan(mbAddr * 4, 4);
+        ref byte handle = ref slice.Handles[list][handleSlot];
+        if (handle == 0)
+        {
+            handle = HandleOf(reference);
+        }
+
+        for (int py = y / 8; py <= (y + h - 1) / 8; py++)
+        {
+            for (int px = x / 8; px <= (x + w - 1) / 8; px++)
+            {
+                int part = (py * 2) + px;
+                refIdxs[part] = (sbyte)refIdx;
+                refIds[part] = referenceId;
+                refParities[part] = (sbyte)reference.Parity;
+                refHandles[part] = handle;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Motion compensation of a partition from its stored motion (8.4.2): from one list, or from
+    /// both, then weighted sample prediction (8.4.2.3): the default (one list as is, or the
+    /// rounded average), explicit weights from the slice's table, or implicit weights from the
+    /// order count distances (bi-predicted blocks of B slices with weighted_bipred_idc 2).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void PredictPartition(SliceState slice, int mbAddr, int x, int y, int w, int h)
+    {
+        int part = (mbAddr * 4) + ((y >> 3) * 2) + (x >> 3);
+        int block = (mbAddr * 16) + ((y >> 2) * 4) + (x >> 2);
+        var ref0 = PictureOf(_refHandle[0][part]);
+        var ref1 = PictureOf(_refHandle[1][part]);
+        if (_mbWidthC == 8)
+        {
+            if (!_pairSlots)
+            {
+                if ((ref0 is null) != (ref1 is null))
+                {
+                    if (slice.Header.Weights is null)
+                    {
+                        PredictFromOne<FrameLayout>(ref0 ?? ref1!, ref0 is null ? 1 : 0, mbAddr, block, x, y, w, h, DefaultWeights);
+                        return;
+                    }
+
+                    var weights = Weighting(slice, _refIdx[0][part], _refIdx[1][part], bi: false, mbAddr, ref0, ref1);
+                    PredictFromOne<FrameLayout>(ref0 ?? ref1!, ref0 is null ? 1 : 0, mbAddr, block, x, y, w, h, weights);
+                    return;
+                }
+
+                if (ref0 is not null)
+                {
+                    PredictFromTwo<FrameLayout>(slice, ref0, ref1!, mbAddr, part, block, x, y, w, h);
+                    return;
+                }
+            }
+            else if (PredictPairsFast(slice, mbAddr, part, block, x, y, w, h, ref0, ref1))
+            {
+                return;
+            }
+        }
+
+        PredictPartitionGeneral(slice, mbAddr, x, y, w, h, part, block, ref0, ref1);
+    }
+
+    /// <summary>
+    /// <see cref="PredictPartition"/>'s direct path in MBAFF frames and field pictures, out of line so that frames inline
+    /// only their own: false, and nothing done, for a partition it does not take.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private bool PredictPairsFast(SliceState slice, int mbAddr, int part, int block, int x, int y, int w, int h, Picture? ref0, Picture? ref1)
+    {
+        if ((ref0 is null) != (ref1 is null))
+        {
+            if (slice.Header.Weights is null)
+            {
+                PredictFromOne<PairLayout>(ref0 ?? ref1!, ref0 is null ? 1 : 0, mbAddr, block, x, y, w, h, DefaultWeights);
+                return true;
+            }
+
+            int shift = FieldIndexShift<PairLayout>(mbAddr);
+            var weights = Weighting(slice, _refIdx[0][part] >> shift, _refIdx[1][part] >> shift, bi: false, mbAddr, ref0, ref1);
+            PredictFromOne<PairLayout>(ref0 ?? ref1!, ref0 is null ? 1 : 0, mbAddr, block, x, y, w, h, weights);
+            return true;
+        }
+
+        if (ref0 is not null)
+        {
+            PredictFromTwo<PairLayout>(slice, ref0, ref1!, mbAddr, part, block, x, y, w, h);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary><see cref="PredictPartition"/> for every other partition.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void PredictPartitionGeneral(SliceState slice, int mbAddr, int x, int y, int w, int h, int part, int block, Picture? ref0, Picture? ref1)
+    {
+        // Where the partition is, in the coordinates of the references (a field macroblock's are
+        // its field's), and where its samples go in the picture.
+        var (lumaX, lumaY, lumaOut, lumaStride, chromaOut, chromaStride) = PartitionPlace(mbAddr, x, y);
+        bool bi = ref0 is not null && ref1 is not null;
+        bool field = IsMbaffFieldMb(mbAddr);
+        int refIdx0 = _refIdx[0][part];
+        int refIdx1 = _refIdx[1][part];
+        var weighting = Weighting(slice, field ? refIdx0 >> 1 : refIdx0, field ? refIdx1 >> 1 : refIdx1, bi, mbAddr, ref0, ref1);
+
+        for (int c = 0; c < (_monochrome ? 1 : 3); c++)
+        {
+            // A chroma block's size: 4:2:0 halves both sides, 4:2:2 the width, 4:4:4 neither.
+            bool lumaLike = c == 0 || _chroma444;
+            int cw = lumaLike ? w : w / 2;
+            int ch = lumaLike || _mbHeightC == 16 ? h : h / 2;
+            var output = Picture.Plane<TPixel>(c).AsSpan(c == 0 ? lumaOut : chromaOut);
+            int outputStride = c == 0 ? lumaStride : chromaStride;
+            if (!bi)
+            {
+                int list = ref0 is null ? 1 : 0;
+                var reference = (ref0 ?? ref1)!;
+                if (weighting.IsDefault)
+                {
+                    PredictComponent(reference, c, mbAddr, lumaX, lumaY, w, h, _mvX[list][block], _mvY[list][block], output, outputStride);
+                    continue;
+                }
+
+                PredictComponent(reference, c, mbAddr, lumaX, lumaY, w, h, _mvX[list][block], _mvY[list][block], _predictionL0, 16);
+                WeightOne(_predictionL0, 16, cw, ch, output, outputStride, weighting, list, c);
+                continue;
+            }
+
+            PredictComponent(ref0!, c, mbAddr, lumaX, lumaY, w, h, _mvX[0][block], _mvY[0][block], _predictionL0, 16);
+            PredictComponent(ref1!, c, mbAddr, lumaX, lumaY, w, h, _mvX[1][block], _mvY[1][block], _predictionL1, 16);
+            if (weighting.IsDefault)
+            {
+                InterPrediction.AverageBlock(_predictionL0, _predictionL1, 16, cw, ch, output, outputStride);
+            }
+            else
+            {
+                WeightBoth(_predictionL0, _predictionL1, 16, cw, ch, output, outputStride, weighting, c);
+            }
+        }
+    }
+
+    /// <summary>
+    /// <see cref="PredictPartition"/> for the most common partition, straight to the kernels: one reference, 4:2:0 or
+    /// 4:2:2, any bit depth, in frames, MBAFF frames and field pictures (<see cref="ReferencePlace{TLayout}"/>). With
+    /// explicit weights (<paramref name="weights"/> not the default; implicit ones apply to two references) each
+    /// component goes through the scratch block and <see cref="WeightOne"/>.
+    /// </summary>
+    private void PredictFromOne<TLayout>(Picture reference, int list, int mbAddr, int block, int x, int y, int w, int h, in PartitionWeights weights)
+    {
+        int mvX = _mvX[list][block];
+        int mvY = _mvY[list][block];
+        var (lumaX, lumaY) = ReferencePlace<TLayout>(mbAddr, x, y);
+
+        // As in PredictComponent: the lowest row the 6-tap filter reads, and one more for chroma's.
+        int lowestRow = lumaY + (mvY >> 2) + h + 3;
+        reference.WaitForRow(lowestRow);
+        CheckRowsFinal(reference, lumaY + (mvY >> 2) + h + 3);
+        var picture = Picture;
+        var (lumaOut, lumaStride, chromaOut, chromaStride) = PicturePlace<TLayout>(mbAddr, x, y, lumaX, lumaY);
+        var luma = picture.Plane<TPixel>(0).AsSpan(lumaOut);
+        var (chromaX, chromaY, chromaH, chromaMvY) = ChromaOfPartition<TLayout>(lumaX, lumaY, h, mvY, mbAddr, reference);
+        var cb = picture.Plane<TPixel>(1).AsSpan(chromaOut);
+        var cr = picture.Plane<TPixel>(2).AsSpan(chromaOut);
+        if (weights.IsDefault)
+        {
+            InterPrediction.PredictLumaBlock(reference, lumaX, lumaY, w, h, mvX, mvY, luma, lumaStride);
+        }
+        else
+        {
+            // Explicit weights (8.4.2.3.2): each component predicted into the scratch block, then weighted into the picture.
+            var prediction = _predictionL0.AsSpan();
+            InterPrediction.PredictLumaBlock(reference, lumaX, lumaY, w, h, mvX, mvY, prediction, 16);
+            WeightOne(prediction, 16, w, h, luma, lumaStride, weights, list, 0);
+            for (int c = 1; c <= 2; c++)
+            {
+                InterPrediction.PredictChromaBlock(reference, c, chromaX, chromaY, w >> 1, chromaH, mvX, chromaMvY, prediction, 16);
+                WeightOne(prediction, 16, w >> 1, chromaH, c == 1 ? cb : cr, chromaStride, weights, list, c);
+            }
+        }
+
+        if (typeof(TPixel) == typeof(byte) && _mbHeightC == 8 && typeof(TLayout) == typeof(FrameLayout) && (x | y) == 0)
+        {
+            InterPrediction.PrefetchAhead(reference, lumaX + (mvX >> 2), lumaY + (mvY >> 2), _mbColumn[mbAddr] & 3);
+        }
+
+        if (weights.IsDefault)
+        {
+            PredictChromaPair(reference, chromaX, chromaY, w >> 1, chromaH, mvX, chromaMvY, cb, cr, chromaStride);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="PredictPartition"/> for a bi-predicted partition under the same conditions as <see cref="PredictFromOne{TLayout}"/>:
+    /// both predictions into the scratch blocks, then their rounded average, or the explicit or implicit weights where they
+    /// differ from it.
+    /// </summary>
+    private void PredictFromTwo<TLayout>(SliceState slice, Picture ref0, Picture ref1, int mbAddr, int part, int block, int x, int y, int w, int h)
+    {
+        int mvX0 = _mvX[0][block];
+        int mvY0 = _mvY[0][block];
+        int mvX1 = _mvX[1][block];
+        int mvY1 = _mvY[1][block];
+        var (lumaX, lumaY) = ReferencePlace<TLayout>(mbAddr, x, y);
+        var weighting = slice.Header.Weights is not null || slice.Pps.WeightedBipredIdc == 2
+            ? Weighting(slice, _refIdx[0][part] >> FieldIndexShift<TLayout>(mbAddr), _refIdx[1][part] >> FieldIndexShift<TLayout>(mbAddr), bi: true, mbAddr, ref0, ref1)
+            : DefaultWeights;
+
+        // As in PredictComponent: each reference's lowest row the 6-tap filter reads, and one more for chroma's.
+        int lowestRow0 = lumaY + (mvY0 >> 2) + h + 3;
+        ref0.WaitForRow(lowestRow0);
+        int lowestRow1 = lumaY + (mvY1 >> 2) + h + 3;
+        ref1.WaitForRow(lowestRow1);
+        var picture = Picture;
+        var (lumaOut, lumaStride, chromaOut, chromaStride) = PicturePlace<TLayout>(mbAddr, x, y, lumaX, lumaY);
+        var prediction0 = _predictionL0.AsSpan();
+        var prediction1 = _predictionL1.AsSpan();
+        CheckRowsFinal(ref0, lumaY + (mvY0 >> 2) + h + 3);
+        CheckRowsFinal(ref1, lumaY + (mvY1 >> 2) + h + 3);
+        InterPrediction.PredictLumaBlock(ref0, lumaX, lumaY, w, h, mvX0, mvY0, prediction0, 16);
+        InterPrediction.PredictLumaBlock(ref1, lumaX, lumaY, w, h, mvX1, mvY1, prediction1, 16);
+        Combine(picture.Plane<TPixel>(0).AsSpan(lumaOut), lumaStride, w, h, 0);
+        if (typeof(TPixel) == typeof(byte) && _mbHeightC == 8 && typeof(TLayout) == typeof(FrameLayout) && (x | y) == 0)
+        {
+            InterPrediction.PrefetchAhead(ref0, lumaX + (mvX0 >> 2), lumaY + (mvY0 >> 2), _mbColumn[mbAddr] & 3);
+        }
+
+        var (chromaX, chromaY, chromaH, chromaMvY0) = ChromaOfPartition<TLayout>(lumaX, lumaY, h, mvY0, mbAddr, ref0);
+        int chromaMvY1 = ChromaOfPartition<TLayout>(lumaX, lumaY, h, mvY1, mbAddr, ref1).MvY;
+
+        // Each list's Cb and Cr side by side in its scratch block (columns 0 and 8: chroma blocks are at most 8 wide here).
+        PredictChromaPair(ref0, chromaX, chromaY, w >> 1, chromaH, mvX0, chromaMvY0, prediction0, prediction0[8..], 16);
+        PredictChromaPair(ref1, chromaX, chromaY, w >> 1, chromaH, mvX1, chromaMvY1, prediction1, prediction1[8..], 16);
+        Combine(picture.Plane<TPixel>(1).AsSpan(chromaOut), chromaStride, w >> 1, chromaH, 1);
+        Combine(picture.Plane<TPixel>(2).AsSpan(chromaOut), chromaStride, w >> 1, chromaH, 2);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        void Combine(Span<TPixel> output, int outputStride, int width, int height, int component)
+        {
+            int column = component == 2 ? 8 : 0;
+            if (weighting.IsDefault)
+            {
+                InterPrediction.AverageBlock<TPixel>(_predictionL0.AsSpan(column), _predictionL1.AsSpan(column), 16, width, height, output, outputStride);
+            }
+            else
+            {
+                WeightBoth(_predictionL0.AsSpan(column), _predictionL1.AsSpan(column), 16, width, height, output, outputStride, weighting, component);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Type arguments of <see cref="PredictFromOne{TLayout}"/> and <see cref="PredictFromTwo{TLayout}"/>: frames, or
+    /// MBAFF frames and field pictures (<see cref="_pairSlots"/>), compiled apart as <typeparamref name="TPixel"/> is, so
+    /// that frames pay nothing for the pairs' place and chroma field offset.
+    /// </summary>
+    private struct FrameLayout
+    {
+    }
+
+    /// <summary>The pairs' layout: see <see cref="FrameLayout"/>.</summary>
+    private struct PairLayout
+    {
+    }
+
+    /// <summary>
+    /// A partition in chroma (8.4.1.4, 8.4.2.2.2): its top-left sample in the reference's coordinates (a field
+    /// macroblock's are its field's), its height, and the vertical vector in eighth chroma samples. 4:2:0 halves both
+    /// sides and adds the offset of a field predicting from the other parity; 4:2:2 keeps the luma's rows, so the vector
+    /// doubles (<see cref="ChromaMvY"/>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private (int X, int Y, int Height, int MvY) ChromaOfPartition<TLayout>(int lumaX, int lumaY, int h, int mvY, int mbAddr, Picture reference) =>
+        _mbHeightC == 16
+        ? (lumaX >> 1, lumaY, h, mvY * 2)
+        : (lumaX >> 1, lumaY >> 1, h >> 1, typeof(TLayout) == typeof(PairLayout) ? mvY + ChromaFieldOffset(mbAddr, reference) : mvY);
+
+    /// <summary>
+    /// The partition's top-left luma sample in the reference's coordinates (a field macroblock's are its field's), as
+    /// <see cref="PartitionPlace"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private (int LumaX, int LumaY) ReferencePlace<TLayout>(int mbAddr, int x, int y)
+    {
+        if (typeof(TLayout) == typeof(FrameLayout))
+        {
+            return ((_mbColumn[mbAddr] * 16) + x, (_mbRow[mbAddr] * 16) + y);
+        }
+
+        int pair = mbAddr >> 1;
+        int lumaY = _fieldMb[mbAddr] ? (_mbRow[pair] * 16) + y : (_mbRow[pair] * 32) + ((mbAddr & 1) * 16) + y;
+        return ((_mbColumn[pair] * 16) + x, lumaY);
+    }
+
+    /// <summary>
+    /// Where the partition's samples go in the picture, as <see cref="PartitionPlace"/>: in frames straight from its
+    /// reference position, which is the picture's.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private (int LumaOut, int LumaStride, int ChromaOut, int ChromaStride) PicturePlace<TLayout>(int mbAddr, int x, int y, int lumaX, int lumaY)
+    {
+        if (typeof(TLayout) == typeof(FrameLayout))
+        {
+            int frameLumaStride = Picture.LumaStride;
+            int frameChromaStride = Picture.ChromaStride;
+            int chromaRow = _mbHeightC == 16 ? lumaY : lumaY >> 1;
+            return ((lumaY * frameLumaStride) + lumaX, frameLumaStride, (chromaRow * frameChromaStride) + (lumaX >> 1), frameChromaStride);
+        }
+
+        var (luma, lumaStride) = LumaPlace(mbAddr);
+        var (chroma, chromaStride) = ChromaPlace(mbAddr);
+        return (luma + (y * lumaStride) + x, lumaStride, chroma + ((_mbHeightC == 16 ? y : y / 2) * chromaStride) + (x / 2), chromaStride);
+    }
+
+    /// <summary>
+    /// 1 for a field macroblock of an MBAFF frame, whose reference indices count fields while the explicit weights
+    /// table counts frames (8.4.2.3); 0 otherwise.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int FieldIndexShift<TLayout>(int mbAddr) => typeof(TLayout) == typeof(PairLayout) && IsMbaffFieldMb(mbAddr) ? 1 : 0;
+
+    /// <summary>Both chroma components of one block: the 8-bit kernel's shared setup, or each in turn for deeper samples.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PredictChromaPair(Picture reference, int x, int y, int width, int height, int mvX, int mvY, Span<TPixel> cb, Span<TPixel> cr, int outputStride)
+    {
+        if (typeof(TPixel) == typeof(byte))
+        {
+            InterPrediction.PredictChromaPair(reference, x, y, width, height, mvX, mvY, MemoryMarshal.Cast<TPixel, byte>(cb), MemoryMarshal.Cast<TPixel, byte>(cr), outputStride);
+            return;
+        }
+
+        InterPrediction.PredictChromaBlock(reference, 1, x, y, width, height, mvX, mvY, cb, outputStride);
+        InterPrediction.PredictChromaBlock(reference, 2, x, y, width, height, mvX, mvY, cr, outputStride);
+    }
+
+    /// <summary>
+    /// With the tests' random delays (<see cref="RowDelay"/>), throws if the reference's rows down to
+    /// <paramref name="lowestRow"/>, the lowest a partition's prediction reads, are not all final: a wait too short shows
+    /// whenever a picture catches up with its reference, not only when the rows it read early happen to change later.
+    /// Callers compute the row again rather than pass the wait's variable, so a wait broken on purpose
+    /// (tools/mutation/mutations.py) is not checked against itself. Correct waits never fail it: it asks the predicate
+    /// <see cref="Picture.WaitForRow"/> waited on, for the same row, and a picture's final rows only grow.
+    /// </summary>
+    private void CheckRowsFinal(Picture reference, int lowestRow)
+    {
+        if (RowDelay > 0 && !reference.IsRowFinal(lowestRow))
+        {
+            throw new InvalidOperationException($"Read reference row {lowestRow} before it was final.");
+        }
+    }
+
+    /// <summary>
+    /// Motion compensation of one component of a w x h luma partition at reference position
+    /// (lumaX, lumaY): luma, and in 4:4:4 Cb and Cr, with the luma filter (8.4.2.2.1); 4:2:0 and
+    /// 4:2:2 chroma with the chroma one, at its position and size (8.4.2.2.2).
+    /// </summary>
+    private void PredictComponent(Picture reference, int c, int mbAddr, int lumaX, int lumaY, int w, int h, int mvX, int mvY, Span<TPixel> output, int outputStride)
+    {
+        // With frame threading the reference may still be being decoded: wait for the lowest row this block reads,
+        // three rows below it for the 6-tap filter and one more for the chroma filter's (luma is predicted first).
+        if (c == 0)
+        {
+            reference.WaitForRow(lumaY + (mvY >> 2) + h + 3);
+            CheckRowsFinal(reference, lumaY + (mvY >> 2) + h + 3);
+        }
+
+        if (c == 0 || _chroma444)
+        {
+            InterPrediction.PredictLumaBlock(reference, lumaX, lumaY, w, h, mvX, mvY, output, outputStride, c);
+            return;
+        }
+
+        // 4:2:2 chroma has the luma's rows: its vertical vector, in eighth samples, is the luma's doubled.
+        bool tall = _mbHeightC == 16;
+        InterPrediction.PredictChromaBlock(reference, c, lumaX / 2, tall ? lumaY : lumaY / 2, w / 2, tall ? h : h / 2, mvX, ChromaMvY(mvY, mbAddr, reference), output, outputStride);
+    }
+
+    /// <summary>
+    /// The partition at (x, y) of a macroblock: its top-left luma sample in reference coordinates
+    /// (field coordinates for a field macroblock of an MBAFF frame), and the offsets and strides of
+    /// its luma and chroma samples in the picture.
+    /// </summary>
+    private (int LumaX, int LumaY, int LumaOut, int LumaStride, int ChromaOut, int ChromaStride) PartitionPlace(int mbAddr, int x, int y)
+    {
+        var (luma, lumaStride) = LumaPlace(mbAddr);
+        var (chroma, chromaStride) = ChromaPlace(mbAddr);
+        int lumaOut = luma + (y * lumaStride) + x;
+        int chromaOut = chroma + ((_mbHeightC == 16 ? y : y / 2) * chromaStride) + (_mbWidthC == 16 ? x : x / 2);
+        if (!_pairSlots)
+        {
+            return ((_mbColumn[mbAddr] * 16) + x, (_mbRow[mbAddr] * 16) + y, lumaOut, lumaStride, chromaOut, chromaStride);
+        }
+
+        int pair = mbAddr >> 1;
+        int lumaX = (_mbColumn[pair] * 16) + x;
+        int lumaY = _fieldMb[mbAddr] ? (_mbRow[pair] * 16) + y : (_mbRow[pair] * 32) + ((mbAddr & 1) * 16) + y;
+        return (lumaX, lumaY, lumaOut, lumaStride, chromaOut, chromaStride);
+    }
+
+    /// <summary>
+    /// The vertical chroma vector (8.4.1.4) in eighth chroma samples: the luma one in 4:2:0, plus
+    /// the offset of a field predicting from the other parity; in 4:2:2 the luma one doubled
+    /// (yIntC and yFracC of 8.4.2.2.2), with no field offset.
+    /// </summary>
+    private int ChromaMvY(int mvY, int mbAddr, Picture reference) =>
+        _mbHeightC == 16 ? mvY * 2 : mvY + ChromaFieldOffset(mbAddr, reference);
+
+    /// <summary>
+    /// The vertical chroma offset of a field macroblock predicting from the field of the other
+    /// parity (Table 8-9): a quarter chroma sample down from the bottom field, up from the top.
+    /// </summary>
+    private int ChromaFieldOffset(int mbAddr, Picture reference)
+    {
+        if (reference.Parity < 0 || reference.Parity == (mbAddr & 1))
+        {
+            return 0;
+        }
+
+        return reference.Parity == 1 ? -2 : 2;
+    }
+
+    /// <summary>
+    /// The weights of one partition: per list and component (luma, Cb, Cr), with the log2
+    /// denominators logWD for luma and chroma. <see cref="IsDefault"/> when they give exactly the
+    /// default prediction, so the faster unweighted path can be taken.
+    /// </summary>
+    private readonly record struct PartitionWeights(bool IsDefault, int LumaLogWd, int ChromaLogWd, PredWeightTable? Table, int RefIdx0, int RefIdx1, int Implicit0, int Implicit1)
+    {
+        public int LogWd(int component) => component == 0 ? LumaLogWd : ChromaLogWd;
+
+        public int Weight(int list, int component) =>
+            Table is null ? (list == 0 ? Implicit0 : Implicit1) : Table.Weight(list, list == 0 ? RefIdx0 : RefIdx1, component);
+
+        public int Offset(int list, int component) =>
+            Table is null ? 0 : Table.Offset(list, list == 0 ? RefIdx0 : RefIdx1, component);
+    }
+
+    private static readonly PartitionWeights DefaultWeights = new(true, 0, 0, null, 0, 0, 0, 0);
+
+    /// <remarks>
+    /// Implicit weights come from the order counts of the partition's references: for a field
+    /// macroblock of an MBAFF frame its fields', and the current picture's field of its parity.
+    /// </remarks>
+    private PartitionWeights Weighting(SliceState slice, int refIdx0, int refIdx1, bool bi, int mbAddr, Picture? ref0, Picture? ref1)
+    {
+        var header = slice.Header;
+        if (header.Weights is { } table)
+        {
+            // Explicit (8.4.3): the table's entries for the partition's reference indices.
+            bool isDefault = true;
+            for (int list = 0; list < 2; list++)
+            {
+                int refIdx = list == 0 ? refIdx0 : refIdx1;
+                if (refIdx < 0)
+                {
+                    continue;
+                }
+
+                for (int c = 0; c < 3; c++)
+                {
+                    int denom = c == 0 ? table.LumaLog2Denom : table.ChromaLog2Denom;
+                    isDefault &= table.Weight(list, refIdx, c) == 1 << denom && table.Offset(list, refIdx, c) == 0;
+                }
+            }
+
+            return new PartitionWeights(isDefault, table.LumaLog2Denom, table.ChromaLog2Denom, table, refIdx0, refIdx1, 0, 0);
+        }
+
+        if (!bi || header.Type != SliceType.B || slice.Pps.WeightedBipredIdc != 2)
+        {
+            return DefaultWeights;
+        }
+
+        // Implicit (8.4.3): weights 64 - DistScaleFactor / 4 and DistScaleFactor / 4 out of 64,
+        // from the order count distances, unless the references are long-term, coincide or too far.
+        var pic0 = ref0!;
+        var pic1 = ref1!;
+        int currentPoc = !IsFieldMb(mbAddr) ? Picture.Poc : (mbAddr & 1) == 0 ? Picture.TopPoc : Picture.BottomPoc;
+        if (IsFieldMb(mbAddr))
+        {
+            Statistics.ImplicitField++;
+        }
+
+        int w0 = 32;
+        int w1 = 32;
+        if (pic1.Poc != pic0.Poc && !slice.Marks.IsLongTerm(pic0) && !slice.Marks.IsLongTerm(pic1))
+        {
+            int tb = Math.Clamp(currentPoc - pic0.Poc, -128, 127);
+            int td = Math.Clamp(pic1.Poc - pic0.Poc, -128, 127);
+            int tx = (16384 + Math.Abs(td / 2)) / td;
+            int distScaleFactor = Math.Clamp(((tb * tx) + 32) >> 6, -1024, 1023);
+            if (distScaleFactor >> 2 is >= -64 and <= 128)
+            {
+                w0 = 64 - (distScaleFactor >> 2);
+                w1 = distScaleFactor >> 2;
+            }
+        }
+
+        return w0 == 32 ? DefaultWeights : new PartitionWeights(false, 5, 5, null, refIdx0, refIdx1, w0, w1);
+    }
+
+    /// <summary>Weighted prediction from one list (8-449, 8-450).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void WeightOne(ReadOnlySpan<TPixel> prediction, int stride, int width, int height, Span<TPixel> output, int outputStride, PartitionWeights weights, int list, int component)
+    {
+        int logWd = weights.LogWd(component);
+        int w = weights.Weight(list, component);
+        int o = weights.Offset(list, component) << (_bitDepth - 8); // offsets are in 8-bit units (8-449)
+#if NET
+        if (typeof(TPixel) == typeof(byte))
+        {
+            InterPrediction.WeightOne(MemoryMarshal.Cast<TPixel, byte>(prediction), stride, width, height, MemoryMarshal.Cast<TPixel, byte>(output), outputStride, w, o, logWd);
+            return;
+        }
+
+        if (typeof(TPixel) == typeof(ushort))
+        {
+            InterPrediction.WeightOne16(MemoryMarshal.Cast<TPixel, ushort>(prediction), stride, width, height, MemoryMarshal.Cast<TPixel, ushort>(output), outputStride, w, o, logWd, Samples.Max<TPixel>(_bitDepth));
+            return;
+        }
+#endif
+
+        InterPrediction.WeightOneReference(prediction, stride, width, height, output, outputStride, w, o, logWd, Samples.Max<TPixel>(_bitDepth));
+    }
+
+    /// <summary>Weighted bi-prediction (8-451).</summary>
+    private void WeightBoth(ReadOnlySpan<TPixel> prediction0, ReadOnlySpan<TPixel> prediction1, int stride, int width, int height, Span<TPixel> output, int outputStride, PartitionWeights weights, int component)
+    {
+        int logWd = weights.LogWd(component);
+        int w0 = weights.Weight(0, component);
+        int w1 = weights.Weight(1, component);
+        int offset = ((weights.Offset(0, component) << (_bitDepth - 8)) + (weights.Offset(1, component) << (_bitDepth - 8)) + 1) >> 1;
+#if NET
+        if (typeof(TPixel) == typeof(byte))
+        {
+            InterPrediction.WeightBoth(MemoryMarshal.Cast<TPixel, byte>(prediction0), MemoryMarshal.Cast<TPixel, byte>(prediction1), stride, width, height, MemoryMarshal.Cast<TPixel, byte>(output), outputStride, w0, w1, offset, logWd);
+            return;
+        }
+
+        if (typeof(TPixel) == typeof(ushort))
+        {
+            InterPrediction.WeightBoth16(MemoryMarshal.Cast<TPixel, ushort>(prediction0), MemoryMarshal.Cast<TPixel, ushort>(prediction1), stride, width, height, MemoryMarshal.Cast<TPixel, ushort>(output), outputStride, w0, w1, offset, logWd, Samples.Max<TPixel>(_bitDepth));
+            return;
+        }
+#endif
+
+        InterPrediction.WeightBothReference(prediction0, prediction1, stride, width, height, output, outputStride, w0, w1, offset, logWd, Samples.Max<TPixel>(_bitDepth));
+    }
+
+    private readonly record struct Motion(bool Available, int RefIdx, int MvX, int MvY);
+
+    /// <summary>
+    /// List <paramref name="list"/> motion of the partition covering luma location (x, y)
+    /// relative to the current macroblock (6.4.11.7). Inside the current macroblock a block is
+    /// only available when it comes before <paramref name="currentBlock"/> (the decoding index of
+    /// the current partition's first 4x4 block). Intra macroblocks, and partitions that do not use
+    /// the list, are available with refIdx -1 and zero motion.
+    /// </summary>
+    /// <remarks>
+    /// In MBAFF frames a neighbour of the other kind is seen in the current macroblock's terms
+    /// (8.4.1.3.1): a frame neighbour of a field macroblock with half the vertical motion
+    /// (rounded towards zero) and twice the reference index, a field neighbour of a frame
+    /// macroblock with twice the motion and half the index.
+    /// </remarks>
+    private Motion MotionNeighbor(int list, int mbAddr, int x, int y, int currentBlock) =>
+        MotionAt(list, mbAddr, currentBlock, Neighbor(mbAddr, x, y));
+
+    /// <summary>Luma motion vector prediction for list <paramref name="list"/> (8.4.1.3).</summary>
+    private (int X, int Y) PredictMv(int list, int mbAddr, int x, int y, int w, int h, int refIdx, PartitionShape shape)
+    {
+        int current = BlockIndex(x / 4, y / 4);
+        if (_pairSlots)
+        {
+            var (pa, pb, pc) = AffMotionNeighbors(list, mbAddr, x, y, w, current);
+            return PredictMv(x, y, refIdx, shape, pa, pb, pc);
+        }
+
+        var a = MotionNeighbor(list, mbAddr, x - 1, y, current);
+        var b = MotionNeighbor(list, mbAddr, x, y - 1, current);
+        return PredictMv(list, mbAddr, x, y, w, refIdx, shape, a, b);
+    }
+
+    /// <summary>
+    /// A, B and C (D where C is not available) of a partition in an MBAFF frame or field picture: what
+    /// <see cref="MotionNeighbor"/> reads. A at the left edge (a partition's rows start at 0, 4, 8 or 12), and B and
+    /// C in the row above, come from the macroblock's edge table (<see cref="AffEdgesOf"/>); only C above and to the
+    /// right of the macroblock and D go through Table 6-4, from the pairs found once (<see cref="AffPairsOf"/>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private (Motion A, Motion B, Motion C) AffMotionNeighbors(int list, int mbAddr, int x, int y, int w, int current)
+    {
+        var edges = AffEdgesOf(mbAddr);
+        int left = 2 * (y >> 2);
+        const int Above = 2 * AffEdgeAbove;
+        var a = MotionAt(list, mbAddr, current, x - 1 >= 0 ? (mbAddr, x - 1, y) : (edges[left], 15, edges[left + 1]));
+        var b = MotionAt(list, mbAddr, current, y - 1 >= 0 ? (mbAddr, x, y - 1) : (edges[Above], x, edges[Above + 1]));
+        var c = MotionAt(
+            list,
+            mbAddr,
+            current,
+            x + w >= 16 ? (y - 1 >= 0 ? (-1, 0, 0) : AffNeighbor(in AffPairsOf(mbAddr), x + w, -1, 16, 16)) : y - 1 >= 0 ? (mbAddr, x + w, y - 1) : (edges[Above], x + w, edges[Above + 1]));
+        if (!c.Available)
+        {
+            c = MotionAt(list, mbAddr, current, x - 1 >= 0 && y - 1 >= 0 ? (mbAddr, x - 1, y - 1) : AffNeighbor(in AffPairsOf(mbAddr), x - 1, y - 1, 16, 16));
+        }
+
+        if (CheckMotionNeighbors)
+        {
+            var c1 = MotionNeighbor(list, mbAddr, x + w, y - 1, current);
+            var expected = (MotionNeighbor(list, mbAddr, x - 1, y, current), MotionNeighbor(list, mbAddr, x, y - 1, current), c1.Available ? c1 : MotionNeighbor(list, mbAddr, x - 1, y - 1, current));
+            if ((a, b, c) != expected)
+            {
+                throw new InvalidOperationException($"Macroblock {mbAddr}, partition at ({x}, {y}), list {list}: neighbours {(a, b, c)} found once, {expected} one by one.");
+            }
+        }
+
+        return (a, b, c);
+    }
+
+    /// <summary><see cref="MotionNeighbor"/> at a location already found (6.4.12).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private Motion MotionAt(int list, int mbAddr, int currentBlock, (int Mb, int X, int Y) location)
+    {
+        var (n, xW, yW) = location;
+        if (n < 0)
+        {
+            return new Motion(false, -1, 0, 0);
+        }
+
+        int bx = xW / 4;
+        int by = yW / 4;
+        if (n == mbAddr && BlockIndex(bx, by) >= currentBlock)
+        {
+            return new Motion(false, -1, 0, 0);
+        }
+
+        int block = (n * 16) + (by * 4) + bx;
+        int refIdx = _refIdx[list][(n * 4) + ((by >> 1) * 2) + (bx >> 1)];
+        int mvY = _mvY[list][block];
+        if (_mbaff && _fieldMb[n] != _fieldMb[mbAddr])
+        {
+            (refIdx, mvY) = _fieldMb[mbAddr] ? (refIdx < 0 ? refIdx : refIdx * 2, mvY / 2) : (refIdx >> 1, mvY * 2);
+        }
+
+        return new Motion(true, refIdx, _mvX[list][block], mvY);
+    }
+
+    /// <summary><see cref="PredictMv(int, int, int, int, int, int, int, PartitionShape)"/> with neighbours A and B already read (P_Skip reads them first).</summary>
+    private (int X, int Y) PredictMv(int list, int mbAddr, int x, int y, int w, int refIdx, PartitionShape shape, Motion a, Motion b)
+    {
+        int current = BlockIndex(x / 4, y / 4);
+        var c = MotionNeighbor(list, mbAddr, x + w, y - 1, current);
+        if (!c.Available)
+        {
+            c = MotionNeighbor(list, mbAddr, x - 1, y - 1, current); // D replaces C
+        }
+
+        return PredictMv(x, y, refIdx, shape, a, b, c);
+    }
+
+    /// <summary>Luma motion vector prediction (8.4.1.3) from neighbours A, B and C (D where C is not available).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static (int X, int Y) PredictMv(int x, int y, int refIdx, PartitionShape shape, Motion a, Motion b, Motion c)
+    {
+        // Directional prediction for 16x8 and 8x16 partitions (8.4.1.3).
+        if (shape == PartitionShape.Wide16x8)
+        {
+            if (y == 0 && b.RefIdx == refIdx)
+            {
+                return (b.MvX, b.MvY);
+            }
+
+            if (y == 8 && a.RefIdx == refIdx)
+            {
+                return (a.MvX, a.MvY);
+            }
+        }
+        else if (shape == PartitionShape.Tall8x16)
+        {
+            if (x == 0 && a.RefIdx == refIdx)
+            {
+                return (a.MvX, a.MvY);
+            }
+
+            if (x == 8 && c.RefIdx == refIdx)
+            {
+                return (c.MvX, c.MvY);
+            }
+        }
+
+        // Median prediction (8.4.1.3.1).
+        if (!b.Available && !c.Available && a.Available)
+        {
+            b = a;
+            c = a;
+        }
+
+        int matches = (a.RefIdx == refIdx ? 1 : 0) + (b.RefIdx == refIdx ? 1 : 0) + (c.RefIdx == refIdx ? 1 : 0);
+        if (matches == 1)
+        {
+            var only = a.RefIdx == refIdx ? a : b.RefIdx == refIdx ? b : c;
+            return (only.MvX, only.MvY);
+        }
+
+        return (Median(a.MvX, b.MvX, c.MvX), Median(a.MvY, b.MvY, c.MvY));
+    }
+
+    private static int Median(int a, int b, int c) => Math.Max(Math.Min(a, b), Math.Min(Math.Max(a, b), c));
+}

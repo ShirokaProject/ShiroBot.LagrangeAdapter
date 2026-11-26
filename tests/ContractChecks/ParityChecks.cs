@@ -140,6 +140,8 @@ internal static class ParityChecks
             .Invoke(messaging, [123L])!;
         if (replyTarget.Uid != "sender")
             throw new Exception("A private reply must reuse the UID learned from the inbound message.");
+        if (await LagrangeProtocol.ResolveLikeTargetUid(bot, 123L, default) != "sender")
+            throw new Exception("Profile likes must reuse a known contact UID with an empty friend list.");
     }
 
     private static async Task ForwardMediaPreparationChecks()

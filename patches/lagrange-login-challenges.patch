@@ -70,10 +70,10 @@ index edabc158..4dfd3531 100644
          => context.EventContext.GetLogic<OperationLogic>().SendGroupFile(groupUin, fileStream, fileName, parentDirectory);
  
 diff --git a/Lagrange.Core/Common/Interface/OperationExt.cs b/Lagrange.Core/Common/Interface/OperationExt.cs
-index ef847d04..77255b54 100644
+index ef847d04..b5cf3be7 100644
 --- a/Lagrange.Core/Common/Interface/OperationExt.cs
 +++ b/Lagrange.Core/Common/Interface/OperationExt.cs
-@@ -89,4 +89,17 @@ public static class OperationExt
+@@ -89,4 +89,20 @@ public static class OperationExt
  
      public static Task<bool> SetBotAvatar(this BotContext context, Stream stream) =>
          context.HighwayContext.UploadFile(stream, 90, Array.Empty<byte>());
@@ -90,6 +90,9 @@ index ef847d04..77255b54 100644
 +
 +    public static Task<BotStranger> FetchStrangerByUid(this BotContext context, string uid) =>
 +        context.CacheContext.ResolveStranger(uid);
++
++    public static string? GetCachedContactUid(this BotContext context, long uin) =>
++        context.CacheContext.ResolveCachedUid(uin);
  }
 diff --git a/Lagrange.Core/Internal/Context/PacketContext.cs b/Lagrange.Core/Internal/Context/PacketContext.cs
 index 6b4d33d1..6fa3c9d5 100644

@@ -1,0 +1,1380 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
+
+namespace ManagedCodecs.H264;
+
+/// <summary>
+/// H.264 decoder for Constrained Baseline, Main, High, High 10, High 4:2:2 and High 4:4:4 Predictive profile streams
+/// (CAVLC or CABAC; I, P and B slices; 8, 9, 10, 12 or 14 bits; monochrome, 4:2:0, 4:2:2 or 4:4:4, the latter also as
+/// separate colour planes; lossless; progressive or interlaced (MBAFF frames, field pictures)), taking MP4-style samples: length-prefixed NAL units, one
+/// picture per sample. It can decode several pictures at once (<see cref="Threads"/>).
+/// </summary>
+/// <remarks>
+/// Implemented from ITU-T H.264; output is bit-exact with any conforming decoder. Streams that use other features
+/// (slice groups (FMO), data partitioning, 11 or 13 bits, luma and chroma
+/// bit depths that differ) are rejected with <see cref="NotSupportedException"/>. Frames come out in display order (picture order
+/// count, 8.2.1), held back as far as the stream's max_num_reorder_frames says reordering can
+/// reach; <see cref="Flush"/> returns the rest at the end.
+/// </remarks>
+internal sealed class H264Decoder : IVideoDecoder
+{
+    private readonly Dictionary<int, SequenceParameterSet> _sps = [];
+    private readonly Dictionary<int, PictureParameterSet> _pps = [];
+    private readonly ReferenceList _references = new();
+    private readonly int _lengthSize;
+
+    // An Annex B stream's packets' times in decoding order, from the first not yet given to a frame (InTimeOrder), and the
+    // reorder depth its frames are output with.
+    private readonly List<long> _decodeTimes = [];
+    private int _timesDepth;
+
+    // Pictures are reused once they are no longer references and no frame waiting for output
+    // borrows them (output is a copy, see Crop, unless BorrowFrames), and so is the per-macroblock
+    // state, as long as the picture size stays the same.
+    private readonly List<Picture> _pictures = [];
+
+    // The planes of copied frames, back from frames the caller disposed.
+    private readonly VideoFramePool _framePool = new();
+    private long _pictureCount;
+
+    // One picture decoder per picture decoded at once (Threads), all for the current stream size and format; and
+    // with threads, the pictures being decoded (or decoded and not yet output), in decoding order.
+    private readonly List<IPictureDecoder> _decoders = [];
+    private readonly Queue<PictureJob> _inFlight = new();
+    private readonly Dictionary<IPictureDecoder, PictureThread> _threadsOf = [];
+    private readonly int _threads = 1;
+
+    // Without ConcealErrors: a reference picture was lost (a gap in frame_num the SPS does not allow) since the last IDR
+    // picture. Its reference marking (memory_management_control_operation) went with it, so no reference list after it
+    // can be trusted: every picture fails until the next IDR picture, rather than predict from the wrong pictures.
+    private bool _referenceLost;
+
+    // Frames a call that threw had already taken out, for the next call to return first (TakeHeld).
+    private List<VideoFrame>? _held;
+
+    // The latest reference picture in decoding order: what an intra picture's missing macroblocks are copied from (ConcealErrors).
+    private Picture? _lastReference;
+
+    // frame_num of the last reference picture (PrevRefFrameNum, 7.4.3); -1 before the first.
+    private int _prevRefFrameNum = -1;
+
+    private readonly PictureOrder _order = new();
+    private readonly OutputQueue _output = new();
+
+    // Whether the packet being parsed is to be decoded and not shown (Packet.Discard).
+    private bool _discard;
+
+    // The picture timing SEI's payload as FFmpeg's decoder holds it: the last one of the packet, or of the packets
+    // since a first field's, as a frame's two fields share it. Interlacing reads it with the picture's SPS, at the
+    // picture's first slice (so an SEI after it counts for a second field only).
+    private byte[]? _timing;
+
+    // The last frame's IsInterlaced (true at the start, and after a change of picture size or format, as in FFmpeg),
+    // the last field picture FFmpeg's parser saw (parity, -1 for none, and frame_num), and whether a picture came yet.
+    private bool _previousInterlaced = true;
+    private (int Parity, int FrameNum) _parserLastField = (-1, 0);
+    private bool _started;
+
+    // The container's picture size (VideoStreamInfo), cropping the frames further as FFmpeg does (OutputSize); 0 when
+    // there is none, or once a picture's SPS did not allow it.
+    private int _containerWidth;
+    private int _containerHeight;
+
+    // The container's colour properties and aspect ratio, which frames take where their SPS says nothing; null without one.
+    private VideoStreamInfo? _stream;
+
+    // The colour properties as FFmpeg's codec context holds them (VideoSignal.After): an SPS that sends no range or
+    // colour description keeps the earlier ones, through new sequences and flushes alike.
+    private VideoSignal _signal = VideoSignal.None;
+
+    /// <param name="codecPrivate">
+    /// The AVCDecoderConfigurationRecord ('avcC') from the container; empty for an Annex B stream (AVI's), whose packets
+    /// are NAL units behind start codes with the parameter sets among them.
+    /// </param>
+    public H264Decoder(ReadOnlySpan<byte> codecPrivate)
+    {
+        if (codecPrivate.IsEmpty)
+        {
+            return; // Annex B: _lengthSize 0
+        }
+
+        var config = AvcConfiguration.Parse(codecPrivate);
+        _lengthSize = config.LengthSize;
+        foreach (var sps in config.Sps)
+        {
+            HandleNal(NalUnit.Parse(sps), current: null);
+        }
+
+        foreach (var pps in config.Pps)
+        {
+            HandleNal(NalUnit.Parse(pps), current: null);
+        }
+    }
+
+    /// <summary>
+    /// A decoder for a demuxed stream. Its frames take the container's picture size (MP4's sample entry) where that
+    /// crops the stream's visible area only at the right and bottom, within its last macroblock column and row, as
+    /// FFmpeg's decoder does (an Apple-encoded 640x360 film stores 640x359): with no SPS cropping at the top or left,
+    /// a size no larger than the SPS's and the same once each is rounded up to a multiple of 16. They take the
+    /// container's colour properties where the SPS's VUI does not send its own (a range, or a colour description), and
+    /// the container's aspect ratio where it has one, as ffprobe shows FFmpeg's frames.
+    /// </summary>
+    public H264Decoder(VideoStreamInfo stream)
+        : this(stream.CodecPrivate.Span)
+    {
+        _containerWidth = stream.Width;
+        _containerHeight = stream.Height;
+        _stream = stream;
+    }
+
+    /// <summary>
+    /// Return frames that point into the decoder's own pictures instead of copies, which saves a
+    /// copy of every frame (about 5% of the decoding time at 720p). A borrowed frame is valid only
+    /// until the next call to <see cref="Decode(Packet)"/> or <see cref="Flush"/>, which may decode a new
+    /// picture into the same memory; copy what has to be kept longer. Its planes are the
+    /// decoder's macroblock-aligned buffers (read rows through <see cref="VideoFrame.GetRow"/>, or
+    /// with its offsets and strides), and they must not be written: later pictures predict from them.
+    /// Frames of more than 8 bits are copies all the same (the decoder keeps their samples as 16-bit
+    /// words, which a frame's byte planes cannot hold without one).
+    /// </summary>
+    public bool BorrowFrames { get; init; }
+
+    /// <summary>
+    /// How many pictures to decode at once, each on a thread of its own (frame threading): a picture is decoded while
+    /// the ones before it are still being decoded, waiting only for the rows of theirs its motion vectors reach, so
+    /// more threads decode faster on more cores, and give the same frames. 1, the default, decodes on the calling
+    /// thread, as WebAssembly in a browser needs (it has no threads there). With more, <see cref="Decode(Packet)"/> returns
+    /// frames up to that many packets later (<see cref="Flush"/> returns the rest), and <see cref="BorrowFrames"/> is
+    /// not supported. A thread waiting for a reference's rows leaves its core idle, so a few more threads than cores can
+    /// help: on a 4-core VM, 6 decoded a 720p P chain up to 16% faster than 4.
+    /// </summary>
+    public int Threads
+    {
+        get => _threads;
+        init => _threads = value >= 1 ? value : throw new ArgumentOutOfRangeException(nameof(value), value, "At least one thread is needed.");
+    }
+
+    /// <summary>
+    /// The stream's field order as <c>ffprobe -show_streams</c> prints it for an MP4 file: the one FFmpeg's parser gives
+    /// the first picture decoded (see <see cref="VideoFrame.FieldOrder"/>), as FFmpeg's stream analysis reads only the
+    /// first packet of an MP4 stream before it has all it needs. <see cref="ManagedCodecs.FieldOrder.Unknown"/> before the
+    /// first picture, and for a stream whose first picture is a field picture (for a raw H.264 file FFmpeg reads on, to
+    /// the second field, whose frame's <see cref="VideoFrame.FieldOrder"/> it then takes).
+    /// </summary>
+    public FieldOrder FieldOrder { get; private set; }
+
+    /// <summary>For tests of frame threading: sleep up to this many milliseconds before each picture and after each macroblock row, at random.</summary>
+    internal int RowDelay { get; init; }
+
+    /// <summary>For tests: MBAFF frames and field pictures predict motion vectors from neighbours found both ways, one call for A, B and C and one lookup each, and throw where they differ.</summary>
+    internal bool CheckMotionNeighbors { get; init; }
+
+    /// <summary>For tests: MBAFF frames and field pictures find each macroblock edge's bS both ways, for the four segments at once (or, across pairs of different kinds, a line at a time from what holds for the edge) and segment by segment, and throw where they differ.</summary>
+    internal bool CheckMbaffStrengths { get; init; }
+
+    /// <summary>For tests: MBAFF frames reconstruct every intra macroblock in the scratch blocks (the reference), none in place.</summary>
+    internal bool MbaffIntraScratchOnly { get; init; }
+
+    /// <summary>
+    /// Conceal damaged slice data instead of failing the picture's <see cref="Decode(Packet)"/>: the macroblocks a slice
+    /// decoded before the damage stay, the picture's other slices are decoded, and every macroblock left missing is a
+    /// copy of the same place in a reference (list 0's first, else the latest reference, else mid-grey). The frame comes
+    /// out with <see cref="VideoFrame.IsDamaged"/>, as does every later frame predicted from a damaged one, until a
+    /// picture that predicts from none (an IDR picture). A field whose second field was lost gives a frame of its own,
+    /// the missing field's rows copied from its. Damaged headers and parameter sets still throw. Off by default: a damaged
+    /// picture then fails, and so does every later picture that predicts from it (and an unpaired field throws).
+    /// </summary>
+    public bool ConcealErrors { get; init; }
+
+    /// <summary>
+    /// An Annex B stream's frames keep the times their own packets were given, as a container's do, where the packets
+    /// do carry presentation times (RTP's timestamps, LivePlayer), in place of FFmpeg's times for a stream that has
+    /// only its decoding order (InTimeOrder).
+    /// </summary>
+    internal bool PacketTimes { get; init; }
+
+    /// <summary>
+    /// Decodes one packet, which holds one picture (MP4 sample), and returns the frames ready for
+    /// display. A field picture is half a frame: the first of a pair gives no frame, the second
+    /// the whole frame, with the first one's timestamp.
+    /// </summary>
+    /// <remarks>
+    /// Frames that are copies own their samples; disposing one when done with it gives its
+    /// planes back to the decoder for a later frame, which saves allocating (and collecting)
+    /// them: about 4 to 7% of the decoding time at 720p.
+    /// </remarks>
+    public IReadOnlyList<VideoFrame> Decode(Packet packet) => Decode(packet.Data.Span, packet.Pts, packet.Discard);
+
+    /// <summary>
+    /// Decodes one picture's length-prefixed NAL units from <paramref name="data"/>, which need not outlive the call
+    /// (the decoder copies what it keeps), as <see cref="Decode(Packet)"/> does; the frame that comes from it gets
+    /// <paramref name="pts"/>.
+    /// </summary>
+    public IReadOnlyList<VideoFrame> Decode(ReadOnlySpan<byte> data, long pts) => Decode(data, pts, discard: false);
+
+    /// <summary>A picture's NAL units; a <paramref name="discard"/> picture (<see cref="Packet.Discard"/>) is decoded and gives no frame.</summary>
+    private List<VideoFrame> Decode(ReadOnlySpan<byte> data, long pts, bool discard)
+    {
+        if (BorrowFrames && Threads > 1)
+        {
+            throw new NotSupportedException("Borrowed frames with more than one thread are not supported.");
+        }
+
+        var frames = TakeHeld();
+        try
+        {
+            DecodeInto(data, pts, discard, frames);
+            return frames;
+        }
+        catch
+        {
+            _held = frames;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The frames a call that threw had already taken out (earlier pictures finished while it waited, or before the one
+    /// that failed): the next call returns them first, so that a failure loses no other picture's frame.
+    /// </summary>
+    private List<VideoFrame> TakeHeld()
+    {
+        var frames = _held ?? [];
+        _held = null;
+        return frames;
+    }
+
+    private void DecodeInto(ReadOnlySpan<byte> data, long pts, bool discard, List<VideoFrame> frames)
+    {
+        _discard = discard;
+        var job = ParsePicture(data, pts, frames);
+        if (Threads == 1)
+        {
+            // A picture that fails is still marked as its headers say, as with threads: later pictures that predict
+            // from it fail (on its rows that were not done) rather than predict from other pictures in its place.
+            try
+            {
+                Run(job);
+            }
+            finally
+            {
+                Finish(job);
+            }
+
+            Output(job, frames);
+            return;
+        }
+
+        // Its decoder's thread, so that a picture always runs while the later ones that wait for it do: pictures
+        // start in decoding order, and wait only for earlier ones. The front end goes on from the headers alone.
+        job.Start();
+        ThreadOf(job.State.Decoder).Post(() => job.Complete(() => RunAndCrop(job)));
+        _inFlight.Enqueue(job);
+        Finish(job);
+        Drain(frames, all: false);
+    }
+
+    /// <summary>
+    /// <see cref="Decode(Packet)"/> for asynchronous callers. With <see cref="Threads"/> above 1 it awaits what
+    /// <see cref="Decode(Packet)"/> would block on: a free decoder (the oldest picture finishing, whose frames it then
+    /// returns). A change of picture size or format still waits
+    /// for every picture being decoded, blocking. Cancelling stops the waiting, not pictures already started; the
+    /// exceptions are those of <see cref="Decode(Packet)"/>, the decoding threads' as they were thrown.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<VideoFrame>> DecodeAsync(Packet packet, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Threads == 1)
+        {
+            return Decode(packet);
+        }
+
+        var frames = TakeHeld();
+        try
+        {
+            while (_inFlight.Count >= Threads)
+            {
+                await WaitForAsync(_inFlight.Peek().Task!, cancellationToken).ConfigureAwait(false);
+                DrainOldest(frames);
+            }
+        }
+        catch
+        {
+            _held = frames;
+            throw;
+        }
+
+        _held = frames;
+        return Decode(packet);
+    }
+
+    /// <summary>
+    /// <see cref="Flush"/> for asynchronous callers: awaits each picture still being decoded instead of blocking.
+    /// Cancelled, it drops the frames of pictures it had already waited for (cancelling a flush abandons the stream).
+    /// </summary>
+    public async ValueTask<IReadOnlyList<VideoFrame>> FlushAsync(CancellationToken cancellationToken = default)
+    {
+        var frames = TakeHeld();
+        try
+        {
+            while (_inFlight.TryPeek(out var job))
+            {
+                await WaitForAsync(job.Task!, cancellationToken).ConfigureAwait(false);
+                DrainOldest(frames);
+            }
+        }
+        catch
+        {
+            _held = frames;
+            throw;
+        }
+
+        _held = frames;
+        return Flush();
+    }
+
+    /// <summary>
+    /// Waits for a picture's thread to end, either way (what it threw comes out where its picture is output), or for
+    /// cancellation.
+    /// </summary>
+    private static async Task WaitForAsync(Task task, CancellationToken cancellationToken)
+    {
+#if NET
+        await task.WaitAsync(cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+#else
+        // netstandard2.1 has neither WaitAsync nor ConfigureAwaitOptions: the first of the task and the cancellation.
+        await Task.WhenAny(task, Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
+#endif
+        if (!task.IsCompleted)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<VideoFrame> Flush()
+    {
+        var frames = TakeHeld();
+        try
+        {
+            Drain(frames, all: true);
+        }
+        catch
+        {
+            _held = frames;
+            throw;
+        }
+        finally
+        {
+            StopThreads();
+        }
+
+        if (_firstField is not null)
+        {
+            if (!ConcealErrors)
+            {
+                _held = frames;
+                throw new NotSupportedException("A field without its second field (an unpaired field) is not supported without ConcealErrors.");
+            }
+
+            CompleteUnpaired(frames);
+        }
+
+        frames.AddRange(InTimeOrder(_output.Flush()));
+        _decodeTimes.Clear(); // the stream ends; a picture never shown leaves its time behind
+        return frames;
+    }
+
+    /// <summary>Outputs the decoded pictures at the front of the queue, in decoding order: those done, or all of them (waiting).</summary>
+    private void Drain(List<VideoFrame> frames, bool all)
+    {
+        while (_inFlight.TryPeek(out var job) && (all || job.Task!.IsCompleted))
+        {
+            DrainOldest(frames);
+        }
+    }
+
+    /// <summary>Waits for the oldest picture being decoded and outputs it; rethrows what decoding it threw.</summary>
+    private void DrainOldest(List<VideoFrame> frames)
+    {
+        var job = _inFlight.Dequeue();
+        job.Wait();
+        Output(job, frames);
+    }
+
+    /// <summary>Decodes the job's slices into its picture and deblocks it, then reports it done (or failed) to pictures that predict from it.</summary>
+    [SuppressMessage("Security", "CA5394:Do not use insecure randomness", Justification = "Only tests set RowDelay: a random sleep that varies frame threads' timing to find races. Nothing secret depends on it.")]
+    private static void Run(PictureJob job)
+    {
+        var state = job.State;
+        var view = state.Header.FieldPic ? state.Picture.Field(state.Header.Parity) : state.Picture;
+        try
+        {
+            if (state.Decoder.RowDelay > 0)
+            {
+                Thread.Sleep(Random.Shared.Next(state.Decoder.RowDelay + 1)); // tests: pictures (and fields) start late
+            }
+
+            // A first field's Begin resets the whole frame's motion and macroblock state, both fields' slots: its second
+            // field, which may run on a decoder of its own, starts after that.
+            job.FirstField?.Begun.Task.GetAwaiter().GetResult();
+            state.Decoder.Begin(state.Picture, state.Sps, state.Header.Parity, state.SecondField);
+            job.Begun.SetResult();
+            foreach (var slice in job.Slices.Where(s => !s.Lost))
+            {
+                state.Decoder.DecodeSlice(slice.Header, slice.Pps, slice.Reader, slice.List0, slice.List1, slice.Marks);
+            }
+
+            if (!state.Decoder.IsComplete)
+            {
+                if (!state.Decoder.ConcealErrors)
+                {
+                    throw new InvalidDataException("The picture is missing macroblocks (ConcealErrors is off).");
+                }
+
+                state.Decoder.Conceal(job.ConcealFrom);
+            }
+
+            state.Decoder.Deblock();
+            if (state.Decoder.ConcealErrors && (state.Decoder.ConcealedMbCount > 0 || ListsDamaged(job)))
+            {
+                state.Picture.Damaged = true;
+            }
+
+            view.ReportDone();
+        }
+        catch
+        {
+            job.Begun.TrySetResult(); // a second field waiting for it goes on, and fails on what it reads
+            view.ReportFailed();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Whether a picture in the job's reference lists is damaged, once each is done: a damaged picture, or one inferred
+    /// for a gap, shifts the lists' order even where no motion names it. Its own frame (a second field's) is left out:
+    /// a damaged first field marks the frame itself.
+    /// </summary>
+    private static bool ListsDamaged(PictureJob job)
+    {
+        foreach (var picture in job.Uses)
+        {
+            if (picture != job.State.Picture)
+            {
+                picture.WaitForRow(int.MaxValue);
+                if (picture.Damaged)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// What follows a picture in decoding order, from its headers alone: reference marking, the frame order count of a
+    /// frame whose second field this was, and the first field a second one is to pair with.
+    /// </summary>
+    private void Finish(PictureJob job)
+    {
+        var state = job.State;
+        var picture = state.Picture;
+        if (state.Header.NalRefIdc != 0)
+        {
+            if (state.Header.FieldPic)
+            {
+                _references.MarkField(state.Header, picture, state.Sps, state.SecondField);
+            }
+            else
+            {
+                _references.Mark(state.Header, picture, state.Sps);
+            }
+
+            _lastReference = picture;
+
+            // PrevRefFrameNum (7.4.3); after memory_management_control_operation 5 it is 0.
+            _prevRefFrameNum = FrameNumAfter(state.Header);
+        }
+
+        if (state.SecondField)
+        {
+            picture.Poc = Math.Min(picture.TopPoc, picture.BottomPoc);
+        }
+
+        _firstField = state.Header.FieldPic && !state.SecondField ? job : null;
+    }
+
+    /// <summary>
+    /// A picture on its own thread, and then its frame copied out there too (a frame, or a second field's), so the
+    /// thread that feeds the decoder goes on to the next picture sooner.
+    /// </summary>
+    private void RunAndCrop(PictureJob job)
+    {
+        Run(job);
+        var state = job.State;
+        if (!job.Discard && (!state.Header.FieldPic || state.SecondField))
+        {
+            // A second field can be done before its first (which it need not predict from): the frame is both.
+            job.FirstField?.Wait();
+            job.Frame = Crop(state.Picture, state.Sps, state.Size);
+        }
+    }
+
+    /// <summary>The frame of a decoded picture into the output queue, and what comes out of it; a first field gives none (its frame comes with the second).</summary>
+    private void Output(PictureJob job, List<VideoFrame> frames)
+    {
+        var state = job.State;
+        if (state.Header.FieldPic && !state.SecondField && !job.Unpaired)
+        {
+            return;
+        }
+
+        var picture = state.Picture;
+        if (job.Discard)
+        {
+            // It still takes its place in the output order, so that the frames around it come out as they would with it.
+            frames.AddRange(InTimeOrder(_output.Add(null, picture.Poc, job.Restart, ReorderDepth(state.Sps))));
+            return;
+        }
+
+        bool borrow = BorrowFrames && picture.BitDepth == 8;
+        var frame = job.Frame ?? (borrow ? Borrow(picture, state.Sps, state.Size) : Crop(picture, state.Sps, state.Size));
+        frame.Pts = job.Pts;
+        frame.IsDamaged = picture.Damaged;
+        frame.PictureType = job.PictureType;
+        frame.IsInterlaced = job.Interlacing.Interlaced;
+        frame.IsTopFieldFirst = job.Interlacing.TopFieldFirst;
+        frame.FieldOrder = job.Interlacing.Order;
+        frame.IsCodedAsFields = job.Interlacing.CodedAsFields;
+        job.Signal.Apply(frame, _stream);
+        if (_lengthSize == 0 && !PacketTimes)
+        {
+            // With PacketTimes none are kept, and InTimeOrder then leaves each frame its own.
+            _decodeTimes.Add(job.Pts);
+            _timesDepth = _stream?.FramesFromZero == true ? 0 : ReorderDepth(state.Sps);
+        }
+
+        frames.AddRange(InTimeOrder(_output.Add(frame, picture.Poc, job.Restart, ReorderDepth(state.Sps), borrow ? picture : null)));
+    }
+
+    /// <summary>
+    /// Frames as the output queue gives them. An Annex B stream's (AVI's) packets carry no presentation times, only their
+    /// decoding order (a frame count). As FFmpeg's, the k-th frame shown takes the time of the packet the reorder depth
+    /// D later in decoding order (k + D: the one decoded when a decoder that holds D frames shows it), and past the last
+    /// packet one tick more a frame: increasing times, D frames after the packets' (libx264's B pictures: frames from
+    /// time 2). With a container's presentation times (an avcC: MP4, Matroska) a frame keeps its own.
+    /// </summary>
+    private List<VideoFrame> InTimeOrder(List<VideoFrame> shown)
+    {
+        if (_lengthSize != 0)
+        {
+            return shown;
+        }
+
+        foreach (var frame in shown)
+        {
+            int at = _timesDepth;
+            if (_decodeTimes.Count > 0)
+            {
+                frame.Pts = at < _decodeTimes.Count ? _decodeTimes[at] : _decodeTimes[^1] + (at - (_decodeTimes.Count - 1));
+                _decodeTimes.RemoveAt(0);
+            }
+        }
+
+        return shown;
+    }
+
+    /// <summary>
+    /// How many decoded frames can precede, in decoding order, a frame shown before them: the
+    /// VUI's max_num_reorder_frames, else none for order count type 2 (which follows decoding
+    /// order), else the whole DPB (A.3.1, the bound with no other information).
+    /// </summary>
+    private static int ReorderDepth(SequenceParameterSet sps)
+    {
+        if (sps.MaxNumReorderFrames is int reorder)
+        {
+            return reorder;
+        }
+
+        if (sps.PicOrderCntType == 2)
+        {
+            return 0;
+        }
+
+        if (sps.MaxDecFrameBuffering is int buffering)
+        {
+            return buffering;
+        }
+
+        // MaxDpbMbs of Table A-1 by level_idc; level 1b counts as 1.1, the larger.
+        int maxDpbMbs = sps.LevelIdc switch
+        {
+            <= 10 => 396,
+            11 => 900,
+            <= 20 => 2376,
+            21 => 4752,
+            <= 30 => 8100,
+            31 => 18000,
+            32 => 20480,
+            <= 41 => 32768,
+            42 => 34816,
+            50 => 110400,
+            <= 52 => 184320,
+            _ => 696320,
+        };
+        return Math.Clamp(maxDpbMbs / (sps.WidthInMbs * sps.HeightInMbs), 1, 16);
+    }
+
+    /// <summary>Parses a packet's NAL units: parameter sets, and the slices of its picture with their reference lists.</summary>
+    private PictureJob ParsePicture(ReadOnlySpan<byte> packet, long pts, List<VideoFrame> frames)
+    {
+        // FFmpeg's decoder forgets the SEI at each packet but between a frame's fields.
+        if (_firstField is null)
+        {
+            _timing = null;
+        }
+
+        PictureJob? current = null;
+        if (_lengthSize == 0)
+        {
+            // Annex B (B.1): each NAL unit after a start code (0x000001) up to the next, less the zero bytes before that
+            // one (a four-byte start code's leading zero, trailing_zero_8bits); emulation prevention keeps the code out
+            // of the units themselves.
+            int start = AfterStartCode(packet, 0);
+            while (start >= 0)
+            {
+                int next = AfterStartCode(packet, start);
+                int end = next < 0 ? packet.Length : next - 3;
+                while (end > start && packet[end - 1] == 0)
+                {
+                    end--;
+                }
+
+                if (end > start)
+                {
+                    current = HandleNal(NalUnit.Parse(packet[start..end]), current, pts, frames);
+                }
+
+                start = next;
+            }
+
+            return current ?? throw new InvalidDataException("The packet contains no picture.");
+        }
+
+        int pos = 0;
+        while (pos < packet.Length)
+        {
+            if (pos + _lengthSize > packet.Length)
+            {
+                throw new InvalidDataException("Truncated NAL length prefix.");
+            }
+
+            int length = 0;
+            for (int i = 0; i < _lengthSize; i++)
+            {
+                length = (length << 8) | packet[pos + i];
+            }
+
+            pos += _lengthSize;
+            if (length <= 0 || length > packet.Length - pos)
+            {
+                throw new InvalidDataException($"NAL unit length {length} overruns the packet.");
+            }
+
+            current = HandleNal(NalUnit.Parse(packet.Slice(pos, length)), current, pts, frames);
+            pos += length;
+        }
+
+        return current ?? throw new InvalidDataException("The packet contains no picture.");
+    }
+
+    // The position after the first start code (0x000001) at or after from, or -1.
+    private static int AfterStartCode(ReadOnlySpan<byte> data, int from)
+    {
+        int at = data[from..].IndexOf(StartCode);
+        return at < 0 ? -1 : from + at + 3;
+    }
+
+    private static ReadOnlySpan<byte> StartCode => [0, 0, 1];
+
+    // frames: where pictures output while waiting for a free decoder go.
+    private PictureJob? HandleNal(NalUnit nal, PictureJob? current, long pts = 0, List<VideoFrame>? frames = null)
+    {
+        switch (nal.Type)
+        {
+            case NalUnitType.Sps:
+                {
+                    var sps = SequenceParameterSet.Parse(nal.CreateReader());
+                    _sps[sps.Id] = sps;
+                    break;
+                }
+
+            case NalUnitType.Pps:
+                {
+                    var pps = PictureParameterSet.Parse(nal.CreateReader(), _sps);
+                    _pps[pps.Id] = pps;
+                    break;
+                }
+
+            case NalUnitType.Slice or NalUnitType.IdrSlice:
+                {
+                    var reader = nal.CreateReader();
+                    var header = SliceHeader.Parse(reader, nal, _sps, _pps, out var sps, out var pps);
+                    CheckSupported(sps);
+
+                    if (current is null)
+                    {
+                        current = StartPicture(header, sps, pts, frames!);
+                    }
+                    else if (header.FrameNum != current.State.Header.FrameNum || current.State.Sps != sps
+                        || header.FieldPic != current.State.Header.FieldPic || header.BottomField != current.State.Header.BottomField)
+                    {
+                        // A slice of another frame, or of the other field (7.4.1.2.4: the first slice of a new picture).
+                        throw new NotSupportedException("A packet holding more than one picture is not supported.");
+                    }
+
+                    List<Picture> list0;
+                    List<Picture> list1;
+                    bool lost = false;
+                    try
+                    {
+                        (list0, list1) = header.Type switch
+                        {
+                            SliceType.P => (_references.BuildList(header, sps), []),
+                            SliceType.B => _references.BuildLists(header, sps, current.State.Poc),
+                            _ => (new List<Picture>(), new List<Picture>()),
+                        };
+                    }
+                    catch (InvalidDataException)
+                    {
+                        if (!ConcealErrors)
+                        {
+                            throw;
+                        }
+
+                        // No reference to predict from, or a list modification naming a missing one: a lost reference.
+                        (list0, list1, lost) = ([], [], true);
+                    }
+
+                    foreach (var picture in list0.Concat(list1))
+                    {
+                        current.Uses.Add(picture.Frame);
+                    }
+
+                    current.Slices.Add(new SliceWork(header, pps, reader, list0, list1, new MarkSnapshot(list0.Concat(list1)), lost));
+                    break;
+                }
+
+            case >= NalUnitType.SliceDataPartitionA and <= (NalUnitType)4:
+                throw new NotSupportedException("Data partitioning is not supported.");
+
+            case NalUnitType.Sei:
+                if (PictureTiming.FindPayload(nal) is { } timing)
+                {
+                    _timing = timing;
+                }
+
+                break;
+
+            default:
+                break; // access unit delimiters, filler data and the like carry no picture data
+        }
+
+        return current;
+    }
+
+    /// <summary>How often MBAFF frames used field and frame pairs and mixed them, so tests can check samples exercise them.</summary>
+    internal MbaffStatistics MbaffStatistics { get; } = new();
+
+    // frame_num as the pictures after this one see it: 0 after memory_management_control_operation 5 (7.4.3).
+    private static int FrameNumAfter(SliceHeader header) => header.MemoryManagement.Any(op => op.Op == 5) ? 0 : header.FrameNum;
+
+    private PictureJob StartPicture(SliceHeader header, SequenceParameterSet sps, long pts, List<VideoFrame> frames)
+    {
+        // The second field of a frame (7.4.1.2.4): the other parity right after the first, with its
+        // frame_num (0 after a first field with memory_management_control_operation 5), not IDR, and a
+        // reference if and only if the first one is.
+        bool secondField = header.FieldPic && _firstField?.State is { } first
+            && first.Header.Parity == 1 - header.Parity && FrameNumAfter(first.Header) == header.FrameNum && first.Sps == sps
+            && !header.IsIdr && (first.Header.NalRefIdc != 0) == (header.NalRefIdc != 0);
+        if (_firstField is not null && !secondField)
+        {
+            if (!ConcealErrors)
+            {
+                throw new NotSupportedException("A field without its second field (an unpaired field) is not supported without ConcealErrors.");
+            }
+
+            CompleteUnpaired(frames);
+        }
+
+        if (header.IsIdr)
+        {
+            _references.Clear();
+            _referenceLost = false;
+        }
+        else if (_references.Any(p => !FitsFormat(p, sps)))
+        {
+            // A new SPS takes effect only at an IDR picture (7.4.1.2.1): references of another size or format, from before
+            // one that broke the rule, are lost to this picture (its inter slices fail, or conceal) rather than read as its own.
+            _references.Clear();
+        }
+        else if (!secondField)
+        {
+            InferGapFrames(header, sps);
+        }
+
+        if (_referenceLost)
+        {
+            throw new InvalidDataException("A reference picture was lost (a gap in frame_num the SPS does not allow): pictures fail until an IDR picture.");
+        }
+
+        // A second field takes a decoder of its own, so it can run while its first is still being decoded: each writes
+        // only its own parity's macroblock slots, and reads the first one's samples as any reference's, row by row.
+        var decoder = TakeDecoder(sps, frames);
+
+        int poc = _order.Next(header, sps);
+        Picture picture;
+        if (secondField)
+        {
+            picture = _firstField!.State.Picture;
+            if (header.BottomField)
+            {
+                picture.BottomPoc = poc;
+            }
+            else
+            {
+                picture.TopPoc = poc;
+            }
+
+            // The frame keeps the first field's order count while its second field is decoded:
+            // 8.2.4.2.4 orders the first field by PicOrderCnt(fldPrev).
+            FieldStatistics.SecondFields++;
+        }
+        else
+        {
+            FieldStatistics.FramePictures += header.FieldPic || sps.FrameMbsOnly ? 0 : 1;
+            picture = TakePicture(sps, header.FrameNum, poc);
+            (picture.TopPoc, picture.BottomPoc) = _order.Fields;
+        }
+
+        // A second field's frame is the first one's: its timestamp, and whether it starts a new sequence.
+        var state = new PictureState(header, sps, decoder, picture, poc, OutputSize(sps), secondField);
+        int decodedPoc = header.BottomField ? _order.DecodedFields.Bottom : _order.DecodedFields.Top;
+        var interlacing = InterlacingOf(header, sps, decodedPoc, secondField);
+        _signal = sps.Signal.After(_signal);
+        var job = secondField
+            ? new PictureJob(state, _firstField!.Pts, _firstField.Restart, _firstField.Discard) { FirstField = _firstField, PictureType = _firstField.PictureType, Interlacing = interlacing, Signal = _firstField.Signal }
+            : new PictureJob(state, pts, header.IsIdr || header.MemoryManagement.Any(op => op.Op == 5), _discard) { PictureType = ToPictureType(header.Type), Interlacing = interlacing, DecodedPoc = decodedPoc, Signal = _signal };
+        decoder.ConcealErrors = ConcealErrors;
+        if (ConcealErrors && _lastReference is { IsNonExisting: false } latest && _references.Contains(latest) && latest != picture)
+        {
+            // Kept from reuse while the picture is decoded, as its lists' pictures are; a field picture copies a field.
+            job.ConcealFrom = header.FieldPic ? latest.Field(header.Parity) : latest;
+            job.Uses.Add(latest);
+        }
+
+        return job;
+    }
+
+    /// <summary>
+    /// A picture's interlacing, as FFmpeg exports it at a frame picture or a second field (from both fields' order counts),
+    /// and its parser's field order; <paramref name="decoded"/> is a field's order count before
+    /// memory_management_control_operation 5. A first field's stands for a frame whose second field is lost, the missing
+    /// field's order count taken as the largest (FFmpeg's INT_MAX), and leaves the previous frame's flag as it was.
+    /// </summary>
+    private Interlacing InterlacingOf(SliceHeader header, SequenceParameterSet sps, int decoded, bool secondField)
+    {
+        // The parser forgets the SEI at each packet, which only a frame picture right after an unpaired field (with the
+        // field's SEI and none of its own) would show: taken as the decoder holds it.
+        var timing = _timing is { } payload && sps.PictureTiming is { } layout ? PictureTiming.Read(payload, layout) : null;
+
+        // The order counts as decoded, not rebased by memory_management_control_operation 5 (FFmpeg's field_poc): a first
+        // field's that took it stays above its second field's.
+        var (top, bottom) = !header.FieldPic ? _order.DecodedFields
+            : secondField ? (header.BottomField ? (_firstField!.DecodedPoc, decoded) : (decoded, _firstField!.DecodedPoc))
+            : header.BottomField ? (int.MaxValue, decoded) : (decoded, int.MaxValue);
+        var order = Interlacing.ParserOrder(header, timing, top, bottom, ref _parserLastField);
+        if (!_started)
+        {
+            FieldOrder = order;
+            _started = true;
+        }
+
+        var (interlaced, topFieldFirst) = Interlacing.Flags(timing, header.FieldPic || sps.MbAdaptiveFrameField, _previousInterlaced, top, bottom);
+        if (!header.FieldPic || secondField)
+        {
+            _previousInterlaced = interlaced;
+        }
+
+        return new Interlacing(interlaced, topFieldFirst, order, header.FieldPic);
+    }
+
+    /// <summary>A slice type as FFmpeg's <c>pict_type</c> (its <c>ff_h264_golomb_to_pict_type</c>).</summary>
+    private static PictureType ToPictureType(SliceType type) => type switch
+    {
+        SliceType.P => PictureType.P,
+        SliceType.B => PictureType.B,
+        SliceType.I => PictureType.I,
+        SliceType.SP => PictureType.SP,
+        _ => PictureType.SI,
+    };
+
+    /// <summary>
+    /// A decoder for pictures of the stream's size and format that no picture being decoded uses: a free one, a new one
+    /// while there are fewer than <see cref="Threads"/>, or the oldest one's once it is done (its picture output into
+    /// <paramref name="frames"/>). A new size or format waits for every picture being decoded first.
+    /// </summary>
+    private IPictureDecoder TakeDecoder(SequenceParameterSet sps, List<VideoFrame> frames)
+    {
+        if (_decoders.Count > 0 && (_decoders[0].Sps.WidthInMbs != sps.WidthInMbs || _decoders[0].Sps.HeightInMbs != sps.HeightInMbs
+            || _decoders[0].Sps.ChromaArrayType != sps.ChromaArrayType || _decoders[0].Sps.ChromaFormatIdc != sps.ChromaFormatIdc
+            || _decoders[0].Sps.BitDepthLuma != sps.BitDepthLuma))
+        {
+            Drain(frames, all: true);
+            StopThreads();
+            _decoders.Clear();
+            _previousInterlaced = true;
+        }
+
+        while (true)
+        {
+            var free = _decoders.Find(d => !_inFlight.Any(job => job.State.Decoder == d));
+            if (free is not null)
+            {
+                return free;
+            }
+
+            if (_decoders.Count < Threads)
+            {
+                // The statistics are shared, counted without locks: exact with one thread (which tests use).
+                IPictureDecoder Plane(int plane) => sps.BitDepthLuma > 8
+                    ? new PictureDecoder<ushort>(sps, plane) { Statistics = MbaffStatistics, FieldStatistics = FieldStatistics, RowDelay = RowDelay, CheckMotionNeighbors = CheckMotionNeighbors, CheckMbaffStrengths = CheckMbaffStrengths, MbaffIntraScratchOnly = MbaffIntraScratchOnly }
+                    : new PictureDecoder<byte>(sps, plane) { Statistics = MbaffStatistics, FieldStatistics = FieldStatistics, RowDelay = RowDelay, CheckMotionNeighbors = CheckMotionNeighbors, CheckMbaffStrengths = CheckMbaffStrengths, MbaffIntraScratchOnly = MbaffIntraScratchOnly };
+                var decoder = sps.SeparateColourPlanes ? new SeparatePlanesDecoder([Plane(0), Plane(1), Plane(2)]) : Plane(0);
+                _decoders.Add(decoder);
+                return decoder;
+            }
+
+            DrainOldest(frames);
+        }
+    }
+
+    /// <summary>The thread that decodes <paramref name="decoder"/>'s pictures.</summary>
+    private PictureThread ThreadOf(IPictureDecoder decoder)
+    {
+        if (!_threadsOf.TryGetValue(decoder, out var thread))
+        {
+            thread = new PictureThread();
+            _threadsOf.Add(decoder, thread);
+        }
+
+        return thread;
+    }
+
+    /// <summary>Ends the decoders' threads once they are idle (the next picture starts them again).</summary>
+    private void StopThreads()
+    {
+        foreach (var thread in _threadsOf.Values)
+        {
+            thread.Stop();
+        }
+
+        _threadsOf.Clear();
+    }
+
+    /// <summary>Whether a picture being decoded (or decoded and not yet output) is <paramref name="picture"/> or predicts from it.</summary>
+    private bool InUse(Picture picture) => _inFlight.Any(job => job.State.Picture == picture || job.Uses.Contains(picture));
+
+    // The first field of a frame being decoded as two field pictures.
+    private PictureJob? _firstField;
+
+    /// <summary>
+    /// With <see cref="ConcealErrors"/>: the frame of a first field whose second field did not come (lost), once the first is
+    /// decoded. The missing field's rows are copies of the present field's (line doubling, not a reference's samples), the
+    /// frame is damaged, and the missing field reports itself done before any later picture starts, so that pictures that
+    /// predict from the frame do not wait for it. A first field that failed gives no frame.
+    /// </summary>
+    private void CompleteUnpaired(List<VideoFrame> frames)
+    {
+        var job = _firstField!;
+        _firstField = null;
+        if (job.Task is { } task)
+        {
+            // What it threw comes out where it is drained, as for any picture.
+            task.ContinueWith(_ => { }, TaskScheduler.Default).Wait();
+        }
+
+        var picture = job.State.Picture;
+        if (picture.Failed)
+        {
+            return;
+        }
+
+        int missing = 1 - job.State.Header.Parity;
+        picture.FillField(missing);
+        picture.Damaged = true;
+        picture.Field(missing).ReportDone();
+        job.Unpaired = true;
+        if (!_inFlight.Contains(job))
+        {
+            Output(job, frames);
+        }
+    }
+
+    /// <summary>How often field pictures were decoded, so tests can check samples exercise them.</summary>
+    internal FieldStatistics FieldStatistics { get; } = new();
+
+    /// <summary>
+    /// Decoding process for gaps in frame_num (8.2.5.2): a frame_num more than one past the
+    /// previous reference picture's means reference frames are missing (dropped temporal layers,
+    /// or lost). Each missing frame_num gets a "non-existing" frame, marked as a short-term
+    /// reference by the sliding window, so that later list positions and the window come out as
+    /// the encoder had them.
+    /// </summary>
+    private void InferGapFrames(SliceHeader header, SequenceParameterSet sps)
+    {
+        int maxFrameNum = 1 << sps.Log2MaxFrameNum;
+        if (_prevRefFrameNum < 0 || header.FrameNum == _prevRefFrameNum || header.FrameNum == (_prevRefFrameNum + 1) % maxFrameNum)
+        {
+            return;
+        }
+
+        // Of a long gap, only the last frames stay marked (the sliding window): only those are worth filling in.
+        int gap = (header.FrameNum - _prevRefFrameNum - 1 + maxFrameNum) % maxFrameNum;
+        int inferred = 0;
+        for (int frameNum = (_prevRefFrameNum + 1) % maxFrameNum; frameNum != header.FrameNum; frameNum = (frameNum + 1) % maxFrameNum)
+        {
+            var picture = TakePicture(sps, frameNum, _order.NextInferred(frameNum, sps));
+            if (ConcealErrors && gap - inferred++ <= Math.Max(sps.MaxNumRefFrames, 1))
+            {
+                // A gap that is a loss, as far as anything predicts from it: the frame copies the latest reference,
+                // so that pictures predicted from it decode (flagged damaged), rather than fail.
+                picture.FillMissing(LatestReferenceDone(picture));
+                _lastReference = picture;
+            }
+            else
+            {
+                picture.IsNonExisting = true;
+                _referenceLost |= !ConcealErrors && !sps.GapsInFrameNumAllowed;
+            }
+
+            picture.ReportDone();
+            _references.MarkNonExisting(picture, sps);
+        }
+
+        _prevRefFrameNum = (header.FrameNum + maxFrameNum - 1) % maxFrameNum;
+    }
+
+    /// <summary>
+    /// The latest reference (still marked, not <paramref name="exclude"/>) once it is decoded, for an inferred frame to
+    /// copy; null if there is none, or it failed.
+    /// </summary>
+    private Picture? LatestReferenceDone(Picture exclude)
+    {
+        if (_lastReference is not { IsNonExisting: false } latest || !_references.Contains(latest) || latest == exclude
+            || latest.WidthInMbs != exclude.WidthInMbs || latest.HeightInMbs != exclude.HeightInMbs || latest.BitDepth != exclude.BitDepth
+            || latest.MbWidthC != exclude.MbWidthC || latest.MbHeightC != exclude.MbHeightC)
+        {
+            return null;
+        }
+
+        try
+        {
+            latest.WaitForRow(int.MaxValue);
+            return latest;
+        }
+        catch (InvalidDataException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Whether <paramref name="picture"/> has the size, chroma format and bit depth of <paramref name="sps"/>'s pictures.</summary>
+    private static bool FitsFormat(Picture picture, SequenceParameterSet sps) =>
+        picture.WidthInMbs == sps.WidthInMbs && picture.HeightInMbs == sps.HeightInMbs && picture.MbHeightC == sps.MbHeightC
+        && picture.MbWidthC == sps.MbWidthC && picture.BitDepth == sps.BitDepthLuma && picture.SeparatePlanes == sps.SeparateColourPlanes;
+
+    /// <summary>A picture of the stream's size that is not a reference, reused when one is free.</summary>
+    private Picture TakePicture(SequenceParameterSet sps, int frameNum, int poc)
+    {
+        // A picture whose frame was returned by the previous call may be reused: borrowed frames
+        // are valid until the next call. One waiting in the output queue may not.
+        bool Fits(Picture p) => FitsFormat(p, sps);
+        _pictures.RemoveAll(p => !Fits(p) && !_references.Contains(p) && !_output.Holds(p) && !InUse(p));
+        var picture = _pictures.Find(p => Fits(p) && !_references.Contains(p) && !_output.Holds(p) && !InUse(p));
+        if (picture is null)
+        {
+            picture = new Picture(sps.WidthInMbs, sps.HeightInMbs, sps.MbHeightC, sps.BitDepthLuma, sps.MbWidthC, sps.SeparateColourPlanes);
+            _pictures.Add(picture);
+        }
+
+        // Every macroblock of a complete picture is written, so the old samples need no clearing.
+        picture.Id = ++_pictureCount;
+        picture.Poc = poc;
+        picture.TopPoc = poc;
+        picture.BottomPoc = poc;
+        picture.Mbaff = false;
+        picture.FrameNum = frameNum;
+        picture.FrameNumWrap = 0;
+        picture.IsShortTermReference = false;
+        picture.IsLongTermReference = false;
+        picture.LongTermFrameIdx = 0;
+        picture.IsNonExisting = false;
+        picture.ResetProgress();
+        return picture;
+    }
+
+    /// <summary>
+    /// The size of a picture's frame: the SPS's visible area (frame cropping, 7.4.2.1.1), or the container's where it
+    /// crops that further as FFmpeg's decoder takes it (h264_slice.c, init_dimensions): no SPS cropping at the top or
+    /// left, no larger, and the same rounded up to a multiple of 16. As there, a picture whose SPS does not allow it
+    /// turns it off for the rest of the stream.
+    /// </summary>
+    private (int Width, int Height) OutputSize(SequenceParameterSet sps)
+    {
+        if (TakesContainerSize(sps, _containerWidth, _containerHeight))
+        {
+            return (_containerWidth, _containerHeight);
+        }
+
+        _containerWidth = 0;
+        _containerHeight = 0;
+        return (sps.Width, sps.Height);
+    }
+
+    private static bool TakesContainerSize(SequenceParameterSet sps, int containerWidth, int containerHeight)
+    {
+        return containerWidth > 0 && containerHeight > 0 && sps.Crop.Top == 0 && sps.Crop.Left == 0
+            && RoundUp16(containerWidth) == RoundUp16(sps.Width) && RoundUp16(containerHeight) == RoundUp16(sps.Height)
+            && containerWidth <= sps.Width && containerHeight <= sps.Height;
+
+        static int RoundUp16(int n) => (n + 15) & ~15;
+    }
+
+    /// <summary>
+    /// The size of the stream's first frames as a decoder for it gives them (<see cref="OutputSize"/>), from the first
+    /// SPS of its configuration record without decoding; null without one (an Annex B stream's are in its packets). For
+    /// the thumbnail package's probe.
+    /// </summary>
+    internal static (int Width, int Height)? FrameSize(VideoStreamInfo stream)
+    {
+        if (stream.CodecPrivate.IsEmpty)
+        {
+            return null;
+        }
+
+        var config = AvcConfiguration.Parse(stream.CodecPrivate.Span);
+        foreach (var data in config.Sps)
+        {
+            var nal = NalUnit.Parse(data);
+            if (nal.Type != NalUnitType.Sps)
+            {
+                continue;
+            }
+
+            var sps = SequenceParameterSet.Parse(nal.CreateReader());
+            return TakesContainerSize(sps, stream.Width, stream.Height) ? (stream.Width, stream.Height) : (sps.Width, sps.Height);
+        }
+
+        return null;
+    }
+
+    /// <summary>Copies the visible area (<paramref name="size"/> from the top left of the SPS's, see OutputSize) into a new frame.</summary>
+    private VideoFrame Crop(Picture picture, SequenceParameterSet sps, (int Width, int Height) size)
+    {
+        // Every sample is written below, so pooled planes need no clearing.
+        var format = FormatOf(picture);
+        var frame = _framePool.Rent(size.Width, size.Height, format);
+        var (left, _, top, _) = sps.Crop;
+        for (int plane = 0; plane < format.PlaneCount(); plane++)
+        {
+            int shiftX = plane == 0 || picture.MbWidthC == 16 ? 0 : 1;
+            int shiftY = plane == 0 || picture.MbHeightC == 16 ? 0 : 1;
+            int stride = plane == 0 ? picture.LumaStride : picture.ChromaStride;
+            var (width, height) = format.PlaneSize(plane, size.Width, size.Height);
+            for (int y = 0; y < height; y++)
+            {
+                int start = (((top >> shiftY) + y) * stride) + (left >> shiftX);
+                if (picture.BitDepth == 8)
+                {
+                    picture.Plane<byte>(plane).AsSpan(start, width).CopyTo(frame.GetRow(plane, y));
+                }
+                else
+                {
+                    // 16-bit words in memory order, which is little-endian on every platform .NET runs on.
+                    MemoryMarshal.AsBytes(picture.Plane<ushort>(plane).AsSpan(start, width)).CopyTo(frame.GetRow(plane, y));
+                }
+            }
+        }
+
+        return frame;
+    }
+
+    /// <summary>A frame of the cropped area of <paramref name="picture"/>, in its planes: no copy (<see cref="BorrowFrames"/>).</summary>
+    private static VideoFrame Borrow(Picture picture, SequenceParameterSet sps, (int Width, int Height) size)
+    {
+        var (left, _, top, _) = sps.Crop;
+        int lumaOffset = (top * picture.LumaStride) + left;
+        var format = FormatOf(picture);
+        if (format.PlaneCount() == 1)
+        {
+            return new VideoFrame(size.Width, size.Height, format, [picture.Y], [picture.LumaStride], [lumaOffset]);
+        }
+
+        int chromaOffset = ((picture.MbHeightC == 16 ? top : top >> 1) * picture.ChromaStride) + (picture.MbWidthC == 16 ? left : left >> 1);
+        return new VideoFrame(
+            size.Width,
+            size.Height,
+            format,
+            [picture.Y, picture.Cb, picture.Cr],
+            [picture.LumaStride, picture.ChromaStride, picture.ChromaStride],
+            [lumaOffset, chromaOffset, chromaOffset]);
+    }
+
+    private static PixelFormat FormatOf(Picture picture) =>
+        PixelFormatExtensions.Of(picture.MbWidthC == 16 ? 3 : picture.MbHeightC switch { 0 => 0, 16 => 2, _ => 1 }, picture.BitDepth);
+
+    /// <summary>The picture being decoded: its first slice header, its SPS, its decoder, its frame, its order count and its output frame's size.</summary>
+    private sealed record PictureState(SliceHeader Header, SequenceParameterSet Sps, IPictureDecoder Decoder, Picture Picture, int Poc, (int Width, int Height) Size, bool SecondField = false);
+
+    /// <summary>A slice to decode, with its reference lists and their marking when they were built.</summary>
+    // Lost: its reference lists could not be built (ConcealErrors), so it is not decoded and its macroblocks are concealed.
+    private sealed record SliceWork(SliceHeader Header, PictureParameterSet Pps, BitReader Reader, List<Picture> List0, List<Picture> List1, MarkSnapshot Marks, bool Lost = false);
+
+    /// <summary>
+    /// A picture parsed from a packet, to be decoded: its state and slices, the frames it predicts from, and for its
+    /// output frame the timestamp (a second field's frame takes the first field's), whether it restarts the order and
+    /// whether it is shown at all (a second field's frame goes as the first field's packet says).
+    /// </summary>
+    private sealed class PictureJob(PictureState state, long pts, bool restart, bool discard)
+    {
+        public PictureState State { get; } = state;
+
+        public long Pts { get; } = pts;
+
+        public bool Restart { get; } = restart;
+
+        public bool Discard { get; } = discard;
+
+        /// <summary>
+        /// Its frame's type: its first slice's (FFmpeg's <c>h264_frame_start</c>), for a second field the first field's,
+        /// so a frame of two fields is typed by the first.
+        /// </summary>
+        public PictureType PictureType { get; init; }
+
+        /// <summary>Its frame's interlacing: a frame picture's or second field's own, a first field's for a frame without its second field.</summary>
+        public Interlacing Interlacing { get; init; }
+
+        /// <summary>Its frame's colour properties: the decoder's after its SPS (<see cref="VideoSignal.After"/>), a second field's its first field's.</summary>
+        public VideoSignal Signal { get; init; } = VideoSignal.None;
+
+        /// <summary>A field's order count as decoded, before memory_management_control_operation 5 rebased it (<see cref="PictureOrder.DecodedFields"/>).</summary>
+        public int DecodedPoc { get; init; }
+
+        /// <summary>With threads, the frame its thread copied out of the picture once decoded.</summary>
+        public VideoFrame? Frame { get; set; }
+
+        /// <summary>A first field whose second field was lost: its frame is output alone (<see cref="CompleteUnpaired"/>).</summary>
+        public bool Unpaired { get; set; }
+
+        /// <summary>A second field's first field, whose <see cref="Begun"/> it waits for.</summary>
+        public PictureJob? FirstField { get; init; }
+
+        /// <summary>Set once the picture's decoder has begun it (reset its state).</summary>
+        public TaskCompletionSource Begun { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<SliceWork> Slices { get; } = [];
+
+        public HashSet<Picture> Uses { get; } = [];
+
+        /// <summary>With <see cref="ConcealErrors"/>, the latest reference: what missing macroblocks are copied from when no slice has a list 0.</summary>
+        public Picture? ConcealFrom { get; set; }
+
+        /// <summary>With threads, set once it is given to its decoder's thread, and done when that has decoded it (either way).</summary>
+        public Task? Task => _done?.Task;
+
+        private TaskCompletionSource? _done;
+        private bool _completed;
+
+        public void Start() => _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Runs <paramref name="decode"/> (on the decoder's thread) and completes <see cref="Task"/> with what it threw, if anything.</summary>
+        public void Complete(Action decode)
+        {
+            try
+            {
+                decode();
+                _done!.SetResult();
+            }
+            catch (Exception exception)
+            {
+                _done!.SetException(exception);
+            }
+
+            lock (_done)
+            {
+                _completed = true;
+                Monitor.PulseAll(_done);
+            }
+        }
+
+        /// <summary>
+        /// Waits until it is decoded and rethrows what decoding threw. It blocks on a monitor: waiting on the task itself
+        /// spins first, which took a core from the pictures being decoded.
+        /// </summary>
+        public void Wait()
+        {
+            lock (_done!)
+            {
+                while (!_completed)
+                {
+                    Monitor.Wait(_done);
+                }
+            }
+
+            _done.Task.GetAwaiter().GetResult();
+        }
+    }
+
+    // The largest frame any level allows (MaxFS of levels 6 to 6.2, Table A-1: 8192x4320 and a little more): beyond it
+    // only damaged or hostile streams, each of whose pictures would take time and memory without bound.
+    private const int MaxFrameMbs = 139264;
+
+    private static void CheckSupported(SequenceParameterSet sps)
+    {
+        if ((long)sps.WidthInMbs * sps.HeightInMbs > MaxFrameMbs)
+        {
+            throw new NotSupportedException($"Frames of {sps.WidthInMbs} x {sps.HeightInMbs} macroblocks are larger than any level allows ({MaxFrameMbs} macroblocks).");
+        }
+
+        // 11 and 13 bits are left out: FFmpeg has no pixel format for them, so nothing to check them against.
+        if (sps.BitDepthLuma is not (8 or 9 or 10 or 12 or 14) || (sps.ChromaFormatIdc != 0 && sps.BitDepthChroma != sps.BitDepthLuma))
+        {
+            throw new NotSupportedException($"Bit depths {sps.BitDepthLuma} (luma) and {sps.BitDepthChroma} (chroma) are not supported (8, 9, 10, 12 or 14, the same for both unless monochrome).");
+        }
+    }
+}
+
+/// <summary>Counts of field pictures, so tests can check samples exercise them.</summary>
+internal sealed class FieldStatistics
+{
+    /// <summary>Second fields decoded (and so frames made of two field pictures).</summary>
+    public int SecondFields { get; set; }
+
+    /// <summary>Partitions of a second field predicted from the first field of its own frame.</summary>
+    public int FromOwnFirstField { get; set; }
+
+    /// <summary>Frame pictures in streams that may code frames as fields (frame_mbs_only_flag 0).</summary>
+    public int FramePictures { get; set; }
+
+    /// <summary>Direct blocks of field pictures whose co-located block is in a frame macroblock (Frm_To_Fld).</summary>
+    public int FieldOverFrame { get; set; }
+
+    /// <summary>Direct blocks of frame pictures whose co-located block is in a frame coded as fields (Fld_To_Frm).</summary>
+    public int FrameOverFields { get; set; }
+
+    /// <summary>Direct blocks of field pictures, by temporal direct prediction.</summary>
+    public int TemporalDirect { get; set; }
+}
