@@ -65,6 +65,7 @@ await ParityChecks.Run();
 await TokenRelayChecks.Run();
 await HighwayUploadChecks.Run();
 await VideoMediaChecks.Run();
+await WebTicketChecks.Run();
 var adapterMetadata = typeof(LagrangeAdapter).GetCustomAttribute<ShiroBot.SDK.Core.BotAdapterAttribute>()!;
 var releaseVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0];
 if (adapterMetadata.Id != "lagrange" || string.IsNullOrWhiteSpace(releaseVersion) || adapterMetadata.Version != releaseVersion ||

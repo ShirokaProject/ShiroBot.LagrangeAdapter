@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.13")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.14")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.13",
+    Version = "0.1.14",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",

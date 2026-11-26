@@ -659,17 +659,10 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
         await LagrangeOperations.RequireSuccessAsync(session.Context.SetBotAvatar(stream), "设置头像", cancellationToken);
     }
 
-    public async Task<string> GetCookiesAsync(string domain, CancellationToken cancellationToken = default)
+    public Task<string> GetCookiesAsync(string domain, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (domain.Length is 0 or > 253 || domain.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '-')))
-            throw new ArgumentException("Cookie 域名无效。", nameof(domain));
-        var context = session.Context;
-        var tickets = LagrangeWebTickets.For(context);
-        var pskey = await tickets.GetPSKeyAsync(domain.ToLowerInvariant(), cancellationToken);
-        var uin = context.BotUin;
-        var skey = await tickets.GetSKeyAsync(cancellationToken);
-        return $"uin=o{uin}; p_uin=o{uin}; skey={skey}; p_skey={pskey}";
+        return LagrangeWebTickets.For(session.Context).GetCookiesAsync(domain, cancellationToken);
     }
 
     async Task<QLoginInfo> IQSystemApi.GetLoginInfoAsync(CancellationToken cancellationToken)
