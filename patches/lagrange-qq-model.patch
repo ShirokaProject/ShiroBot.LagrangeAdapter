@@ -206,6 +206,28 @@ index 90ee1c7..ab55e0f 100644
  
  internal class InfoSyncEventResp(string message) : ProtocolEvent
  {
+diff --git a/Lagrange.Core/Internal/Logic/MessagingLogic.cs b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
+index 8a31584..300c049 100644
+--- a/Lagrange.Core/Internal/Logic/MessagingLogic.cs
++++ b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
+@@ -29,6 +29,6 @@ internal class MessagingLogic(BotContext context) : ILogic
+     {
+-        string peerUid = context.CacheContext.ResolveCachedUid(peerUin) ?? throw new InvalidTargetException(peerUin);
++        var peerUid = (await ResolvePrivateMessageContact(peerUin)).Uid;
+         var result = await context.EventContext.SendEvent<GetRoamMessageEventResp>(new GetRoamMessageEventReq(peerUid, time, count));
+         var messages = new List<BotMessage>(result.Chains.Count);
+-        foreach (var chain in result.Chains) messages.Add(await Parse(chain));
++        foreach (var chain in result.Chains) messages.Add(await _packer.ParsePrivateHistoryAsync(chain));
+         return messages;
+@@ -38,6 +38,6 @@ internal class MessagingLogic(BotContext context) : ILogic
+     {
+-        string peerUid = context.CacheContext.ResolveCachedUid(peerUin) ?? throw new InvalidTargetException(peerUin);
++        var peerUid = (await ResolvePrivateMessageContact(peerUin)).Uid;
+         var result = await context.EventContext.SendEvent<GetC2CMessageEventResp>(new GetC2CMessageEventReq(peerUid, startSequence, endSequence));
+         var messages = new List<BotMessage>(result.Chains.Count);
+-        foreach (var chain in result.Chains) messages.Add(await Parse(chain));
++        foreach (var chain in result.Chains) messages.Add(await _packer.ParsePrivateHistoryAsync(chain));
+         return messages;
 diff --git a/Lagrange.Core/Internal/Logic/OperationLogic.cs b/Lagrange.Core/Internal/Logic/OperationLogic.cs
 index bd60058..a6cad85 100644
 --- a/Lagrange.Core/Internal/Logic/OperationLogic.cs
@@ -333,6 +355,15 @@ index b9a4c30..e94d6b8 100644
      
      [ProtoMember(7)] public List<RichMediaStorageTransInfo> Ext { get; set; }
      
+diff --git a/Lagrange.Core/Internal/Services/Message/GetRoamMessageService.cs b/Lagrange.Core/Internal/Services/Message/GetRoamMessageService.cs
+index 2a232a6..d776ada 100644
+--- a/Lagrange.Core/Internal/Services/Message/GetRoamMessageService.cs
++++ b/Lagrange.Core/Internal/Services/Message/GetRoamMessageService.cs
+@@ -20,3 +20,3 @@ internal class GetRoamMessageService : BaseService<GetRoamMessageEventReq, GetRo
+             Count = input.Count,
+-            Direction = 2
++            Direction = 1 // Search older messages from the supplied timestamp.
+         };
 diff --git a/Lagrange.Core/Internal/Services/Message/GroupFSViewService.cs b/Lagrange.Core/Internal/Services/Message/GroupFSViewService.cs
 index 9282186..88e2e6c 100644
 --- a/Lagrange.Core/Internal/Services/Message/GroupFSViewService.cs
@@ -729,3 +760,23 @@ index 6cf2076..e506a56 100644
                  VideoSize = new Vector2(videoInfo.Width, videoInfo.Height),
                  VideoLength = videoInfo.Time
              };
+diff --git a/Lagrange.Core/Message/MessagePacker.cs b/Lagrange.Core/Message/MessagePacker.cs
+index b513694..ec2ff92 100644
+--- a/Lagrange.Core/Message/MessagePacker.cs
++++ b/Lagrange.Core/Message/MessagePacker.cs
+@@ -19,3 +19,6 @@ internal class MessagePacker(BotContext context)
+
+-    private async Task<BotMessage> ParseCoreAsync(CommonMessage msg, bool allowPartialMedia)
++    internal Task<BotMessage> ParsePrivateHistoryAsync(CommonMessage msg) =>
++        ParseCoreAsync(msg, allowPartialMedia: false, expandForwards: false);
++
++    private async Task<BotMessage> ParseCoreAsync(CommonMessage msg, bool allowPartialMedia, bool expandForwards = true)
+     {
+@@ -85,3 +88,7 @@ internal class MessagePacker(BotContext context)
+             foreach (var entity in message.Entities)
++            {
++                // History carries the card ID, and callers can request its contents separately.
++                if (!expandForwards && entity is MultiMsgEntity) continue;
+                 await entity.Postprocess(context, message);
++            }
+         }

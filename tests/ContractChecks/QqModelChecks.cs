@@ -24,6 +24,7 @@ internal static class QqModelChecks
         CheckInterface<IQMessageApi, LagrangeQqMessageApi>(nameof(IQMessageApi.ForwardSingleMessageAsync));
         await CheckFileCallsAsync();
         await CheckOnlinePushAsync();
+        await CheckPrivateHistoryDirectionAsync();
         CheckSegments();
         Console.WriteLine("QQ Model 1.2 interface dispatch, file OIDB payloads, online device push and new incoming segments passed (offline).");
     }
@@ -136,6 +137,22 @@ internal static class QqModelChecks
         Receive(new ProtoWire());
         if ((await provider.GetOnlineClientsAsync()).Count != 0)
             throw new Exception("The empty device push did not replace the old device snapshot.");
+    }
+
+    private static async Task CheckPrivateHistoryDirectionAsync()
+    {
+        using var bot = BotFactory.Create(new BotConfig());
+        var core = typeof(BotContext).Assembly;
+        var requestType = core.GetType("Lagrange.Core.Internal.Events.Message.GetRoamMessageEventReq")!;
+        var serviceType = core.GetType("Lagrange.Core.Internal.Services.Message.GetRoamMessageService")!;
+        var service = Activator.CreateInstance(serviceType)!;
+        var request = Activator.CreateInstance(requestType, "friend-uid", 1_700_000_000u, 20u);
+        var build = serviceType.GetMethod("Build", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var data = await (ValueTask<ReadOnlyMemory<byte>>)build.Invoke(service, [request, bot])!;
+        var fields = ProtoWire.Parse(data.Span);
+        if (ProtoWire.String(fields, 1) != "friend-uid" || ProtoWire.Number(fields, 2) != 1_700_000_000u ||
+            ProtoWire.Number(fields, 4) != 20u || ProtoWire.Number(fields, 5) != 1u)
+            throw new Exception("Private history did not request older messages from the supplied timestamp.");
     }
 
     private static void CheckSegments()
