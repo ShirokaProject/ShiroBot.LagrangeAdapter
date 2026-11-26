@@ -192,7 +192,11 @@ internal sealed class LagrangeFlashProtocol(LagrangeProtocol protocol)
             ? new ProtoWire().UInt(1, 2).Message(3, new ProtoWire().UInt(1, checked((ulong)peer)))
             : new ProtoWire().UInt(1, 1).Message(2, new ProtoWire().Text(1, friendUid));
         var req = new ProtoWire().Message(1, target).Text(2, set);
-        await protocol.Oidb(0x93d7, 1, req, token, reserved: true);
+        var response = await protocol.Oidb(0x93d7, 1, req, token, reserved: true);
+        var status = ProtoWire.Child(response, 1);
+        LagrangeProtocol.RequireSuccess(status);
+        if (ProtoWire.Child(status, 3).Count == 0)
+            throw new InvalidDataException("QQ 未返回闪传卡片的目标发送状态。");
     }
 
     private ProtoWire MediaRequest(uint command) => new ProtoWire().Message(1, new ProtoWire()

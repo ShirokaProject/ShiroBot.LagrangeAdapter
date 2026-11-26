@@ -510,10 +510,10 @@ index a30b327..f12378b 100644
 \ No newline at end of file
 diff --git a/Lagrange.Core/Message/Entities/MarkdownEntity.cs b/Lagrange.Core/Message/Entities/MarkdownEntity.cs
 new file mode 100644
-index 0000000..5d85366
+index 0000000..991297e
 --- /dev/null
 +++ b/Lagrange.Core/Message/Entities/MarkdownEntity.cs
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,42 @@
 +using Lagrange.Core.Internal.Packets.Message;
 +using Lagrange.Core.Utility;
 +using Lagrange.Proto;
@@ -536,10 +536,17 @@ index 0000000..5d85366
 +        }
 +    }];
 +
-+    IMessageEntity? IMessageEntity.Parse(List<Elem> elements, Elem target) =>
-+        target.CommonElem is { ServiceType: 45, BusinessType: 1 } markdown
-+            ? new MarkdownEntity(ProtoHelper.Deserialize<MarkdownPayload>(markdown.PbElem.Span).Content)
++    IMessageEntity? IMessageEntity.Parse(List<Elem> elements, Elem target)
++    {
++        if (target.CommonElem is not { ServiceType: 45, BusinessType: 1 or 3 } markdown)
++            return null;
++
++        var content = ProtoHelper.Deserialize<MarkdownPayload>(markdown.PbElem.Span).Content;
++        // QQ FlashTransfer pushes a Markdown card with business type 3.
++        return markdown.BusinessType == 1 || content.StartsWith("[闪传](mqqapi://markdown/node?", StringComparison.Ordinal)
++            ? new MarkdownEntity(content)
 +            : null;
++    }
 +
 +    string IMessageEntity.ToPreviewString() => Content;
 +}

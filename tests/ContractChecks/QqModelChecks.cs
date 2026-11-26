@@ -102,6 +102,21 @@ internal static class QqModelChecks
             throw new Exception("Flash commit ignored the media error.");
         }
         catch (InvalidOperationException exception) when (exception.Message.Contains("100000", StringComparison.Ordinal)) { }
+
+        var groupTarget = new ProtoWire().UInt(1, 2).Message(3, new ProtoWire().UInt(1, 123));
+        reply = new ProtoWire().Message(1, new ProtoWire().Message(3, groupTarget));
+        await flash.SendCardAsync("set-123", 123, null, default);
+        var sentTo = ProtoWire.Child(request, 1);
+        if (command != "OidbSvcTrpcTcp.0x93d7_1" || ProtoWire.String(request, 2) != "set-123" ||
+            ProtoWire.Number(sentTo, 1) != 2 || ProtoWire.Number(ProtoWire.Child(sentTo, 3), 1) != 123)
+            throw new Exception("Flash card did not target the group with its uploaded file set.");
+        reply = new ProtoWire().Message(1, new ProtoWire().UInt(1, 403).Text(2, "target rejected").Message(3, groupTarget));
+        try
+        {
+            await flash.SendCardAsync("set-123", 123, null, default);
+            throw new Exception("Flash card ignored the target's send status.");
+        }
+        catch (InvalidOperationException exception) when (exception.Message.Contains("403", StringComparison.Ordinal)) { }
     }
 
     private static async Task CheckOnlinePushAsync()
@@ -141,7 +156,19 @@ internal static class QqModelChecks
                 }
             }
         });
-        var markdown = new MarkdownEntity($"[闪传](mqqapi://flash/open?json={Uri.EscapeDataString(card)})");
+        var content = $"[闪传](mqqapi://markdown/node?json={Uri.EscapeDataString(card)})";
+        var core = typeof(MarkdownEntity).Assembly;
+        var elemType = core.GetType("Lagrange.Core.Internal.Packets.Message.Elem", throwOnError: true)!;
+        var commonElemType = core.GetType("Lagrange.Core.Internal.Packets.Message.CommonElem", throwOnError: true)!;
+        var commonElem = Activator.CreateInstance(commonElemType)!;
+        commonElemType.GetProperty("ServiceType")!.SetValue(commonElem, 45u);
+        commonElemType.GetProperty("BusinessType")!.SetValue(commonElem, 3u);
+        commonElemType.GetProperty("PbElem")!.SetValue(commonElem, (ReadOnlyMemory<byte>)new ProtoWire().Text(1, content).ToArray());
+        var elem = Activator.CreateInstance(elemType)!;
+        elemType.GetProperty("CommonElem")!.SetValue(elem, commonElem);
+        var parse = typeof(IMessageEntity).GetMethod("Parse", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var markdown = parse.Invoke(new MarkdownEntity(), [null, elem]) as MarkdownEntity
+            ?? throw new Exception("QQ business type 3 lost its FlashTransfer Markdown card.");
         var mapped = LagrangeMapper.ToQqSegments([markdown, new MarkdownEntity("[闪传](bad)")]);
         if (mapped[0] is not QIncomingFlashFile { FileSetId: "set-123", SceneType: 2, Title: "文件" } ||
             mapped[1] is not QIncomingText ||

@@ -44,9 +44,10 @@ internal sealed partial class LagrangeQqMessageApi
                 if (group)
                 {
                     var copied = await files.CopyGroupFileAsync(peerId, groupFile.FileId, target, toFriend: false, cancellationToken);
-                    return await ObserveForwardAsync(target, group,
+                    var forwarded = await ObserveForwardAsync(target, group,
                         entity => entity is GroupFileEntity forwarded && forwarded.FileId == copied.Id,
                         () => GroupFiles.SendAsync(context, target, copied, cancellationToken), cancellationToken);
+                    return forwarded.Sequence.ToString();
                 }
 
                 return (await files.SendGroupFileToFriendAsync(peerId, groupFile.FileId, target, cancellationToken)).Sequence.ToString();
@@ -65,10 +66,8 @@ internal sealed partial class LagrangeQqMessageApi
         if (source.Entities.Count == 1 && source.Entities[0] is MarkdownEntity markdown &&
             LagrangeMapper.TryReadFlashCard(markdown.Content) is { } card)
         {
-            return await ObserveForwardAsync(target, group,
-                entity => entity is MarkdownEntity incoming &&
-                    LagrangeMapper.TryReadFlashCard(incoming.Content)?.FileSetId == card.FileSetId,
-                () => files.SendFlashCardAsync(card.FileSetId, target, group, cancellationToken), cancellationToken);
+            var forwarded = await SendFlashCardAsync(card.FileSetId, target, group, cancellationToken);
+            return forwarded.Sequence.ToString();
         }
 
         var resources = new List<Stream>();
@@ -130,19 +129,25 @@ internal sealed partial class LagrangeQqMessageApi
         }
     }
 
-    private async Task<string> ObserveForwardAsync(long target, bool group, Func<IMessageEntity, bool> match,
+    internal Task<BotMessage> SendFlashCardAsync(string fileSetId, long target, bool group, CancellationToken token) =>
+        ObserveForwardAsync(target, group,
+            entity => entity is MarkdownEntity markdown &&
+                LagrangeMapper.TryReadFlashCard(markdown.Content)?.FileSetId == fileSetId,
+            () => files.SendFlashCardAsync(fileSetId, target, group, token), token);
+
+    private async Task<BotMessage> ObserveForwardAsync(long target, bool group, Func<IMessageEntity, bool> match,
         Func<Task> send, CancellationToken token)
     {
         var self = session.Context.BotUin;
         var started = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var observed = new TaskCompletionSource<ulong>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observed = new TaskCompletionSource<BotMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
         void Observe(BotMessage message)
         {
             if (message.Contact.Uin != self || message.Sequence == 0 || message.Time < started) return;
             var isGroup = message.Contact is BotGroupMember;
             var peer = message.Contact is BotGroupMember member ? member.Group.GroupUin : message.Receiver.Uin;
             if (isGroup == group && target == peer && message.Entities.Any(match))
-                observed.TrySetResult(message.Sequence);
+                observed.TrySetResult(message);
         }
 
         session.MessagePushed += Observe;
@@ -151,7 +156,7 @@ internal sealed partial class LagrangeQqMessageApi
             await send();
             try
             {
-                return (await observed.Task.WaitAsync(TimeSpan.FromSeconds(8), token)).ToString();
+                return await observed.Task.WaitAsync(TimeSpan.FromSeconds(8), token);
             }
             catch (TimeoutException)
             {
@@ -162,8 +167,8 @@ internal sealed partial class LagrangeQqMessageApi
                     Observe(message);
                 }
 
-                if (observed.Task.IsCompletedSuccessfully) return observed.Task.Result.ToString();
-                throw new TimeoutException("QQ 已接受转发，但未查到目标消息序号。");
+                if (observed.Task.IsCompletedSuccessfully) return observed.Task.Result;
+                throw new TimeoutException("QQ 已接受请求，但未查到目标消息序号。");
             }
         }
         finally

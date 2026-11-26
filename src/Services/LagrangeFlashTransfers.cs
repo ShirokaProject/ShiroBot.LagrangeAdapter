@@ -143,7 +143,7 @@ internal sealed class LagrangeFlashTransfers(
     {
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stopping, token);
         token = lifetime.Token;
-        var uid = group ? null : await LagrangeProtocol.Uid(context, peer, token);
+        var uid = group ? null : await LagrangeProtocol.ResolveContactUidAsync(context, peer, token);
         await _protocol.SendCardAsync(set, peer, uid, token);
     }
 

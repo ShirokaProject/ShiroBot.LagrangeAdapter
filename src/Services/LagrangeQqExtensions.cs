@@ -63,7 +63,7 @@ internal sealed class LagrangeQqFriendApi(LagrangeSession session) : IQFriendApi
         cancellationToken.ThrowIfCancellationRequested();
         if (count is < 1 or > 20) throw new ArgumentOutOfRangeException(nameof(count));
         var context = session.Context;
-        var uid = await LagrangeProtocol.ResolveLikeTargetUid(context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
+        var uid = await LagrangeProtocol.ResolveContactUidAsync(context, LagrangeMapper.ParseId(userId, nameof(userId)), cancellationToken);
         await new LagrangeProtocol(context).Like(uid, count, cancellationToken);
     }
 

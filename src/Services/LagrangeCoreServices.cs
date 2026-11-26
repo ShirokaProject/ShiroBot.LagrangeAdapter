@@ -5,7 +5,7 @@ using ShiroBot.SDK.Models;
 namespace ShiroBot.LagrangeAdapter.Services;
 
 /// <summary>平台无关消息服务的 Lagrange 实现。</summary>
-internal sealed class LagrangeMessageService(LagrangeSession session) : IMessageService
+internal sealed class LagrangeMessageService(LagrangeSession session, LagrangeQqMessageApi? qqMessages = null) : IMessageService
 {
     public async Task<SentMessage> SendMessageAsync(Channel channel, IReadOnlyList<MessageSegment> segments,
         CancellationToken cancellationToken = default)
@@ -13,6 +13,17 @@ internal sealed class LagrangeMessageService(LagrangeSession session) : IMessage
         cancellationToken.ThrowIfCancellationRequested();
         var peerId = LagrangeMapper.ParseId(channel.Id, "Channel.Id");
         var context = session.Context;
+        if (segments.Count == 1 && segments[0] is RawSegment { Platform: "qq", Kind: "flash_file", Payload: string fileSetId })
+        {
+            if (channel.Type is not (ChannelType.Group or ChannelType.Direct))
+                throw LagrangeMapper.Unsupported("闪传卡片的会话类型");
+            ArgumentException.ThrowIfNullOrWhiteSpace(fileSetId);
+            var messages = qqMessages ?? throw LagrangeMapper.Unsupported("发送闪传卡片");
+            var card = await messages.SendFlashCardAsync(fileSetId.Trim(), peerId, channel.Type == ChannelType.Group,
+                cancellationToken).ConfigureAwait(false);
+            return new SentMessage(card.Sequence.ToString()) { Timestamp = DateTimeOffset.FromUnixTimeSeconds(card.Time) };
+        }
+
         List<Stream> resources = [];
         Lagrange.Core.Message.BotMessage sent;
         try

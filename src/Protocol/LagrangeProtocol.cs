@@ -36,7 +36,7 @@ internal sealed class LagrangeProtocol
     internal Task<List<ProtoWire.Field>> Like(string uid, int count, CancellationToken token) =>
         Oidb(0x7e5, 104, new ProtoWire().Text(11, uid).UInt(12, 71).UInt(13, checked((ulong)count)), token);
 
-    internal static async Task<string> ResolveLikeTargetUid(BotContext context, long uin, CancellationToken token)
+    internal static async Task<string> ResolveContactUidAsync(BotContext context, long uin, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (uin == context.BotUin && !string.IsNullOrEmpty(context.Keystore.Uid)) return context.Keystore.Uid;
