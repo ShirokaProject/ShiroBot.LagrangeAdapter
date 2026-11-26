@@ -13,13 +13,25 @@ internal sealed class LagrangeMessageService(LagrangeSession session) : IMessage
         cancellationToken.ThrowIfCancellationRequested();
         var peerId = LagrangeMapper.ParseId(channel.Id, "Channel.Id");
         var context = session.Context;
-        var chain = await LagrangeMapper.ToChainAsync(segments,
-                id => session.ResolveMessageAsync(id, peerId, channel.Type == ChannelType.Group, cancellationToken), context)
-            .ConfigureAwait(false);
-
-        var sent = channel.Type == ChannelType.Group
-            ? await context.SendGroupMessage(peerId, chain).ConfigureAwait(false)
-            : await context.SendFriendMessage(peerId, chain).ConfigureAwait(false);
+        List<Stream> resources = [];
+        Lagrange.Core.Message.BotMessage sent;
+        try
+        {
+            sent = await context.RunMessageOperationAsync(async () =>
+            {
+                var chain = await LagrangeMapper.ToChainAsync(segments,
+                    id => session.ResolveMessageAsync(id, peerId, channel.Type == ChannelType.Group, cancellationToken),
+                    context, cancellationToken, resources).ConfigureAwait(false);
+                return channel.Type == ChannelType.Group
+                    ? await context.SendGroupMessage(peerId, chain).ConfigureAwait(false)
+                    : await context.SendFriendMessage(peerId, chain).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (var resource in resources)
+                await resource.DisposeAsync().ConfigureAwait(false);
+        }
 
         session.CacheMessage(sent);
         return new SentMessage(sent.Sequence.ToString())

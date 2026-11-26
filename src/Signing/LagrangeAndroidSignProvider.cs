@@ -42,7 +42,7 @@ internal sealed class LagrangeAndroidSignProvider : AndroidBotSignProvider, IDis
         payload["cmd"] = cmd;
         payload["seq"] = seq;
         payload["buffer"] = Convert.ToHexString(body.Span).ToLowerInvariant();
-        var root = await _client.RequestAsync("sign", payload);
+        var root = await _client.RequestWithCancellationAsync("sign", payload, Context.MessageOperationCancellation);
         var value = root["data"] as JsonObject ?? throw new InvalidDataException("签名响应缺少 data 对象。");
         return new SsoSecureInfo
         {

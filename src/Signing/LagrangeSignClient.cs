@@ -34,15 +34,22 @@ internal sealed class LagrangeSignClient : IDisposable
             _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.SignToken);
     }
 
-    internal async Task<JsonObject> RequestAsync(string endpoint, object? payload = null)
+    internal Task<JsonObject> RequestAsync(string endpoint, object? payload = null) =>
+        RequestWithCancellationAsync(endpoint, payload, CancellationToken.None);
+
+    internal async Task<JsonObject> RequestWithCancellationAsync(string endpoint, object? payload, CancellationToken cancellationToken)
     {
+        using var linked = cancellationToken.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(_stopping, cancellationToken)
+            : null;
+        var token = linked?.Token ?? _stopping;
         try
         {
             using var request = new HttpRequestMessage(payload is null ? HttpMethod.Get : HttpMethod.Post,
                 new Uri(_base, endpoint));
             if (payload is not null) request.Content = JsonContent.Create(payload);
-            using var response = await _client.SendAsync(request, _stopping);
-            var body = await response.Content.ReadAsStringAsync(_stopping);
+            using var response = await _client.SendAsync(request, token);
+            var body = await response.Content.ReadAsStringAsync(token);
             JsonObject? root;
             try { root = JsonNode.Parse(body) as JsonObject; }
             catch (System.Text.Json.JsonException)

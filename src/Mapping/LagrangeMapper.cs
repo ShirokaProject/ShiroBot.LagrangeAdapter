@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Diagnostics;
 using Lagrange.Core.Common;
 using Lagrange.Core.Common.Entity;
 using Lagrange.Core.Message;
@@ -14,6 +16,8 @@ namespace ShiroBot.LagrangeAdapter;
 public static class LagrangeMapper
 {
     private static readonly HttpClient ResourceClient = new();
+    private static readonly SemaphoreSlim ForwardImageDownloadSlots = new(8, 8);
+    private static readonly TimeSpan ForwardImageInactivityTimeout = TimeSpan.FromSeconds(12);
     public const string PlatformId = "qq";
 
 
@@ -282,12 +286,14 @@ public static class LagrangeMapper
 
     public static async Task<MessageChain> ToChainAsync(
         IReadOnlyList<MessageSegment> segments,
-        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null,
+        CancellationToken cancellationToken = default, List<Stream>? resources = null)
     {
         var chain = new MessageChain();
 
         foreach (var segment in segments)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             switch (segment)
             {
                 case TextSegment text:
@@ -313,18 +319,18 @@ public static class LagrangeMapper
                     chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(emoji.Id), false));
                     break;
                 case ImageSegment image:
-                    chain.Add(new ImageEntity(await OpenResourceAsync(image.Uri).ConfigureAwait(false),
-                        image.Summary ?? "[图片]", disposeOnCompletion: true));
+                    chain.Add(new ImageEntity(await OpenMessageResourceAsync(image.Uri, cancellationToken, resources).ConfigureAwait(false),
+                        image.Summary ?? "[图片]", disposeOnCompletion: resources is null));
                     break;
                 case AudioSegment audio:
-                    chain.Add(new RecordEntity(await OpenResourceAsync(audio.Uri).ConfigureAwait(false),
-                        disposeOnCompletion: true));
+                    chain.Add(new RecordEntity(await OpenMessageResourceAsync(audio.Uri, cancellationToken, resources).ConfigureAwait(false),
+                        disposeOnCompletion: resources is null));
                     break;
                 case VideoSegment video:
-                    chain.Add(await CreateVideoAsync(video.Uri, video.ThumbnailUri).ConfigureAwait(false));
+                    chain.Add(await CreateVideoAsync(video.Uri, video.ThumbnailUri, cancellationToken, resources).ConfigureAwait(false));
                     break;
                 case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
-                    await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context).ConfigureAwait(false);
+                    await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context, cancellationToken, resources).ConfigureAwait(false);
                     break;
                 case RawSegment { Payload: IMessageEntity lagrangeEntity }:
                     chain.Add(lagrangeEntity);
@@ -342,8 +348,10 @@ public static class LagrangeMapper
     public static async Task AppendQqSegmentAsync(
         MessageChain chain,
         QOutgoingSegment segment,
-        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null,
+        CancellationToken cancellationToken = default, List<Stream>? resources = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         switch (segment)
         {
             case QOutgoingText text:
@@ -364,15 +372,15 @@ public static class LagrangeMapper
 
                 break;
             case QOutgoingImage image:
-                chain.Add(new ImageEntity(await OpenResourceAsync(image.Uri).ConfigureAwait(false),
-                    image.Summary ?? "[图片]", disposeOnCompletion: true));
+                chain.Add(new ImageEntity(await OpenMessageResourceAsync(image.Uri, cancellationToken, resources).ConfigureAwait(false),
+                    image.Summary ?? "[图片]", disposeOnCompletion: resources is null));
                 break;
             case QOutgoingRecord record:
-                chain.Add(new RecordEntity(await OpenResourceAsync(record.Uri).ConfigureAwait(false),
-                    disposeOnCompletion: true));
+                chain.Add(new RecordEntity(await OpenMessageResourceAsync(record.Uri, cancellationToken, resources).ConfigureAwait(false),
+                    disposeOnCompletion: resources is null));
                 break;
             case QOutgoingVideo video:
-                chain.Add(await CreateVideoAsync(video.Uri, video.ThumbUri).ConfigureAwait(false));
+                chain.Add(await CreateVideoAsync(video.Uri, video.ThumbUri, cancellationToken, resources).ConfigureAwait(false));
                 break;
             case QOutgoingLightApp lightApp:
                 chain.Add(new LightAppEntity(lightApp.JsonPayload));
@@ -381,7 +389,7 @@ public static class LagrangeMapper
                 chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(face.FaceId), face.IsLarge));
                 break;
             case QOutgoingForward forward:
-                chain.Add(await ToMultiMsgAsync(forward, resolveQuoted, context).ConfigureAwait(false));
+                chain.Add(await ToMultiMsgAsync(forward, resolveQuoted, context, cancellationToken, resources).ConfigureAwait(false));
                 break;
             default:
                 throw Unsupported(segment.GetType().Name);
@@ -391,37 +399,134 @@ public static class LagrangeMapper
     /// <summary>合并转发 → MultiMsgEntity(伪造消息)。</summary>
     public static async Task<MultiMsgEntity> ToMultiMsgAsync(
         QOutgoingForward forward,
-        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null)
+        Func<string, Task<BotMessage?>> resolveQuoted, Lagrange.Core.BotContext? context = null,
+        CancellationToken cancellationToken = default, List<Stream>? resources = null)
     {
-        var messages = new List<BotMessage>();
-        foreach (var message in forward.Messages)
+        var remoteImages = forward.Messages.SelectMany(message => message.Segments).OfType<QOutgoingImage>()
+            .Where(image => IsHttpResource(image.Uri)).ToArray();
+        var downloaded = new Stream?[remoteImages.Length];
+        var completed = false;
+        try
         {
-            var chain = new MessageChain();
-            foreach (var segment in message.Segments)
+            if (remoteImages.Length > 0)
             {
-                await AppendQqSegmentAsync(chain, segment, resolveQuoted, context).ConfigureAwait(false);
+                var started = Stopwatch.GetTimestamp();
+                var trace = Activity.Current?.TraceId.ToString() ?? "-";
+                context?.LogDebug(nameof(LagrangeMapper), "trace={0} forward image download start images={1}", trace, remoteImages.Length);
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                deadline.CancelAfter(TimeSpan.FromSeconds(40));
+                try
+                {
+                    await Parallel.ForEachAsync(Enumerable.Range(0, remoteImages.Length),
+                        new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = deadline.Token },
+                        async (index, token) =>
+                        {
+                            downloaded[index] = await DownloadForwardImageAsync(remoteImages[index].Uri, token).ConfigureAwait(false);
+                        }).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException("Downloading images for the forwarded message exceeded 40 seconds.");
+                }
+                finally
+                {
+                    context?.LogDebug(nameof(LagrangeMapper),
+                        "trace={0} forward image download finished ready={1}/{2} elapsed_ms={3:F0}",
+                        trace, downloaded.Count(stream => stream is not null), remoteImages.Length,
+                        Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                }
             }
 
-            messages.Add(BotMessage.CreateCustomGroup(
-                0,
-                ParseId(message.UserId, "UserId"),
-                message.SenderName,
-                (message.Time ?? DateTimeOffset.Now).ToUnixTimeSeconds(),
-                chain));
-        }
+            var messages = new List<BotMessage>();
+            var imageIndex = 0;
+            foreach (var message in forward.Messages)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var chain = new MessageChain();
+                foreach (var segment in message.Segments)
+                {
+                    if (segment is QOutgoingImage image && IsHttpResource(image.Uri))
+                    {
+                        chain.Add(new ImageEntity(downloaded[imageIndex++]!, image.Summary ?? "[图片]",
+                            disposeOnCompletion: resources is null));
+                        continue;
+                    }
+                    await AppendQqSegmentAsync(chain, segment, resolveQuoted, context, cancellationToken, resources).ConfigureAwait(false);
+                }
 
-        return new MultiMsgEntity(messages);
+                messages.Add(BotMessage.CreateCustomGroup(
+                    0, ParseId(message.UserId, "UserId"), message.SenderName,
+                    (message.Time ?? DateTimeOffset.Now).ToUnixTimeSeconds(), chain));
+            }
+
+            if (resources is not null)
+                foreach (var stream in downloaded) resources.Add(stream!);
+            completed = true;
+            return new MultiMsgEntity(messages);
+        }
+        finally
+        {
+            if (!completed)
+                foreach (var stream in downloaded)
+                    if (stream is not null) await stream.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
-    private static async Task<VideoEntity> CreateVideoAsync(string uri, string? thumbnailUri)
+    private static async Task<Stream> DownloadForwardImageAsync(string uri, CancellationToken token)
     {
-        var video = await OpenResourceAsync(uri, bufferHttpResponse: false).ConfigureAwait(false);
+        var host = new Uri(uri).IdnHost;
+        await ForwardImageDownloadSlots.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+                deadline.CancelAfter(ForwardImageInactivityTimeout);
+                try
+                {
+                    return await OpenHttpResourceAsync(uri, deadline.Token, deadline).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+                {
+                    if (attempt == 2)
+                        throw new TimeoutException($"Downloading a forwarded image from {host} timed out after two attempts.");
+                }
+                catch (HttpRequestException exception)
+                {
+                    if (attempt == 2 || exception.StatusCode is { } status && (int)status < 500 &&
+                        status is not (System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests))
+                    {
+                        var reason = exception.StatusCode is { } response ? $"HTTP {(int)response}" : "connection error";
+                        throw new HttpRequestException($"Downloading a forwarded image from {host} failed ({reason}).", statusCode: exception.StatusCode, inner: null);
+                    }
+                }
+                catch (HttpIOException)
+                {
+                    if (attempt == 2)
+                        throw new HttpRequestException($"Downloading a forwarded image from {host} failed while reading the response.");
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ForwardImageDownloadSlots.Release();
+        }
+    }
+
+    private static async Task<VideoEntity> CreateVideoAsync(string uri, string? thumbnailUri,
+        CancellationToken cancellationToken, List<Stream>? resources)
+    {
+        var video = await OpenMessageResourceAsync(uri, cancellationToken, null).ConfigureAwait(false);
         try
         {
             var (size, duration) = LagrangeVideoMedia.ReadMetadata(video);
             var thumbnail = thumbnailUri is not null
-                ? await OpenResourceAsync(thumbnailUri).ConfigureAwait(false)
-                : await LagrangeVideoMedia.TryCreateThumbnailAsync(video, size).ConfigureAwait(false);
+                ? await OpenMessageResourceAsync(thumbnailUri, cancellationToken, null).ConfigureAwait(false)
+                : await LagrangeVideoMedia.TryCreateThumbnailAsync(video, size, cancellationToken).ConfigureAwait(false);
+            resources?.Add(video);
+            // A missing cover is created internally by VideoEntity and must also be disposed after a send.
+            if (thumbnail is not null) resources?.Add(thumbnail);
             return new VideoEntity(video, thumbnail, disposeOnCompletion: true)
             {
                 VideoSize = size,
@@ -433,6 +538,15 @@ public static class LagrangeMapper
             await video.DisposeAsync().ConfigureAwait(false);
             throw;
         }
+    }
+
+    private static async Task<Stream> OpenMessageResourceAsync(string uri, CancellationToken cancellationToken,
+        List<Stream>? resources)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var stream = await OpenResourceAsync(uri, bufferHttpResponse: false, cancellationToken).ConfigureAwait(false);
+        resources?.Add(stream);
+        return stream;
     }
 
     /// <summary>解析 http(s)://、file://、base64:// 三种资源形式为 Stream。</summary>
@@ -449,11 +563,16 @@ public static class LagrangeMapper
             return File.OpenRead(new Uri(uri).LocalPath);
         }
 
-        if (!uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-            !uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return File.OpenRead(uri);
+        if (!IsHttpResource(uri)) return File.OpenRead(uri);
         if (bufferHttpResponse)
             return new MemoryStream(await ResourceClient.GetByteArrayAsync(uri, cancellationToken).ConfigureAwait(false));
 
+        return await OpenHttpResourceAsync(uri, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Stream> OpenHttpResourceAsync(string uri, CancellationToken cancellationToken,
+        CancellationTokenSource? inactivityDeadline = null)
+    {
         using var response = await ResourceClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
             .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
@@ -469,9 +588,14 @@ public static class LagrangeMapper
         var file = new FileStream(path, options);
         try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromMinutes(20));
-            await response.Content.CopyToAsync(file, timeout.Token).ConfigureAwait(false);
+            if (inactivityDeadline is not null)
+                await CopyForwardImageAsync(response.Content, file, inactivityDeadline).ConfigureAwait(false);
+            else
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromMinutes(20));
+                await response.Content.CopyToAsync(file, timeout.Token).ConfigureAwait(false);
+            }
             file.Position = 0;
             return file;
         }
@@ -481,6 +605,29 @@ public static class LagrangeMapper
             throw;
         }
     }
+
+    private static async Task CopyForwardImageAsync(HttpContent content, Stream file, CancellationTokenSource deadline)
+    {
+        deadline.CancelAfter(ForwardImageInactivityTimeout);
+        await using var body = await content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            int count;
+            while ((count = await body.ReadAsync(buffer.AsMemory(), deadline.Token).ConfigureAwait(false)) > 0)
+            {
+                deadline.CancelAfter(ForwardImageInactivityTimeout);
+                await file.WriteAsync(buffer.AsMemory(0, count), deadline.Token).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static bool IsHttpResource(string uri) =>
+        uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
 
     // ─── 工具 ───
 

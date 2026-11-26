@@ -38,11 +38,12 @@ internal static class LagrangeVideoMedia
     private static uint DurationSeconds(double seconds) =>
         double.IsFinite(seconds) && seconds > 0 ? (uint)Math.Min(uint.MaxValue, Math.Ceiling(seconds)) : 0;
 
-    public static async Task<Stream?> TryCreateThumbnailAsync(Stream source, Vector2 videoSize)
+    public static async Task<Stream?> TryCreateThumbnailAsync(Stream source, Vector2 videoSize, CancellationToken cancellationToken = default)
     {
         if (videoSize.X <= 0 || videoSize.Y <= 0) return null;
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
         try
         {
             using var demuxer = Demuxer.Open(source, leaveOpen: true);
@@ -82,7 +83,7 @@ internal static class LagrangeVideoMedia
             return finalCover is null ? null : new MemoryStream(finalCover, writable: false);
         }
         catch (Exception exception) when (exception is IOException or InvalidDataException or NotSupportedException
-            or OverflowException or OperationCanceledException)
+            or OverflowException || exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
         {
             return null;
         }

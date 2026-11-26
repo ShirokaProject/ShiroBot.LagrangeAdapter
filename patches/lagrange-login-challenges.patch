@@ -95,7 +95,7 @@ index ef847d04..b5cf3be7 100644
 +        context.CacheContext.ResolveCachedUid(uin);
  }
 diff --git a/Lagrange.Core/Internal/Context/PacketContext.cs b/Lagrange.Core/Internal/Context/PacketContext.cs
-index 6b4d33d1..6fa3c9d5 100644
+index 6b4d33d..df02253 100644
 --- a/Lagrange.Core/Internal/Context/PacketContext.cs
 +++ b/Lagrange.Core/Internal/Context/PacketContext.cs
 @@ -1,14 +1,15 @@
@@ -116,12 +116,14 @@ index 6b4d33d1..6fa3c9d5 100644
  
      private readonly BotKeystore _keystore;
      private readonly SsoPacker _ssoPacker;
-@@ -37,8 +38,13 @@ internal class PacketContext
+@@ -37,29 +38,40 @@ internal class PacketContext
  
      public ValueTask<BotSsoPacket> SendPacket(BotSsoPacket packet, ServiceAttribute options)
      {
 -        var tcs = new SsoPacketValueTaskSource();
 -        _pendingTasks.TryAdd(packet.Sequence, tcs);
++        var token = _context.MessageOperationCancellation;
++        token.ThrowIfCancellationRequested();
 +        var pending = new PendingRequest(this, packet.Sequence);
 +        if (!_pendingTasks.TryAdd(packet.Sequence, pending))
 +        {
@@ -132,7 +134,12 @@ index 6b4d33d1..6fa3c9d5 100644
  
          Task.Run(async () => // Schedule the task to the ThreadPool
          {
-@@ -50,16 +56,19 @@ internal class PacketContext
+             try
+             {
++                token.ThrowIfCancellationRequested();
+                 ReadOnlyMemory<byte> frame;
+
+                 switch (options.RequestType)
                  {
                      case RequestType.D2Auth:
                      {
@@ -154,11 +161,12 @@ index 6b4d33d1..6fa3c9d5 100644
                          }
  
                          break;
-@@ -85,18 +94,64 @@ internal class PacketContext
+@@ -85,18 +97,65 @@ internal class PacketContext
                      }
                  }
  
 -                await _context.SocketContext.Send(frame);
++                token.ThrowIfCancellationRequested();
 +                if (await _context.SocketContext.Send(frame) <= 0) throw new IOException("QQ socket is disconnected.");
              }
              catch (Exception e)
@@ -222,7 +230,7 @@ index 6b4d33d1..6fa3c9d5 100644
      }
  
      public void DispatchPacket(ReadOnlySpan<byte> buffer)
-@@ -106,14 +161,15 @@ internal class PacketContext
+@@ -106,14 +165,15 @@ internal class PacketContext
  
          if (_pendingTasks.TryRemove(sso.Sequence, out var tcs))
          {
@@ -392,7 +400,7 @@ index 7dbb67a5..bd600584 100644
  
      private static string ResolveFileName(Stream fileStream, string? fileName)
 diff --git a/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs b/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
-index 1b940511..bdaa292f 100644
+index 1b94051..93155f5 100644
 --- a/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
 +++ b/Lagrange.Core/Internal/Logic/Processors/RichTextMsgProcessor.cs
 @@ -1,4 +1,4 @@
@@ -401,7 +409,7 @@ index 1b940511..bdaa292f 100644
  using System.Web;
  using Lagrange.Core.Common.Entity;
  using Lagrange.Core.Events.EventArgs;
-@@ -10,6 +10,8 @@ namespace Lagrange.Core.Internal.Logic.Processors;
+@@ -10,14 +10,16 @@ namespace Lagrange.Core.Internal.Logic.Processors;
  
  [MsgPushProcessor(MsgType.GroupMessage)]
  [MsgPushProcessor(MsgType.PrivateMessage)]
@@ -410,9 +418,10 @@ index 1b940511..bdaa292f 100644
  [MsgPushProcessor(MsgType.TempMessage)]
  internal class RichTextMsgProcessor : MsgPushProcessorBase
  {
-@@ -17,7 +19,7 @@ internal class RichTextMsgProcessor : MsgPushProcessorBase
+     internal override async ValueTask<bool> Handle(BotContext context, MsgType msgType, int subType, PushMessageEvent msgEvt, ReadOnlyMemory<byte>? content)
      {
-         var message = await context.EventContext.GetLogic<MessagingLogic>().Parse(msgEvt.MsgPush.CommonMessage);
+-        var message = await context.EventContext.GetLogic<MessagingLogic>().Parse(msgEvt.MsgPush.CommonMessage);
++        var message = await context.EventContext.GetLogic<MessagingLogic>().ParsePushAsync(msgEvt.MsgPush.CommonMessage);
  
 -        if (message.Entities.Count > 0 && message.Entities[0] is LightAppEntity app && TryHandleLightApp(context, message, app)) return true;
 +        if (message.Entities.Count > 0 && message.Entities[0] is LightAppEntity app) TryHandleLightApp(context, message, app);
@@ -1294,10 +1303,23 @@ index 4b7d1fa5..e0f3ebd2 100644
 \ No newline at end of file
 +}
 diff --git a/Lagrange.Core/Message/MessagePacker.cs b/Lagrange.Core/Message/MessagePacker.cs
-index 011f6eca..fa6acb77 100644
+index 011f6ec..b513694 100644
 --- a/Lagrange.Core/Message/MessagePacker.cs
 +++ b/Lagrange.Core/Message/MessagePacker.cs
-@@ -32,7 +32,13 @@ internal class MessagePacker(BotContext context)
+@@ -13,7 +13,11 @@ internal class MessagePacker(BotContext context)
+ {
+     private readonly List<IMessageEntity> _factory = MessageEntityRegistry.Create();
+
+-    public async Task<BotMessage> Parse(CommonMessage msg)
++    public Task<BotMessage> Parse(CommonMessage msg) => ParseCoreAsync(msg, allowPartialMedia: false);
++
++    internal Task<BotMessage> ParsePushAsync(CommonMessage msg) => ParseCoreAsync(msg, allowPartialMedia: true);
++
++    private async Task<BotMessage> ParseCoreAsync(CommonMessage msg, bool allowPartialMedia)
+     {
+         var contentHead = msg.ContentHead;
+         var routingHead = msg.RoutingHead;
+@@ -32,7 +36,13 @@ internal class MessagePacker(BotContext context)
          if (msg.MessageBody is null)
              return message;
  
@@ -1312,7 +1334,39 @@ index 011f6eca..fa6acb77 100644
          {
              message.Entities.Add(record);
          }
-@@ -63,9 +69,11 @@ internal class MessagePacker(BotContext context)
+@@ -51,9 +61,29 @@ internal class MessagePacker(BotContext context)
+             }
+         }
+
+-        foreach (var entity in message.Entities)
++        if (allowPartialMedia)
++        {
++            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
++            await context.RunMessageOperationAsync(async () =>
++            {
++                foreach (var entity in message.Entities)
++                {
++                    if (deadline.IsCancellationRequested) break;
++                    try { await entity.Postprocess(context, message); }
++                    catch (Exception exception) when ((entity is RichMediaEntityBase or MultiMsgEntity) &&
++                        (exception is Lagrange.Core.Exceptions.LagrangeException || deadline.IsCancellationRequested && exception is OperationCanceledException))
++                    {
++                        context.LogWarning(nameof(MessagePacker), "Incoming {0} metadata unavailable: {1}",
++                            null, entity.GetType().Name, exception.GetBaseException().Message);
++                    }
++                }
++                return true;
++            }, deadline.Token);
++        }
++        else
+         {
+-            await entity.Postprocess(context, message);
++            foreach (var entity in message.Entities)
++                await entity.Postprocess(context, message);
+         }
+
+         return message;
+@@ -63,9 +93,11 @@ internal class MessagePacker(BotContext context)
      {
          switch (type)
          {
@@ -1327,7 +1381,7 @@ index 011f6eca..fa6acb77 100644
  
              case 141:
                  return (await context.CacheContext.ResolveStranger(routingHead.ToUid)).CloneWithSource(routingHead.CommonC2C.FromTinyId);
-@@ -86,14 +94,11 @@ internal class MessagePacker(BotContext context)
+@@ -86,14 +118,11 @@ internal class MessagePacker(BotContext context)
      {
          switch (type)
          {
@@ -1818,11 +1872,20 @@ index 374f352c..491e4090 100644
 \ No newline at end of file
 +}
 diff --git a/Lagrange.Core/Internal/Logic/MessagingLogic.cs b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
-index d5c8661e..41712200 100644
+index d5c8661..8a31584 100644
 --- a/Lagrange.Core/Internal/Logic/MessagingLogic.cs
 +++ b/Lagrange.Core/Internal/Logic/MessagingLogic.cs
-@@ -43,8 +43,8 @@ internal class MessagingLogic(BotContext context) : ILogic
- 
+@@ -13,6 +13,8 @@ internal class MessagingLogic(BotContext context) : ILogic
+
+     public Task<BotMessage> Parse(CommonMessage msg) => _packer.Parse(msg);
+
++    internal Task<BotMessage> ParsePushAsync(CommonMessage msg) => _packer.ParsePushAsync(msg);
++
+     public Task<CommonMessage> BuildFake(BotMessage msg) => _packer.BuildFake(msg);
+
+     public async Task<List<BotMessage>> GetGroupMessage(long groupUin, ulong startSequence, ulong endSequence)
+@@ -43,10 +45,10 @@ internal class MessagingLogic(BotContext context) : ILogic
+
      public async Task<BotMessage> SendFriendMessage(long friendUin, MessageChain chain)
      {
 -        var friend = await context.CacheContext.ResolveFriend(friendUin) ?? throw new InvalidTargetException(friendUin);
@@ -1830,12 +1893,15 @@ index d5c8661e..41712200 100644
 +        var friend = await ResolvePrivateMessageContact(friendUin);
 +        var self = await ResolvePrivateMessageContact(context.BotUin);
          var message = await BuildMessage(chain, self, friend);
-         var result = await context.EventContext.SendEvent<SendMessageEventResp>(new SendMessageEventReq(message));
- 
-@@ -57,6 +57,19 @@ internal class MessagingLogic(BotContext context) : ILogic
+-        var result = await context.EventContext.SendEvent<SendMessageEventResp>(new SendMessageEventReq(message));
++        var result = await SubmitMessageAsync(message);
+
+         if (result == null) throw new InvalidOperationException();
+         if (result.Result != 0) throw new OperationException(result.Result);
+@@ -57,11 +59,24 @@ internal class MessagingLogic(BotContext context) : ILogic
          return message;
      }
- 
+
 +    private async Task<BotFriend> ResolvePrivateMessageContact(long uin)
 +    {
 +        var cached = context.CacheContext.ResolveCachedFriend(uin);
@@ -1852,6 +1918,30 @@ index d5c8661e..41712200 100644
      public async Task<BotMessage> SendGroupMessage(long groupUin, MessageChain chain)
      {
          var (group, self) = await context.CacheContext.ResolveMember(groupUin, context.BotUin) ?? throw new InvalidTargetException(context.BotUin, groupUin);
+         var message = await BuildMessage(chain, self, group);
+-        var result = await context.EventContext.SendEvent<SendMessageEventResp>(new SendMessageEventReq(message));
++        var result = await SubmitMessageAsync(message);
+
+         if (result == null) throw new InvalidOperationException();
+         if (result.Result != 0) throw new OperationException(result.Result);
+@@ -72,6 +87,17 @@ internal class MessagingLogic(BotContext context) : ILogic
+         return message;
+     }
+
++    private async ValueTask<SendMessageEventResp> SubmitMessageAsync(BotMessage message)
++    {
++        var trace = System.Diagnostics.Activity.Current;
++        var started = System.Diagnostics.Stopwatch.GetTimestamp();
++        var result = await context.EventContext.SendEvent<SendMessageEventResp>(new SendMessageEventReq(message));
++        if (trace is not null)
++            context.LogDebug(nameof(MessagingLogic), "trace={0} QQ send response code={1} elapsed_ms={2:F0}",
++                trace.TraceId, result?.Result, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds);
++        return result!;
++    }
++
+     public Task RecallMessage(BotMessage message)
+     {
+         return message.Contact switch
 diff --git a/Lagrange.Core/Message/Entities/LightAppEntity.cs b/Lagrange.Core/Message/Entities/LightAppEntity.cs
 index 5315e78c..6b85f242 100644
 --- a/Lagrange.Core/Message/Entities/LightAppEntity.cs
@@ -1877,3 +1967,29 @@ index 5315e78c..6b85f242 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/Lagrange.Core/Internal/Context/EventContext.cs b/Lagrange.Core/Internal/Context/EventContext.cs
+index 176023a..00f137b 100644
+--- a/Lagrange.Core/Internal/Context/EventContext.cs
++++ b/Lagrange.Core/Internal/Context/EventContext.cs
+@@ -26,16 +26,19 @@ internal class EventContext : IDisposable
+     {
+         try
+         {
++            var token = _context.MessageOperationCancellation;
++            token.ThrowIfCancellationRequested();
+             await HandleOutgoingEvent(@event);
+             var (frame, attribute) = await _context.ServiceContext.Resolve(@event);
+-            var @return = await _context.PacketContext.SendPacket(frame, attribute);
++            var pending = _context.PacketContext.SendPacket(frame, attribute);
++            var @return = token.CanBeCanceled ? await pending.AsTask().WaitAsync(token) : await pending;
+             var resolved = await _context.ServiceContext.Resolve(@return);
+
+             var result = resolved as T ?? throw new LagrangeException($"The event type is not the same as the expected type. Expected: {typeof(T)}, Actual: {resolved.GetType()}");
+             await HandleIncomingEvent(result);
+             return result;
+         }
+-        catch (Exception e) when (e is not LagrangeException)
++        catch (Exception e) when (e is not LagrangeException && !(_context.MessageOperationCancellation.IsCancellationRequested && e is OperationCanceledException))
+         {
+             throw new LagrangeException("An error occurred while sending the event", e);
+         }

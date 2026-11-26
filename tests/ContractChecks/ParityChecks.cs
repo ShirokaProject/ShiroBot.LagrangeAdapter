@@ -19,6 +19,7 @@ internal static class ParityChecks
         WriterBoundsChecks();
         LightAppEncodingCheck();
         await ForwardMediaPreparationChecks();
+        await UnavailableForwardPushKeepsMessageAsync();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
         Equal(wire, "089601120141");
@@ -144,6 +145,60 @@ internal static class ParityChecks
             throw new Exception("Profile likes must reuse a known contact UID with an empty friend list.");
     }
 
+    private static async Task UnavailableForwardPushKeepsMessageAsync()
+    {
+        using var bot = BotFactory.Create(new Lagrange.Core.Common.BotConfig { SignProvider = new OfflineSignProvider() });
+        var assembly = typeof(BotContext).Assembly;
+        object Packet(string name) => Activator.CreateInstance(
+            assembly.GetType($"Lagrange.Core.Internal.Packets.Message.{name}", throwOnError: true)!)!;
+        static void Set(object target, string name, object value) =>
+            target.GetType().GetProperty(name)!.SetValue(target, value);
+        var routing = Packet("RoutingHead");
+        Set(routing, "FromUin", 123L);
+        Set(routing, "FromUid", "sender");
+        Set(routing, "ToUin", 999L);
+        Set(routing, "ToUid", "receiver");
+        var header = Packet("ContentHead");
+        Set(header, "Type", 166);
+        var richText = Packet("RichText");
+        var elements = (System.Collections.IList)richText.GetType().GetProperty("Elems")!.GetValue(richText)!;
+        var text = Packet("Text");
+        Set(text, "TextMsg", "text beside unavailable media");
+        var textElement = Packet("Elem");
+        Set(textElement, "Text", text);
+        elements.Add(textElement);
+        var card = Packet("RichMsg");
+        Set(card, "ServiceId", 35u);
+        using var compressed = new MemoryStream();
+        compressed.WriteByte(1);
+        using (var zip = new System.IO.Compression.ZLibStream(compressed, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true))
+            zip.Write("<msg m_resid=\"unavailable-forward\"/>"u8);
+        Set(card, "BytesTemplate1", (ReadOnlyMemory<byte>)compressed.ToArray());
+        var cardElement = Packet("Elem");
+        Set(cardElement, "RichMsg", card);
+        elements.Add(cardElement);
+        var body = Packet("MessageBody");
+        Set(body, "RichText", richText);
+        var message = Packet("CommonMessage");
+        Set(message, "RoutingHead", routing);
+        Set(message, "ContentHead", header);
+        Set(message, "MessageBody", body);
+        var packer = Activator.CreateInstance(assembly.GetType("Lagrange.Core.Message.MessagePacker", true)!, bot)!;
+        var parsed = await (Task<BotMessage>)packer.GetType()
+            .GetMethod("ParsePushAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(packer, [message])!;
+        if (parsed.Entities.OfType<MultiMsgEntity>().Single().ResId != "unavailable-forward" ||
+            parsed.Entities.OfType<TextEntity>().Single().Text != "text beside unavailable media")
+            throw new Exception("Media enrichment failure discarded the forwarded reference or its adjacent text.");
+    }
+
+    private sealed class OfflineSignProvider : Lagrange.Core.Common.BotSignProvider
+    {
+        public override bool IsWhiteListCommand(string cmd) => true;
+
+        public override Task<Lagrange.Core.Common.SsoSecureInfo?> GetSecSign(long uin, string cmd, int seq, ReadOnlyMemory<byte> body) =>
+            throw new TimeoutException("fixture signer unreachable");
+    }
+
     private static async Task ForwardMediaPreparationChecks()
     {
         using var bot = BotFactory.Create(new Lagrange.Core.Common.BotConfig());
@@ -162,6 +217,37 @@ internal static class ParityChecks
             if (!ReferenceEquals(image.Envelope, envelope))
                 throw new Exception("Forwarded media must use the enclosing destination, including nested forwards.");
         }
+
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var bothStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entering = 0;
+        async Task Preprocess(BotContext context, BotMessage message)
+        {
+            if (!ReferenceEquals(message, envelope)) throw new Exception("Parallel image lost the enclosing destination.");
+            if (Interlocked.Increment(ref entering) == 2) bothStarted.TrySetResult();
+            await release.Task.WaitAsync(context.MessageOperationCancellation);
+            throw new StopBeforeForwardUpload();
+        }
+        var parallel = new MultiMsgEntity([
+            BotMessage.CreateCustomGroup(0, 123, "first", 1, [new ParallelProbeImage(Preprocess)]),
+            BotMessage.CreateCustomGroup(0, 456, "second", 1, [new ParallelProbeImage(Preprocess)])
+        ]);
+        var preprocessing = bot.RunMessageOperationAsync(async () =>
+        {
+            await parallel.Preprocess(bot, envelope);
+            return true;
+        }, deadline.Token);
+        await bothStarted.Task.WaitAsync(deadline.Token);
+        release.SetResult();
+        try
+        {
+            await preprocessing.WaitAsync(deadline.Token);
+            throw new Exception("Unexpected success from the synthetic image uploads.");
+        }
+        catch (StopBeforeForwardUpload)
+        {
+        }
     }
 
     private sealed class ForwardProbeImage() : ImageEntity(Stream.Null)
@@ -176,6 +262,11 @@ internal static class ParityChecks
     }
 
     private sealed class StopBeforeForwardUpload : Exception;
+
+    private sealed class ParallelProbeImage(Func<BotContext, BotMessage, Task> prepare) : ImageEntity(Stream.Null)
+    {
+        public override Task Preprocess(BotContext context, BotMessage message) => prepare(context, message);
+    }
 
     private static void ReaderBoundsChecks()
     {

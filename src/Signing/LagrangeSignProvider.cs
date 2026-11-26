@@ -567,7 +567,7 @@ internal sealed class LagrangeSignProvider : BotSignProvider, IDisposable
             ["guid"] = Convert.ToHexString(Context.Keystore.Guid).ToLowerInvariant(),
             ["qua"] = BuildQua(Context.Config.Protocol, Context.AppInfo)
         };
-        var root = await _client.RequestAsync("api/sign/sec-sign", payload);
+        var root = await _client.RequestWithCancellationAsync("api/sign/sec-sign", payload, Context.MessageOperationCancellation);
         var value = root["value"] as JsonObject
                     ?? throw new InvalidDataException("签名服务响应缺少 value 对象。");
         return new SsoSecureInfo

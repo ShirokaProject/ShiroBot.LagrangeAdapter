@@ -9,6 +9,9 @@ using Lagrange.Core.Common;
 using Lagrange.Core.Common.Interface;
 using Lagrange.Core.Internal.Context;
 using Lagrange.Core.Exceptions;
+using Lagrange.Core.Message.Entities;
+using ShiroBot.LagrangeAdapter;
+using ShiroBot.Model.QQ;
 
 namespace ContractChecks;
 
@@ -19,6 +22,8 @@ internal static class HighwayUploadChecks
         var content = new byte[1024 * 1024 + 17];
         new Random(41).NextBytes(content);
         await CheckImageUploadResponsesAsync();
+        await CheckRemoteImageDownloadAsync();
+        await CheckForwardImageDownloadsAsync();
         await CheckFlashTransferAsync(content);
 
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -30,8 +35,7 @@ internal static class HighwayUploadChecks
         var highway = bot.GetType().GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(bot)!;
         var (ticket, url) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)listener.LocalEndpoint).Port);
-        highway.GetType().GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(highway, (ticket, url, DateTimeOffset.UtcNow.AddMinutes(1)));
+        InstallSession(highway, ticket, url);
         var upload = highway.GetType().GetMethod("UploadFile")!;
         using var first = new MemoryStream(content, 0, 1500);
         var firstUpload = (Task<bool>)upload.Invoke(highway, [first, 1001, ReadOnlyMemory<byte>.Empty])!;
@@ -48,9 +52,213 @@ internal static class HighwayUploadChecks
             !Payload(blocks[2]).SequenceEqual(content.AsSpan(1024, 476)) ||
             !Payload(blocks[3]).SequenceEqual(content.AsSpan(0, 1024)))
             throw new Exception("Highway changed the retried block or its payload order.");
+        await CheckHighwayEndpointFailoverAsync(content);
+        await CheckHighwayCallerCancellationAsync(content);
         await CheckHighwayShutdownAsync(content);
         await CheckFlashTransferShutdownAsync(content);
-        Console.WriteLine("FlashTransfer and Highway upload, retry, rejection and shutdown checks passed.");
+        Console.WriteLine("Remote image download, FlashTransfer and Highway upload, retry, cancellation and shutdown checks passed.");
+    }
+
+    private static void InstallSession(object highway, byte[] ticket, params string[] urls)
+    {
+        var field = highway.GetType().GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var session = Activator.CreateInstance(field.FieldType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null,
+            [ticket, urls, DateTimeOffset.UtcNow.AddMinutes(1)], null);
+        field.SetValue(highway, session);
+    }
+
+    private static async Task CheckHighwayEndpointFailoverAsync(byte[] content)
+    {
+        using var primary = new TcpListener(IPAddress.Loopback, 0);
+        using var backup = new TcpListener(IPAddress.Loopback, 0);
+        primary.Start();
+        backup.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var bot = BotFactory.Create(new BotConfig { HighwayChunkSize = 1024 });
+        var highway = typeof(BotContext).GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(bot)!;
+        var (ticket, firstUrl) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)primary.LocalEndpoint).Port);
+        var (_, secondUrl) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)backup.LocalEndpoint).Port);
+        InstallSession(highway, ticket, firstUrl, secondUrl);
+        var method = highway.GetType().GetMethod("UploadFile")!;
+        Task<bool> Upload(Stream data) => (Task<bool>)method.Invoke(highway, [data, 1004, ReadOnlyMemory<byte>.Empty])!;
+
+        byte[] accepted = [0x28, 0, 0, 0, 2, 0, 0, 0, 0, 0x18, 0, 0x29];
+        byte[] rejected = [0x28, 0, 0, 0, 4, 0, 0, 0, 0, 0x12, 2, 0x28, 7, 0x29];
+        async Task<byte[]> ExchangeAsync(TcpListener endpoint, byte[] response, bool truncate = false)
+        {
+            using var socket = await endpoint.AcceptTcpClientAsync(timeout.Token);
+            using var stream = socket.GetStream();
+            var (_, body) = await ReadRequestAsync(stream, timeout.Token);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"HTTP/1.1 200 OK\r\nContent-Length: {response.Length}\r\nConnection: close\r\n\r\n"), timeout.Token);
+            await stream.WriteAsync(response.AsMemory(0, truncate ? 1 : response.Length), timeout.Token);
+            return body;
+        }
+
+        using var data = new MemoryStream(content, 0, 2500);
+        var sending = Upload(data);
+        var first = await ExchangeAsync(primary, accepted);
+        var stalled = await ExchangeAsync(primary, accepted, truncate: true);
+        var retried = await ExchangeAsync(backup, accepted);
+        var final = await ExchangeAsync(backup, accepted);
+        if (!await sending.WaitAsync(timeout.Token) || !stalled.SequenceEqual(retried) ||
+            !Payload(first).SequenceEqual(content.AsSpan(0, 1024)) ||
+            !Payload(retried).SequenceEqual(content.AsSpan(1024, 1024)) ||
+            !Payload(final).SequenceEqual(content.AsSpan(2048, 452)))
+            throw new Exception("Highway failover did not preserve the acknowledged block order and retried bytes.");
+
+        using var again = new MemoryStream(content, 0, 1024);
+        var response = Upload(again);
+        await ExchangeAsync(backup, rejected);
+        if (await response.WaitAsync(timeout.Token) || primary.Pending())
+            throw new Exception("Highway retried an explicit QQ response rejection on another endpoint.");
+    }
+
+    private static async Task CheckRemoteImageDownloadAsync()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var cancellation = new CancellationTokenSource();
+        var url = $"http://{listener.LocalEndpoint}/image";
+        List<Stream> resources = [];
+        var chain = LagrangeMapper.ToChainAsync(
+            [new ShiroBot.SDK.Models.ImageSegment(url)],
+            _ => Task.FromResult<Lagrange.Core.Message.BotMessage?>(null),
+            cancellationToken: cancellation.Token, resources: resources);
+        using (var client = await listener.AcceptTcpClientAsync(timeout.Token))
+        using (var connection = client.GetStream())
+        using (var reader = new StreamReader(connection, leaveOpen: true))
+        {
+            while (!string.IsNullOrEmpty(await reader.ReadLineAsync(timeout.Token))) { }
+            await connection.WriteAsync("HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\nConnection: close\r\n\r\n"u8.ToArray(), timeout.Token);
+            var chunk = new byte[65536];
+            for (var i = 0; i < 64; i++)
+                await connection.WriteAsync(chunk, timeout.Token);
+            await chain.WaitAsync(timeout.Token);
+        }
+        await using (var resource = resources.Single())
+        {
+            if (resource is not FileStream || !resource.CanSeek || resource.Length != 4194304 || resource.Position != 0)
+                throw new Exception("Remote image was not spooled to a rewindable file.");
+        }
+
+        resources.Clear();
+        var interrupted = LagrangeMapper.ToChainAsync(
+            [new ShiroBot.SDK.Models.ImageSegment(url)],
+            _ => Task.FromResult<Lagrange.Core.Message.BotMessage?>(null),
+            cancellationToken: cancellation.Token, resources: resources);
+        using var stalled = await listener.AcceptTcpClientAsync(timeout.Token);
+        using var stalledStream = stalled.GetStream();
+        using var stalledReader = new StreamReader(stalledStream, leaveOpen: true);
+        while (!string.IsNullOrEmpty(await stalledReader.ReadLineAsync(timeout.Token))) { }
+        await stalledStream.WriteAsync("HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\n\r\nx"u8.ToArray(), timeout.Token);
+        await cancellation.CancelAsync();
+        await ExpectCancellationAsync(interrupted, timeout.Token);
+        if (resources.Count != 0) throw new Exception("An incomplete image was passed to the message chain.");
+    }
+
+    private static async Task CheckForwardImageDownloadsAsync()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        string Url(string path) => $"http://{listener.LocalEndpoint}/{path}?secret=hidden";
+        static Task<Lagrange.Core.Message.BotMessage?> NoQuote(string _) => Task.FromResult<Lagrange.Core.Message.BotMessage?>(null);
+        async Task<string> PathAsync(TcpClient client)
+        {
+            using var reader = new StreamReader(client.GetStream(), leaveOpen: true);
+            var request = await reader.ReadLineAsync(timeout.Token);
+            while (!string.IsNullOrEmpty(await reader.ReadLineAsync(timeout.Token))) { }
+            return request!.Split(' ')[1].Split('?')[0];
+        }
+        Task WriteAsync(TcpClient client, string status, string body) => client.GetStream().WriteAsync(
+            Encoding.ASCII.GetBytes($"HTTP/1.1 {status}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}"),
+            timeout.Token).AsTask();
+
+        List<Stream> resources = [];
+        var forward = new QOutgoingForward([
+            new QForwardedMessage("123", "first", [new QOutgoingImage(Url("first"))]),
+            new QForwardedMessage("456", "second", [new QOutgoingImage(Url("second"))])
+        ]);
+        var prepared = LagrangeMapper.ToMultiMsgAsync(forward, NoQuote, cancellationToken: timeout.Token, resources: resources);
+        try
+        {
+            using var a = await listener.AcceptTcpClientAsync(timeout.Token);
+            var aPath = await PathAsync(a);
+            // The second download must start while the first response is still pending.
+            using var b = await listener.AcceptTcpClientAsync(timeout.Token);
+            var bPath = await PathAsync(b);
+            if (aPath == bPath || aPath is not ("/first" or "/second") || bPath is not ("/first" or "/second"))
+                throw new Exception("Parallel forward downloads did not request both images.");
+            await WriteAsync(aPath == "/second" ? a : b, "200 OK", "2");
+            await WriteAsync(aPath == "/first" ? a : b, "503 Unavailable", "");
+            using var retry = await listener.AcceptTcpClientAsync(timeout.Token);
+            if (await PathAsync(retry) != "/first") throw new Exception("The wrong image was retried.");
+            await WriteAsync(retry, "200 OK", "1");
+            var entity = await prepared.WaitAsync(timeout.Token);
+            if (entity.Messages.Count != 2 || entity.Messages.Any(message => message.Entities.Single() is not ImageEntity) ||
+                resources.Select(stream => stream.ReadByte()).SequenceEqual(new[] { (int)'1', (int)'2' }) is false)
+                throw new Exception("Forward download completion order changed the message order or image streams.");
+        }
+        finally
+        {
+            foreach (var stream in resources) await stream.DisposeAsync();
+            resources.Clear();
+        }
+
+        var denied = new QOutgoingForward([new QForwardedMessage("123", "first", [new QOutgoingImage(Url("denied"))])]);
+        var failed = LagrangeMapper.ToMultiMsgAsync(denied, NoQuote, cancellationToken: timeout.Token, resources: resources);
+        using var rejected = await listener.AcceptTcpClientAsync(timeout.Token);
+        if (await PathAsync(rejected) != "/denied") throw new Exception("Wrong image requested.");
+        await WriteAsync(rejected, "403 Forbidden", "");
+        try
+        {
+            await failed.WaitAsync(timeout.Token);
+            throw new Exception("A forbidden image was silently accepted in a forwarded message.");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden &&
+            ex.Message.Contains("forwarded image", StringComparison.Ordinal) &&
+            !ex.Message.Contains("secret", StringComparison.Ordinal))
+        {
+            if (resources.Count != 0) throw new Exception("A failed forward retained incomplete image downloads.");
+        }
+    }
+
+    private static async Task CheckHighwayCallerCancellationAsync(byte[] content)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var cancelled = new CancellationTokenSource();
+        await using var bot = BotFactory.Create(new BotConfig { HighwayConcurrent = 1 });
+        var highway = typeof(BotContext).GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(bot)!;
+        var (ticket, url) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)listener.LocalEndpoint).Port);
+        InstallSession(highway, ticket, url);
+        var method = highway.GetType().GetMethod("UploadFile")!;
+        Task<bool> Upload(Stream stream) => (Task<bool>)method.Invoke(highway, [stream, 1004, ReadOnlyMemory<byte>.Empty])!;
+
+        using var first = new MemoryStream(content, 0, 1024);
+        var inFlight = bot.RunMessageOperationAsync(() => Upload(first), cancelled.Token);
+        using var socket = await listener.AcceptTcpClientAsync(timeout.Token);
+        using var connection = socket.GetStream();
+        await ReadRequestAsync(connection, timeout.Token);
+        await cancelled.CancelAsync();
+        await ExpectCancellationAsync(inFlight, timeout.Token);
+
+        using var second = new MemoryStream(content, 0, 1024);
+        var nextUpload = Upload(second);
+        using var next = await listener.AcceptTcpClientAsync(timeout.Token);
+        using var nextStream = next.GetStream();
+        await ReadRequestAsync(nextStream, timeout.Token);
+        byte[] accepted = [0x28, 0, 0, 0, 2, 0, 0, 0, 0, 0x18, 0, 0x29];
+        await nextStream.WriteAsync("HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n"u8.ToArray(), timeout.Token);
+        await nextStream.WriteAsync(accepted, timeout.Token);
+        if (!await nextUpload.WaitAsync(timeout.Token))
+            throw new Exception("Cancelling a Highway action did not release the only upload slot.");
     }
 
     private static async Task CheckHighwayShutdownAsync(byte[] content)
@@ -62,8 +270,7 @@ internal static class HighwayUploadChecks
         var highway = typeof(BotContext).GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(bot)!;
         var (ticket, url) = await ParseHighwaySessionAsync(bot, ((IPEndPoint)listener.LocalEndpoint).Port);
-        highway.GetType().GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(highway, (ticket, url, DateTimeOffset.UtcNow.AddMinutes(1)));
+        InstallSession(highway, ticket, url);
         var method = highway.GetType().GetMethod("UploadFile")!;
         Task Upload(Stream stream) => (Task)method.Invoke(highway, [stream, 1001, ReadOnlyMemory<byte>.Empty])!;
 

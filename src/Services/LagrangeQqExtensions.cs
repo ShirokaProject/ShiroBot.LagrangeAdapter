@@ -460,8 +460,10 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri, bufferHttpResponse: false, cancellationToken).ConfigureAwait(false);
-        var result = await session.Context.SendFriendFileWithId(LagrangeMapper.ParseId(userId, "userId"), stream, fileName)
-            .ConfigureAwait(false);
+        var context = session.Context;
+        var result = await context.RunMessageOperationAsync(
+            () => context.SendFriendFileWithId(LagrangeMapper.ParseId(userId, "userId"), stream, fileName),
+            cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrEmpty(result.FileId)) throw new InvalidDataException("私聊文件上传未返回文件 ID。");
         return result.FileId;
     }
@@ -471,9 +473,10 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using var stream = await LagrangeMapper.OpenResourceAsync(fileUri, bufferHttpResponse: false, cancellationToken).ConfigureAwait(false);
-        return await session.Context
-            .SendGroupFile(LagrangeMapper.ParseId(groupId, "groupId"), stream, fileName, parentFolderId)
-            .ConfigureAwait(false);
+        var context = session.Context;
+        return await context.RunMessageOperationAsync(
+            () => context.SendGroupFile(LagrangeMapper.ParseId(groupId, "groupId"), stream, fileName, parentFolderId),
+            cancellationToken).ConfigureAwait(false);
     }
 
     public Task<string> GetGroupFileDownloadUrlAsync(string groupId, string fileId,
@@ -750,19 +753,31 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
     {
         cancellationToken.ThrowIfCancellationRequested();
         var context = session.Context;
-        var chain = new Lagrange.Core.Message.MessageChain();
-        foreach (var segment in segments)
+        var parsedPeer = LagrangeMapper.ParseId(peerId, "peerId");
+        List<Stream> resources = [];
+        Lagrange.Core.Message.BotMessage sent;
+        try
         {
-            await LagrangeMapper.AppendQqSegmentAsync(chain, segment,
-                id => session.ResolveMessageAsync(id, LagrangeMapper.ParseId(peerId, "peerId"),
-                    scene == QMessageScene.Group, cancellationToken), context).ConfigureAwait(false);
-        }
+            sent = await context.RunMessageOperationAsync(async () =>
+            {
+                var chain = new Lagrange.Core.Message.MessageChain();
+                foreach (var segment in segments)
+                {
+                    await LagrangeMapper.AppendQqSegmentAsync(chain, segment,
+                        id => session.ResolveMessageAsync(id, parsedPeer, scene == QMessageScene.Group, cancellationToken),
+                        context, cancellationToken, resources).ConfigureAwait(false);
+                }
 
-        var sent = scene == QMessageScene.Group
-            ? await context.SendGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
-                .ConfigureAwait(false)
-            : await context.SendFriendMessage(LagrangeMapper.ParseId(peerId, "peerId"), chain)
-                .ConfigureAwait(false);
+                return scene == QMessageScene.Group
+                    ? await context.SendGroupMessage(parsedPeer, chain).ConfigureAwait(false)
+                    : await context.SendFriendMessage(parsedPeer, chain).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (var resource in resources)
+                await resource.DisposeAsync().ConfigureAwait(false);
+        }
 
         session.CacheMessage(sent);
         return new QSentMessage(sent.Sequence.ToString(), DateTimeOffset.FromUnixTimeSeconds(sent.Time));
@@ -772,13 +787,14 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var messages = scene == QMessageScene.Group
-            ? await session.Context
+        var context = session.Context;
+        var messages = await context.RunMessageOperationAsync(async () => scene == QMessageScene.Group
+            ? await context
                 .GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId),
                     ulong.Parse(messageId)).ConfigureAwait(false)
-            : await session.Context
+            : await context
                 .GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId), ulong.Parse(messageId))
-                .ConfigureAwait(false);
+                .ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
 
         var message = messages.FirstOrDefault();
         return message is null
@@ -863,7 +879,12 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
         var entity = new Lagrange.Core.Message.Entities.MultiMsgEntity(forwardId);
         var envelope =
             Lagrange.Core.Message.BotMessage.CreateCustomGroup(0, 0, "", DateTimeOffset.UtcNow.ToUnixTimeSeconds(), []);
-        await entity.Postprocess(session.Context, envelope).WaitAsync(cancellationToken);
+        var context = session.Context;
+        await context.RunMessageOperationAsync(async () =>
+        {
+            await entity.Postprocess(context, envelope).ConfigureAwait(false);
+            return true;
+        }, cancellationToken).ConfigureAwait(false);
         return
         [
             .. entity.Messages.Select(x => new QForwardedIncomingMessage

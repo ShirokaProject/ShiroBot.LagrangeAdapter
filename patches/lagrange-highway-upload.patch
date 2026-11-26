@@ -1,5 +1,5 @@
 diff --git a/Lagrange.Core/BotContext.cs b/Lagrange.Core/BotContext.cs
-index ed40abc..642ce34 100644
+index ed40abc..331567b 100644
 --- a/Lagrange.Core/BotContext.cs
 +++ b/Lagrange.Core/BotContext.cs
 @@ -6,8 +6,11 @@ using Lagrange.Core.Internal.Context;
@@ -15,7 +15,33 @@ index ed40abc..642ce34 100644
      internal BotContext(BotConfig config, BotKeystore keystore, BotAppInfo appInfo)
      {
          Config = config;
-@@ -93,10 +96,25 @@ public class BotContext : IDisposable
+@@ -49,6 +52,25 @@ public class BotContext : IDisposable
+     internal HighwayContext HighwayContext { get; }
+     internal FlashTransferContext FlashTransferContext { get; }
+ 
++    private readonly AsyncLocal<CancellationToken> _messageCancellation = new();
++
++    public CancellationToken MessageOperationCancellation => _messageCancellation.Value;
++
++    public async Task<T> RunMessageOperationAsync<T>(Func<Task<T>> operation, CancellationToken cancellationToken)
++    {
++        cancellationToken.ThrowIfCancellationRequested();
++        var previous = _messageCancellation.Value;
++        _messageCancellation.Value = cancellationToken;
++        try
++        {
++            return await operation().ConfigureAwait(false);
++        }
++        finally
++        {
++            _messageCancellation.Value = previous;
++        }
++    }
++
+     #region Shortcut Methods
+     
+     public void LogCritical(string tag, [StringSyntax(StringSyntaxAttribute.CompositeFormat)] string text, Exception? exception = null, params object?[] args)
+@@ -93,10 +115,25 @@ public class BotContext : IDisposable
  
      #endregion
  
@@ -46,7 +72,7 @@ index ed40abc..642ce34 100644
      }
  }
 diff --git a/Lagrange.Core/Internal/Context/FlashTransferContext.cs b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
-index f9d248a..ac6a27a 100644
+index f9d248a..0760007 100644
 --- a/Lagrange.Core/Internal/Context/FlashTransferContext.cs
 +++ b/Lagrange.Core/Internal/Context/FlashTransferContext.cs
 @@ -1,113 +1,164 @@
@@ -104,7 +130,7 @@ index f9d248a..ac6a27a 100644
  
 -    public async Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream)
 +    public Task<bool> UploadFile(string uKey, uint appId, Stream bodyStream) =>
-+        _lifetime.RunAsync(token => UploadFileAsync(uKey, appId, bodyStream, token));
++        _lifetime.RunAsync(token => UploadFileAsync(uKey, appId, bodyStream, token), _context.MessageOperationCancellation);
 +
 +    private async Task<bool> UploadFileAsync(string uKey, uint appId, Stream bodyStream, CancellationToken stopping)
      {
@@ -295,12 +321,13 @@ index f9d248a..ac6a27a 100644
 +    public void Dispose() => StopAsync().GetAwaiter().GetResult();
 +}
 diff --git a/Lagrange.Core/Internal/Context/HighwayContext.cs b/Lagrange.Core/Internal/Context/HighwayContext.cs
-index a1c8240..e183b89 100644
+index a1c8240..b9050da 100644
 --- a/Lagrange.Core/Internal/Context/HighwayContext.cs
 +++ b/Lagrange.Core/Internal/Context/HighwayContext.cs
-@@ -1,182 +1,226 @@
+@@ -1,182 +1,266 @@
  using System.Buffers;
  using System.Buffers.Binary;
++using System.Diagnostics;
 +using System.Net;
  using System.Security.Cryptography;
 +using Lagrange.Core.Exceptions;
@@ -309,9 +336,9 @@ index a1c8240..e183b89 100644
  using Lagrange.Core.Utility;
 -using Lagrange.Core.Utility.Binary;
 -using Lagrange.Core.Utility.Extension;
- 
+
  namespace Lagrange.Core.Internal.Context;
- 
+
 -internal class HighwayContext
 +internal sealed class HighwayContext : IDisposable
  {
@@ -324,24 +351,32 @@ index a1c8240..e183b89 100644
 -    private readonly ulong _chunkSize;
 +    private const int Attempts = 3;
 +    private const int FrameOverhead = 10;
-+    private readonly HttpClient _client = new()
++    private readonly HttpClient _client = new(new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(10) })
 +    {
 +        Timeout = TimeSpan.FromSeconds(45),
 +        MaxResponseContentBufferSize = 1024 * 1024
 +    };
- 
+
 -    private readonly int _concurrent;
 -    
 +    private readonly BotContext _context;
 +    private readonly int _chunkSize;
 +    private readonly SemaphoreSlim _uploads;
++    internal SemaphoreSlim ForwardImageSlots { get; }
 +    private readonly SemaphoreSlim _sessionLock = new(1);
      private int _sequence;
 +    private readonly UploadLifetime _lifetime = new();
-+    private (byte[] Ticket, string Url, DateTimeOffset Expires)? _session;
- 
++    private UploadSession? _session;
+
 -    private (byte[], DateTime)? _ticket;
--
++    private sealed class UploadSession(byte[] ticket, string[] urls, DateTimeOffset expires)
++    {
++        internal byte[] Ticket { get; } = ticket;
++        internal string[] Urls { get; } = urls;
++        internal DateTimeOffset Expires { get; } = expires;
++        internal int PreferredEndpoint;
++    }
+
 -    private string? _url;
 -    
      public HighwayContext(BotContext context)
@@ -358,8 +393,9 @@ index a1c8240..e183b89 100644
 +        _chunkSize = checked((int)context.Config.HighwayChunkSize);
 +        var concurrent = checked((int)context.Config.HighwayConcurrent);
 +        _uploads = new SemaphoreSlim(concurrent, concurrent);
++        ForwardImageSlots = new SemaphoreSlim(Math.Max(1, concurrent - 1), Math.Max(1, concurrent - 1));
      }
- 
+
 -    public async Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
 +    public async Task UploadRequiredAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo)
      {
@@ -372,12 +408,12 @@ index a1c8240..e183b89 100644
 +        if (!await UploadFile(stream, commandId, extendInfo).ConfigureAwait(false))
 +            throw new OperationException(-1, $"Highway upload failed (command {commandId})");
 +    }
- 
+
 -        var tasks = new List<Task<bool>>();
 -        bool result = true;
 +    public Task<bool> UploadFile(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo) =>
-+        _lifetime.RunAsync(token => UploadFileAsync(stream, commandId, extendInfo, token));
- 
++        _lifetime.RunAsync(token => UploadFileAsync(stream, commandId, extendInfo, token), _context.MessageOperationCancellation);
+
 -        ulong fileSize = (ulong)stream.Length;
 -        ulong offset = 0;
 -        var fileMd5 = stream.Md5();
@@ -385,20 +421,25 @@ index a1c8240..e183b89 100644
 +    private async Task<bool> UploadFileAsync(Stream stream, int commandId, ReadOnlyMemory<byte> extendInfo, CancellationToken token)
 +    {
 +        // Keep offsets ordered within each file and bound concurrent files per bot.
++        var started = Stopwatch.GetTimestamp();
++        var trace = Activity.Current?.TraceId.ToString() ?? "-";
 +        await _uploads.WaitAsync(token).ConfigureAwait(false);
 +        try
          {
 -            var buffer = ArrayPool<byte>.Shared.Rent((int)_chunkSize);
 -            ulong payload = (ulong)await stream.ReadAsync(buffer.AsMemory(0, (int)_chunkSize));
--
--            ulong currentBlockOffset = offset;
--            var task = Task.Run(async () => // closure
-+            var (ticket, url, _) = await GetSessionAsync(token).ConfigureAwait(false);
++            var session = await GetSessionAsync(token).ConfigureAwait(false);
++            var endpoint = Volatile.Read(ref session.PreferredEndpoint);
 +            var fileSize = stream.Length;
++            var authority = new Uri($"http://{session.Urls[endpoint]}").Authority;
++            _context.LogDebug(Tag, "trace={0} upload start command={1} bytes={2} endpoint={3} setup_ms={4:F0}",
++                trace, commandId, fileSize, authority, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 +            stream.Position = 0;
 +            var fileMd5 = await MD5.HashDataAsync(stream, token).ConfigureAwait(false);
 +            stream.Position = 0;
-+
+
+-            ulong currentBlockOffset = offset;
+-            var task = Task.Run(async () => // closure
 +            var payload = ArrayPool<byte>.Shared.Rent(_chunkSize);
 +            try
              {
@@ -443,10 +484,15 @@ index a1c8240..e183b89 100644
 +                    var length = (int)Math.Min(_chunkSize, fileSize - offset);
 +                    var block = payload.AsMemory(0, length);
 +                    await stream.ReadExactlyAsync(block, token).ConfigureAwait(false);
-+                    if (!await SendBlockAsync(url, ticket, commandId, extendInfo, fileMd5, fileSize, offset, block, token).ConfigureAwait(false))
++                    endpoint = await SendBlockAsync(session, endpoint, trace, commandId, extendInfo,
++                        fileMd5, fileSize, offset, block, token).ConfigureAwait(false);
++                    if (endpoint < 0)
 +                        return false;
 +                    offset += length;
 +                }
++                Volatile.Write(ref session.PreferredEndpoint, endpoint);
++                _context.LogDebug(Tag, "trace={0} upload complete command={1} bytes={2} elapsed_ms={3:F0}",
++                    trace, commandId, fileSize, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 +                return true;
 +            }
 +            finally
@@ -454,23 +500,29 @@ index a1c8240..e183b89 100644
 +                ArrayPool<byte>.Shared.Return(payload);
 +            }
 +        }
++        catch (OperationCanceledException) when (token.IsCancellationRequested)
++        {
++            _context.LogDebug(Tag, "trace={0} upload cancelled command={1} elapsed_ms={2:F0}",
++                trace, commandId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
++            throw;
++        }
 +        finally
 +        {
 +            _uploads.Release();
 +        }
 +    }
- 
+
 -                bool end = currentBlockOffset + payload >= fileSize;
 -                var upload = ArrayPool<byte>.Shared.Rent(1 + 1 + 4 + 4 + headProto.Length + (int)payload);
 -                var memory = upload.AsMemory(0, 1 + 1 + 4 + 4 + headProto.Length + (int)payload);
-+    private async Task<(byte[] Ticket, string Url, DateTimeOffset Expires)> GetSessionAsync(CancellationToken token)
++    private async Task<UploadSession> GetSessionAsync(CancellationToken token)
 +    {
 +        await _sessionLock.WaitAsync(token).ConfigureAwait(false);
 +        try
 +        {
 +            if (_session is { } session && session.Expires > DateTimeOffset.UtcNow)
 +                return session;
- 
+
 -                memory.Span[0] = 0x28;
 -                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[1..], (uint)headProto.Length);
 -                BinaryPrimitives.WriteUInt32BigEndian(memory.Span[5..], (uint)payload);
@@ -481,12 +533,10 @@ index a1c8240..e183b89 100644
 +                .AsTask().WaitAsync(token).ConfigureAwait(false);
 +            if (!response.HighwayUrls.TryGetValue(1, out var urls) || urls.Count == 0)
 +                throw new OperationException(-1, "Highway session returned no upload endpoint");
- 
+
 -                var request = new HttpRequestMessage(HttpMethod.Post, $"http://{_url}")
--                {
--                    Content = new ReadOnlyMemoryContent(memory), Headers = { { "Connection", end ? "close" : "keep-alive" } }
--                };
-+            session = (response.SigSession, urls[0], DateTimeOffset.UtcNow.AddHours(12));
++            session = new UploadSession(response.SigSession, urls.Distinct(StringComparer.Ordinal).ToArray(),
++                DateTimeOffset.UtcNow.AddHours(12));
 +            _session = session;
 +            return session;
 +        }
@@ -495,7 +545,68 @@ index a1c8240..e183b89 100644
 +            _sessionLock.Release();
 +        }
 +    }
- 
++
++    private async Task<int> SendBlockAsync(UploadSession session, int endpoint, string trace, int commandId, ReadOnlyMemory<byte> extendInfo,
++        byte[] fileMd5, long fileSize, long offset, ReadOnlyMemory<byte> block, CancellationToken token)
++    {
++        var appId = (uint)_context.AppInfo.AppId;
++        var header = ProtoHelper.Serialize(new ReqDataHighwayHead
++        {
++            MsgBaseHead = new DataHighwayHead
++            {
++                Version = 1,
++                Uin = _context.Keystore.Uin.ToString(),
++                Command = "PicUp.DataUp",
++                Seq = (uint)(Interlocked.Increment(ref _sequence) - 1) % 100000 + 1,
++                AppId = appId,
++                DataFlag = 16,
++                CommandId = (uint)commandId
++            },
++            MsgSegHead = new SegHead
++            {
++                Filesize = (ulong)fileSize,
++                DataOffset = (ulong)offset,
++                DataLength = (uint)block.Length,
++                ServiceTicket = session.Ticket,
++                Md5 = MD5.HashData(block.Span),
++                FileMd5 = fileMd5
++            },
++            BytesReqExtendInfo = extendInfo,
++            MsgLoginSigHead = new LoginSigHead
++            {
++                Uint32LoginSigType = 8,
++                BytesLoginSig = _context.Keystore.WLoginSigs.A2,
++                AppId = appId
++            }
++        });
++        var prefix = new byte[9 + header.Length];
++        prefix[0] = 0x28;
++        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(1), (uint)header.Length);
++        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(5), (uint)block.Length);
++        header.Span.CopyTo(prefix.AsSpan(9));
++
++        for (var attempt = 1; ; attempt++)
++        {
++            token.ThrowIfCancellationRequested();
++            var target = new Uri($"http://{session.Urls[endpoint]}");
++            var started = Stopwatch.GetTimestamp();
++            try
++            {
++                using var request = new HttpRequestMessage(HttpMethod.Post, target)
+                 {
+-                    Content = new ReadOnlyMemoryContent(memory), Headers = { { "Connection", end ? "close" : "keep-alive" } }
++                    Content = new BlockContent(prefix, block)
+                 };
++                request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
++                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
++                request.Headers.ConnectionClose = attempt > 1 || offset + block.Length == fileSize;
++                using var response = await _client.SendAsync(request, token).ConfigureAwait(false);
++                response.EnsureSuccessStatusCode();
++                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
++                var result = ParseResponse(bytes);
++                var segmentCode = result.MsgSegHead?.RetCode ?? 0;
++                if (result.ErrorCode == 0 && segmentCode == 0) return endpoint;
+
 -                try
 -                {
 -                    var response = await _client.SendAsync(request);
@@ -523,120 +634,72 @@ index a1c8240..e183b89 100644
 -                    if (e.StackTrace is { } stack) _context.LogDebug(Tag, stack);
 -                }
 -                finally
-+    private async Task<bool> SendBlockAsync(string url, byte[] ticket, int commandId, ReadOnlyMemory<byte> extendInfo,
-+        byte[] fileMd5, long fileSize, long offset, ReadOnlyMemory<byte> block, CancellationToken token)
-+    {
-+        var appId = (uint)_context.AppInfo.AppId;
-+        var header = ProtoHelper.Serialize(new ReqDataHighwayHead
-+        {
-+            MsgBaseHead = new DataHighwayHead
-+            {
-+                Version = 1,
-+                Uin = _context.Keystore.Uin.ToString(),
-+                Command = "PicUp.DataUp",
-+                Seq = (uint)(Interlocked.Increment(ref _sequence) - 1) % 100000 + 1,
-+                AppId = appId,
-+                DataFlag = 16,
-+                CommandId = (uint)commandId
-+            },
-+            MsgSegHead = new SegHead
-+            {
-+                Filesize = (ulong)fileSize,
-+                DataOffset = (ulong)offset,
-+                DataLength = (uint)block.Length,
-+                ServiceTicket = ticket,
-+                Md5 = MD5.HashData(block.Span),
-+                FileMd5 = fileMd5
-+            },
-+            BytesReqExtendInfo = extendInfo,
-+            MsgLoginSigHead = new LoginSigHead
-+            {
-+                Uint32LoginSigType = 8,
-+                BytesLoginSig = _context.Keystore.WLoginSigs.A2,
-+                AppId = appId
++                _context.LogWarning(Tag, "trace={0} Highway rejected command {1} at offset {2}: {3}/{4} endpoint={5}",
++                    null, trace, commandId, offset, result.ErrorCode, segmentCode, target.Authority);
++                return -1;
 +            }
-+        });
-+        var prefix = new byte[9 + header.Length];
-+        prefix[0] = 0x28;
-+        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(1), (uint)header.Length);
-+        BinaryPrimitives.WriteUInt32BigEndian(prefix.AsSpan(5), (uint)block.Length);
-+        header.Span.CopyTo(prefix.AsSpan(9));
-+
-+        for (var attempt = 1; ; attempt++)
-+        {
-+            token.ThrowIfCancellationRequested();
-+            try
++            catch (Exception ex) when (!token.IsCancellationRequested &&
++                (ex is HttpRequestException or IOException or OperationCanceledException))
 +            {
-+                using var request = new HttpRequestMessage(HttpMethod.Post, $"http://{url}")
++                var transient = ex is OperationCanceledException or HttpIOException ||
++                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
++                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
++                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
++                if (!transient || attempt == Attempts)
                  {
 -                    ArrayPool<byte>.Shared.Return(buffer);
 -                    ArrayPool<byte>.Shared.Return(upload);
 -                    request.Dispose();
 -                    new ReadOnlyMemoryContent(memory).Dispose();
--                }
--
-+                    Content = new BlockContent(prefix, block)
-+                };
-+                request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
-+                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)");
-+                request.Headers.ConnectionClose = attempt > 1 || offset + block.Length == fileSize;
-+                using var response = await _client.SendAsync(request, token).ConfigureAwait(false);
-+                response.EnsureSuccessStatusCode();
-+                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
-+                var result = ParseResponse(bytes);
-+                var segmentCode = result.MsgSegHead?.RetCode ?? 0;
-+                if (result.ErrorCode == 0 && segmentCode == 0) return true;
-+
-+                _context.LogWarning(Tag, "Highway rejected command {0} at offset {1}: {2}/{3}",
-+                    null, commandId, offset, result.ErrorCode, segmentCode);
-                 return false;
++                    _context.LogError(Tag,
++                        "trace={0} Highway request failed command={1} offset={2} attempt={3} endpoint={4} elapsed_ms={5:F0} error={6}",
++                        null, trace, commandId, offset, attempt, target.Authority,
++                        Stopwatch.GetElapsedTime(started).TotalMilliseconds, ex.GetType().Name);
++                    return -1;
+                 }
++                var nextEndpoint = (endpoint + 1) % session.Urls.Length;
++                _context.LogWarning(Tag,
++                    "trace={0} Highway retry command={1} offset={2} attempt={3} endpoint={4} next={5} elapsed_ms={6:F0} error={7}",
++                    null, trace, commandId, offset, attempt, target.Authority,
++                    new Uri($"http://{session.Urls[nextEndpoint]}").Authority,
++                    Stopwatch.GetElapsedTime(started).TotalMilliseconds, ex.GetType().Name);
++                endpoint = nextEndpoint;
++                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token).ConfigureAwait(false);
++            }
++        }
++    }
+
+-                return false;
 -            });
 -            offset += payload;
--
++    private sealed class BlockContent(byte[] prefix, ReadOnlyMemory<byte> block) : HttpContent
++    {
++        private static readonly byte[] Suffix = [0x29];
+
 -            tasks.Add(task);
 -            if (tasks.Count == (_concurrent))
 -            {
 -                var successBlocks = await Task.WhenAll(tasks);
 -                foreach (bool t in successBlocks) result &= t;
 -                tasks.Clear();
-             }
+-            }
 -            
 -            if (tasks.Count != 0)
-+            catch (Exception ex) when (!token.IsCancellationRequested &&
-+                (ex is HttpRequestException or IOException or OperationCanceledException))
-             {
+-            {
 -                var finalBlocks = await Task.WhenAll(tasks);
 -                foreach (bool t in finalBlocks) result &= t;
 -                tasks.Clear();
-+                var transient = ex is OperationCanceledException or HttpIOException ||
-+                    ex is HttpRequestException { StatusCode: null or HttpStatusCode.RequestTimeout
-+                        or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway
-+                        or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout };
-+                if (!transient || attempt == Attempts)
-+                {
-+                    _context.LogError(Tag, "Highway request failed for command {0} at offset {1} after {2} attempt(s)",
-+                        ex, commandId, offset, attempt);
-+                    return false;
-+                }
-+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), token).ConfigureAwait(false);
-             }
-         }
-+    }
-+
-+    private sealed class BlockContent(byte[] prefix, ReadOnlyMemory<byte> block) : HttpContent
-+    {
-+        private static readonly byte[] Suffix = [0x29];
-+
+-            }
 +        protected override bool TryComputeLength(out long length)
 +        {
 +            length = (long)prefix.Length + block.Length + Suffix.Length;
 +            return true;
-+        }
-+
+         }
+
+-        return result;
 +        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
 +            SerializeToStreamAsync(stream, context, CancellationToken.None);
- 
--        return result;
++
 +        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context,
 +            CancellationToken cancellationToken)
 +        {
@@ -645,7 +708,7 @@ index a1c8240..e183b89 100644
 +            await stream.WriteAsync(Suffix, cancellationToken);
 +        }
      }
- 
+
 -    private int GetNewSequence()
 +    public Task StopAsync() => _lifetime.StopAsync(_client.Dispose);
 +
@@ -1164,10 +1227,12 @@ index 27eef16..b15ed6d 100644
              EncodeTwo32VarIntSimd<TT, TU>(v1, v2);
          }
 diff --git a/Lagrange.Core/Message/Entities/MultiMsgEntity.cs b/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
-index 44be011..338971a 100644
+index 44be011..3aff56c 100644
 --- a/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
 +++ b/Lagrange.Core/Message/Entities/MultiMsgEntity.cs
-@@ -2,6 +2,7 @@ using System.IO.Compression;
+@@ -1,7 +1,9 @@
++using System.Diagnostics;
+ using System.IO.Compression;
  using System.Text.Json.Nodes;
  using System.Xml;
  using Lagrange.Core.Common.Entity;
@@ -1175,8 +1240,8 @@ index 44be011..338971a 100644
  using Lagrange.Core.Internal.Events.Message;
  using Lagrange.Core.Internal.Packets.Message;
  using Lagrange.Core.Internal.Packets.Service;
-@@ -24,14 +25,22 @@ public class MultiMsgEntity(string? resId) : IMessageEntity
- 
+@@ -24,14 +26,59 @@ public class MultiMsgEntity(string? resId) : IMessageEntity
+
      public async Task Preprocess(BotContext context, BotMessage message)
      {
 -        if (string.IsNullOrEmpty(ResId))
@@ -1184,25 +1249,69 @@ index 44be011..338971a 100644
 -            var result = await context.EventContext.SendEvent<LongMsgSendEventResp>(new LongMsgSendEventReq(message.Receiver, Messages));
 -            ResId = result.ResId;
 +        if (!string.IsNullOrEmpty(ResId)) return;
- 
+
++        var token = context.MessageOperationCancellation;
++        var trace = Activity.Current?.TraceId.ToString() ?? "-";
++        var started = Stopwatch.GetTimestamp();
++        var images = new HashSet<ImageEntity>(ReferenceEqualityComparer.Instance);
 +        // Only the enclosing message has the real QQ conversation and recipient.
 +        foreach (var node in Messages)
 +        {
 +            foreach (var entity in node.Entities)
++            {
++                token.ThrowIfCancellationRequested();
++                if (entity is ImageEntity image)
++                {
++                    images.Add(image);
++                    continue;
++                }
 +                await entity.Preprocess(context, message);
++            }
          }
 +
++        var slots = context.HighwayContext.ForwardImageSlots;
++        await Parallel.ForEachAsync(images,
++            new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = token },
++            async (image, workerToken) =>
++            {
++                await slots.WaitAsync(workerToken).ConfigureAwait(false);
++                try
++                {
++                    await context.RunMessageOperationAsync(async () =>
++                    {
++                        await image.Preprocess(context, message).ConfigureAwait(false);
++                        return true;
++                    }, workerToken).ConfigureAwait(false);
++                }
++                finally
++                {
++                    slots.Release();
++                }
++            }).ConfigureAwait(false);
++        context.LogDebug(nameof(MultiMsgEntity), "trace={0} forward media ready nodes={1} images={2} elapsed_ms={3:F0}",
++            trace, Messages.Count, images.Count, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
++
++        var submitting = Stopwatch.GetTimestamp();
 +        var result = await context.EventContext.SendEvent<LongMsgSendEventResp>(
 +            new LongMsgSendEventReq(message.Receiver, Messages));
 +        if (string.IsNullOrWhiteSpace(result.ResId))
 +            throw new OperationException(-1, "QQ did not return a resource ID for the forwarded messages");
 +        ResId = result.ResId;
++        context.LogDebug(nameof(MultiMsgEntity), "trace={0} QQ forward accepted elapsed_ms={1:F0}",
++            trace, Stopwatch.GetElapsedTime(submitting).TotalMilliseconds);
      }
 -    
 +
      public async Task Postprocess(BotContext context, BotMessage message)
      {
          if (string.IsNullOrEmpty(ResId)) return;
+@@ -124,4 +171,4 @@ public class MultiMsgEntity(string? resId) : IMessageEntity
+         }
+         return BitConverter.GetBytes((a << 16) | b);
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs b/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs
 index 571616f..70d7923 100644
 --- a/Lagrange.Core/Internal/Services/System/FetchFriendsService.cs
@@ -1329,10 +1438,10 @@ index ddbf7a9..1d07b3c 100644
      public override void Write(ProtoWriter writer, object target)
 diff --git a/Lagrange.Core/Internal/Context/UploadLifetime.cs b/Lagrange.Core/Internal/Context/UploadLifetime.cs
 new file mode 100644
-index 0000000..9f5fcba
+index 0000000..520fe12
 --- /dev/null
 +++ b/Lagrange.Core/Internal/Context/UploadLifetime.cs
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,57 @@
 +namespace Lagrange.Core.Internal.Context;
 +
 +internal sealed class UploadLifetime
@@ -1343,7 +1452,7 @@ index 0000000..9f5fcba
 +    private int _active;
 +    private Task? _stopTask;
 +
-+    public async Task<bool> RunAsync(Func<CancellationToken, Task<bool>> upload)
++    public async Task<bool> RunAsync(Func<CancellationToken, Task<bool>> upload, CancellationToken caller = default)
 +    {
 +        lock (_gate)
 +        {
@@ -1354,7 +1463,10 @@ index 0000000..9f5fcba
 +
 +        try
 +        {
-+            return await upload(_stopping.Token).ConfigureAwait(false);
++            using var linked = caller.CanBeCanceled
++                ? CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token, caller)
++                : null;
++            return await upload(linked?.Token ?? _stopping.Token).ConfigureAwait(false);
 +        }
 +        finally
 +        {
