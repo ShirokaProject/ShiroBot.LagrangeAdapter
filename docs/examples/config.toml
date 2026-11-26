@@ -40,6 +40,5 @@ use_ipv6_network = false
 get_optimum_server = true
 # Trace / Debug / Information / Warning / Error / Critical
 log_level = "Information"
-# 上传分块大小（字节，1..1048576）和并发数量（至少 1）。
-highway_chunk_size = 1048576
+# 上传分块固定为 1 MiB。并发数量至少为 1。
 highway_concurrent = 4

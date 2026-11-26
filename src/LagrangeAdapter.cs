@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.9")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.10")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.9",
+    Version = "0.1.10",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -611,14 +611,12 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
 [ConfigModel]
 public sealed class LagrangeAdapterConfig
 {
+    private const uint HighwayChunkSize = 1024 * 1024;
+
     /// <summary>启动后自动恢复会话或登录；false 时由 Action 触发扫码。</summary>
     [ConfigField("启动后恢复会话或登录；关闭时通过登录页面手动扫码或输入账号密码。", Label = "自动登录", Group = "login", GroupLabel = "登录",
         GroupOrder = 10, Order = 10)]
     public bool AutoLogin { get; set; } = false;
-
-    [ConfigField("默认使用仓库 GitHub Pages 的 Ticket helper；也可填写自己的 HTTPS 地址或本机静态服务。", Label = "验证码辅助页面", Group = "login", GroupLabel = "登录", GroupOrder = 10, Order = 50,
-        Placeholder = "https://captcha.example.com/")]
-    public string CaptchaHelperUrl { get; set; } = "https://ticket-helper.shiroka.org/";
 
     [ConfigField("选择内置版本会自动设置平台和 AppInfo；自定义时使用下面的平台、内联/文件或远端 AppInfo。签名服务地址仍需与版本匹配。", Label = "协议版本", Group = "protocol", GroupLabel = "协议与 AppInfo", GroupOrder = 20, Order = 5, Type = "select",
         Options = ["Mac 7.0.3-54395", "AndroidPad 9.3.80-16750", "自定义"])]
@@ -681,11 +679,6 @@ public sealed class LagrangeAdapterConfig
         Options = ["Trace", "Debug", "Information", "Warning", "Error", "Critical"])]
     public string LogLevel { get; set; } = "Information";
 
-    /// <summary>每个上传分块大小，最大 1048576 字节。</summary>
-    [ConfigField("单位字节，最大 1 MiB。", Label = "上传分块大小", Group = "upload", GroupLabel = "媒体上传", GroupOrder = 50, Order = 10,
-        Min = 1, Max = 1048576)]
-    public uint HighwayChunkSize { get; set; } = 1048576;
-
     [ConfigField("媒体上传并发数；上传不稳定时可改为 1。", Label = "上传并发数", Group = "upload", GroupLabel = "媒体上传", GroupOrder = 50,
         Order = 20, Min = 1)]
     public uint HighwayConcurrent { get; set; } = 4;
@@ -704,10 +697,6 @@ public sealed class LagrangeAdapterConfig
 
     public void Validate()
     {
-        if (!Uri.TryCreate(CaptchaHelperUrl, UriKind.Absolute, out var helper) ||
-            helper.UserInfo.Length != 0 || helper.Query.Length != 0 || helper.Fragment.Length != 0 ||
-            !(helper.Scheme == "https" || helper.Scheme == "http" && helper.IsLoopback))
-            throw new ArgumentException("CaptchaHelperUrl 必须为 HTTPS 基础地址；本机地址也支持 HTTP，不能含鉴权、查询参数或片段。");
         _ = AccountUin;
         if (DeviceName.Length > 64 || DeviceName.Any(char.IsControl))
             throw new ArgumentException("设备名称最多 64 个字符，不能包含控制字符。");
@@ -717,7 +706,6 @@ public sealed class LagrangeAdapterConfig
         if (!Enum.TryParse<LogLevel>(LogLevel, true, out var level) || !Enum.IsDefined(level))
             throw new ArgumentException($"未知日志等级: {LogLevel}");
         if (SignTimeoutSeconds is <= 0 or > 600) throw new ArgumentOutOfRangeException(nameof(SignTimeoutSeconds));
-        if (HighwayChunkSize is 0 or > 1048576) throw new ArgumentOutOfRangeException(nameof(HighwayChunkSize));
         if (HighwayConcurrent == 0) throw new ArgumentOutOfRangeException(nameof(HighwayConcurrent));
         if (protocol == Protocols.AndroidWatch)
             throw new ArgumentException("当前 Lagrange 内核未实现 AndroidWatch 登录，请选择 AndroidPhone 或 AndroidPad。");

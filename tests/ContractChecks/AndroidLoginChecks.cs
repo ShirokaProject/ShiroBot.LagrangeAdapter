@@ -81,9 +81,6 @@ internal static class AndroidLoginChecks
         foreach (var config in new[] {
             new LagrangeAdapterConfig { FetchAppInfo = true },
             new LagrangeAdapterConfig { FetchAppInfo = true, SignServer = "http://localhost", AppInfo = "{}" },
-            new LagrangeAdapterConfig { CaptchaHelperUrl = "http://captcha.example.com/" },
-            new LagrangeAdapterConfig { CaptchaHelperUrl = "https://user:secret@captcha.example.com/" },
-            new LagrangeAdapterConfig { CaptchaHelperUrl = "https://captcha.example.com/?redirect=evil" },
             new LagrangeAdapterConfig { SignServer = "http://localhost/android/v/ss_synthetic", SignToken = "duplicate" },
             new LagrangeAdapterConfig { SignServer = "http://localhost/?token=synthetic" } })
         {
@@ -151,10 +148,6 @@ internal static class AndroidLoginChecks
         catch (ArgumentException) { }
         if ((await Call("status"))["verificationId"]!.GetValue<string>() != state["verificationId"]!.GetValue<string>())
             throw new Exception("Invalid ticket consumed the current challenge.");
-        adapter.CurrentConfigValue.CaptchaHelperUrl = "https://captcha.example.test/tools/ticket/";
-        set.Invoke(adapter, [bot, "captcha", "https://ti.qq.com/safe/tools/captcha/sms-verify-login?aid=16&sid=123&uin=0", null]);
-        if (!(await Call("status"))["verificationUrl"]!.GetValue<string>().StartsWith("https://captcha.example.test/tools/ticket/?", StringComparison.Ordinal))
-            throw new Exception("Configured self-hosted helper path was ignored.");
         set.Invoke(adapter, [bot, "device", "javascript:alert(1)", null]);
         if ((await Call("status"))["verificationUrl"] is not null) throw new Exception("Unsafe verification URL accepted.");
         try { await Call("sms-login", new JsonObject { ["uin"] = "not-an-account" }); throw new Exception("Invalid SMS account accepted."); }

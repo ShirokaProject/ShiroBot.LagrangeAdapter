@@ -232,7 +232,7 @@ Console.WriteLine("File metadata and group request credential mapping checks pas
 
 foreach (var invalid in new[]
          {
-             new LagrangeAdapterConfig { HighwayChunkSize = 0 },
+             new LagrangeAdapterConfig { HighwayConcurrent = 0 },
              new LagrangeAdapterConfig { SignToken = "without-server" },
              new LagrangeAdapterConfig { AppInfo = "{}", AppInfoPath = "other.json" }
          })
@@ -250,14 +250,14 @@ foreach (var invalid in new[]
 var networkOptions = new LagrangeAdapterConfig
 {
     AutoReconnect = false, AutoReLogin = false, UseIpv6Network = true, GetOptimumServer = false,
-    LogLevel = "Debug", HighwayChunkSize = 1024, HighwayConcurrent = 2
+    LogLevel = "Debug", HighwayConcurrent = 2
 };
 var nativeConfig = (Lagrange.Core.Common.BotConfig)typeof(LagrangeAdapterConfig)
     .GetMethod("CreateBotConfig", BindingFlags.NonPublic | BindingFlags.Instance)!
     .Invoke(networkOptions, [Lagrange.Core.Common.Protocols.Linux])!;
 if (nativeConfig.AutoReconnect || nativeConfig.AutoReLogin || !nativeConfig.UseIPv6Network ||
     nativeConfig.GetOptimumServer ||
-    nativeConfig.HighwayChunkSize != 1024 || nativeConfig.HighwayConcurrent != 2 ||
+    nativeConfig.HighwayChunkSize != 1048576 || nativeConfig.HighwayConcurrent != 2 ||
     nativeConfig.LogLevel.ToString() != "Debug")
     throw new Exception("Connection options were not propagated.");
 Console.WriteLine("Connection option propagation and config validation checks passed.");
@@ -271,6 +271,8 @@ foreach (var requiredKey in new[]
          })
     if (!configKeys.Contains(requiredKey))
         throw new Exception($"Configuration key was renamed unexpectedly: {requiredKey}");
+if (configKeys.Contains("highway_chunk_size") || configKeys.Contains("captcha_helper_url"))
+    throw new Exception("Fixed adapter settings must not be exposed as config keys.");
 if (!adapter.GetType().GetInterfaces().Contains(typeof(ShiroBot.SDK.Config.IConfigurableAdapter)) ||
     !adapter.GetType().GetInterfaces()
         .Contains(typeof(ShiroBot.SDK.Config.IConfigurableComponent<LagrangeAdapterConfig>)))

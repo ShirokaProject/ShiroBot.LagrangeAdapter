@@ -61,7 +61,7 @@ public partial class LagrangeAdapter
         _verificationUrl = Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0
             ? uri.AbsoluteUri : null;
         if (status == "captcha" && context.Config.Protocol is Lagrange.Core.Common.Protocols.AndroidPhone or Lagrange.Core.Common.Protocols.AndroidPad)
-            _verificationUrl = AndroidCaptchaHelperUrl(_verificationUrl, context.BotUin, CurrentConfigValue.CaptchaHelperUrl);
+            _verificationUrl = AndroidCaptchaHelperUrl(_verificationUrl, context.BotUin);
         _verificationPhone = phone;
         _verificationId = Guid.NewGuid().ToString("N");
         _loginError = null;
@@ -70,7 +70,7 @@ public partial class LagrangeAdapter
 
     // Same helper/query handoff as Yogurt: the native QQ page otherwise sends
     // its ticket to the mobile app bridge instead of displaying it in a browser.
-    private static string? AndroidCaptchaHelperUrl(string? url, long uin, string helperUrl)
+    private static string? AndroidCaptchaHelperUrl(string? url, long uin)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
             !uri.Host.Equals("ti.qq.com", StringComparison.OrdinalIgnoreCase) ||
@@ -78,7 +78,7 @@ public partial class LagrangeAdapter
         var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
         if (query["uin"] == "0" && uin > 0)
             query["uin"] = uin.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return helperUrl.TrimEnd('?') + "?" + query;
+        return "https://ticket-helper.shiroka.org/?" + query;
     }
 
     private async Task<JsonNode?> HandleLoginPageAsync(string action, JsonNode? arguments, CancellationToken token)

@@ -464,7 +464,7 @@ index a1c8240..59e26c0 100644
 +            ObjectDisposedException.ThrowIf(_disposed, this);
 +            try
 +            {
-+                using var request = new HttpRequestMessage(HttpMethod.Post, $"http://{url}/cgi-bin/httpconn?htcmd=0x6FF0087&uin={_context.Keystore.Uin}")
++                using var request = new HttpRequestMessage(HttpMethod.Post, $"http://{url}")
                  {
 -                    Uint32LoginSigType = 8,
 -                    BytesLoginSig = _context.Keystore.WLoginSigs.A2,
@@ -698,21 +698,38 @@ index d5fc857..d921be6 100644
                  break;
              }
 diff --git a/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs b/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
-index baefd8e..249a40a 100644
+index baefd8e..f8da6ce 100644
 --- a/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
 +++ b/Lagrange.Core/Internal/Services/Message/NTV2RichMediaUploadService.cs
-@@ -27,16 +27,22 @@ file class Common
+@@ -1,4 +1,5 @@
+ using Lagrange.Core.Common;
++using Lagrange.Core.Exceptions;
+ using Lagrange.Core.Internal.Events.Message;
+ using Lagrange.Core.Internal.Packets.Service;
+ using Lagrange.Core.Message.Entities;
+@@ -27,16 +28,33 @@ file class Common
          };
      }
      
 -    public static NTV2RichMediaHighwayExt? GenerateExt(UploadResp upload, SubFileInfo subFileInfo)
-+    public const uint VideoThumbnailType = 100;
-+
-+    public static NTV2RichMediaHighwayExt? GenerateVideoThumbnailExt(UploadResp upload)
++    public static UploadResp RequireImageUpload(NTV2RichMediaResp response)
      {
 -        if (subFileInfo.UKey == null) return null;
 -        
 -        var index = upload.MsgInfo.MsgInfoBody[0].Index;
++        if (response.RespHead is { RetCode: not 0 } head)
++            throw new OperationException(unchecked((int)head.RetCode), head.Message);
++
++        if (response.Upload is not { MsgInfo.MsgInfoBody: [var first, ..] } upload || first.Index is null)
++            throw new InvalidDataException("QQ image upload response did not contain a media index.");
++
++        return upload;
++    }
++
++    public const uint VideoThumbnailType = 100;
++
++    public static NTV2RichMediaHighwayExt? GenerateVideoThumbnailExt(UploadResp upload)
++    {
 +        var subFileInfo = upload.SubFileInfos?.FirstOrDefault(file => file.SubType == VideoThumbnailType)
 +            ?? (upload.SubFileInfos is [var onlyFile] ? onlyFile : null);
 +        if (string.IsNullOrEmpty(subFileInfo?.UKey)) return null;
@@ -730,7 +747,29 @@ index baefd8e..249a40a 100644
              MsgInfoBody = upload.MsgInfo.MsgInfoBody,
              BlockSize = BlockSize,
              Hash = new NTHighwayHash { FileSha1 = [Convert.FromHexString(index.Info.FileSha1)] }
-@@ -195,12 +201,12 @@ internal class VideoUploadService : OidbService<VideoUploadEventReq, VideoUpload
+@@ -81,7 +99,9 @@ internal class ImageUploadService : OidbService<ImageUploadEventReq, ImageUpload
+
+     protected override Task<ImageUploadEventResp> ProcessResponse(NTV2RichMediaResp response, BotContext context)
+     {
+-        return Task.FromResult(new ImageUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, Common.GenerateExt(response.Upload)));
++        var upload = Common.RequireImageUpload(response);
++        var extension = string.IsNullOrEmpty(upload.UKey) ? null : Common.GenerateExt(upload);
++        return Task.FromResult(new ImageUploadEventResp(upload.MsgInfo, upload.CompatQMsg, extension));
+     }
+ }
+
+@@ -113,7 +133,9 @@ internal class ImageGroupUploadService : OidbService<ImageGroupUploadEventReq, I
+
+     protected override Task<ImageGroupUploadEventResp> ProcessResponse(NTV2RichMediaResp response, BotContext context)
+     {
+-        return Task.FromResult(new ImageGroupUploadEventResp(response.Upload.MsgInfo, response.Upload.CompatQMsg, Common.GenerateExt(response.Upload)));
++        var upload = Common.RequireImageUpload(response);
++        var extension = string.IsNullOrEmpty(upload.UKey) ? null : Common.GenerateExt(upload);
++        return Task.FromResult(new ImageGroupUploadEventResp(upload.MsgInfo, upload.CompatQMsg, extension));
+     }
+ }
+
+@@ -195,12 +217,12 @@ internal class VideoUploadService : OidbService<VideoUploadEventReq, VideoUpload
          };
          var entity = (VideoEntity)request.Entity;
          ArgumentNullException.ThrowIfNull(entity.ThumbnailEntity);
@@ -745,7 +784,7 @@ index baefd8e..249a40a 100644
      }
  }
  
-@@ -222,11 +228,11 @@ internal class VideoGroupUploadService : OidbService<VideoGroupUploadEventReq, V
+@@ -222,11 +244,11 @@ internal class VideoGroupUploadService : OidbService<VideoGroupUploadEventReq, V
          };
          var entity = (VideoEntity)request.Entity;
          ArgumentNullException.ThrowIfNull(entity.ThumbnailEntity);
@@ -761,18 +800,69 @@ index baefd8e..249a40a 100644
  }
 \ No newline at end of file
 diff --git a/Lagrange.Core/Message/Entities/ImageEntity.cs b/Lagrange.Core/Message/Entities/ImageEntity.cs
-index 9ac5ddf..68f98d1 100644
+index 9ac5ddf..4929eb1 100644
 --- a/Lagrange.Core/Message/Entities/ImageEntity.cs
 +++ b/Lagrange.Core/Message/Entities/ImageEntity.cs
-@@ -48,7 +48,7 @@ public class ImageEntity : RichMediaEntityBase
-                 // Aot 和 MacOS 下使用 FlashTransfer 上传
-                 if (RuntimeFeature.IsDynamicCodeCompiled && !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                 {
+@@ -1,6 +1,7 @@
+ using System.Numerics;
+ using System.Runtime.CompilerServices;
+ using System.Runtime.InteropServices;
++using Lagrange.Core.Exceptions;
+ using Lagrange.Core.Internal.Events.Message;
+ using Lagrange.Core.Internal.Packets.Message;
+ using Lagrange.Core.Internal.Packets.Service;
+@@ -34,5 +35,6 @@ public class ImageEntity : RichMediaEntityBase
+         ArgumentNullException.ThrowIfNull(Stream);
+
++        var stage = "upload negotiation";
+         try
+         {
+             IsGroup = message.IsGroup();
+@@ -43,18 +45,34 @@ public class ImageEntity : RichMediaEntityBase
+             _compat = result.Compat;
+             MsgInfo = result.Info;
+
+-            if (result.Ext != null)
++            if (result.Ext is null)
+             {
+-                // Aot 和 MacOS 下使用 FlashTransfer 上传
+-                if (RuntimeFeature.IsDynamicCodeCompiled && !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+-                {
 -                    await context.HighwayContext.UploadFile(Stream.Value, IsGroup ? 1004 : 1003, ProtoHelper.Serialize(result.Ext));
-+                    await context.HighwayContext.UploadRequiredAsync(Stream.Value, IsGroup ? 1004 : 1003, ProtoHelper.Serialize(result.Ext));
-                 }
-                 else
-                 {
+-                }
+-                else
+-                {
+-                    await context.FlashTransferContext.UploadFile(result.Ext.UKey, (uint)(IsGroup ? 1407 : 1406), Stream.Value);
+-                }
++                context.LogDebug(nameof(ImageEntity), "QQ accepted the image without a separate upload (group: {0})", IsGroup);
++                return;
++            }
++
++            if (RuntimeFeature.IsDynamicCodeCompiled && !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
++            {
++                stage = "Highway";
++                var commandId = IsGroup ? 1004 : 1003;
++                context.LogDebug(nameof(ImageEntity), "Uploading image via Highway (command {0}, {1} bytes)", commandId, Stream.Value.Length);
++                await context.HighwayContext.UploadRequiredAsync(Stream.Value, commandId, ProtoHelper.Serialize(result.Ext));
++            }
++            else
++            {
++                stage = "FlashTransfer";
++                uint appId = IsGroup ? 1407u : 1406u;
++                context.LogDebug(nameof(ImageEntity), "Uploading image via FlashTransfer (app {0}, {1} bytes)", appId, Stream.Value.Length);
++                if (!await context.FlashTransferContext.UploadFile(result.Ext.UKey, appId, Stream.Value))
++                    throw new OperationException(-1, $"FlashTransfer image upload failed (app {appId})");
+             }
++
++            context.LogDebug(nameof(ImageEntity), "Image upload completed via {0} (group: {1})", stage, IsGroup);
++        }
++        catch (Exception ex)
++        {
++            context.LogWarning(nameof(ImageEntity), "Image preparation failed during {0} (group: {1})", ex, stage, IsGroup);
++            throw;
+         }
+         finally
+         {
 diff --git a/Lagrange.Core/Message/Entities/RecordEntity.cs b/Lagrange.Core/Message/Entities/RecordEntity.cs
 index c9fba17..08a3131 100644
 --- a/Lagrange.Core/Message/Entities/RecordEntity.cs
