@@ -33,7 +33,10 @@ internal sealed class LagrangeEventService : IEventService
         });
 
         // 注意:Lagrange 断言 handler 不能是静态方法,这里全部用实例 lambda 委托
-        invoker.RegisterEvent<BotMessageEvent>(async (_, e) => await OnMessageAsync(e));
+        invoker.RegisterEvent<BotMessageEvent>(async (_, e) =>
+        {
+            if (ReferenceEquals(_session, session)) await OnMessageAsync(e, session);
+        });
         invoker.RegisterEvent<BotGroupRecallEvent>(async (_, e) => await PublishAsync(new MessageDeletedEvent
         {
             Platform = LagrangeMapper.PlatformId,
@@ -178,9 +181,9 @@ internal sealed class LagrangeEventService : IEventService
                 IsSelf = isSelf, SelfId = self, Time = DateTimeOffset.FromUnixTimeSeconds(message.Time) } };
     }
 
-    private async Task OnMessageAsync(BotMessageEvent e)
+    private async Task OnMessageAsync(BotMessageEvent e, LagrangeSession session)
     {
-        _session?.CacheMessage(e.Message);
+        session.CachePushedMessage(e.Message);
         await PublishAsync(LagrangeMapper.ToMessageEvent(e.Message, _session?.ActiveContext?.BotUin.ToString()))
             .ConfigureAwait(false);
         foreach (var file in e.Message.Entities.OfType<PrivateFileEntity>())
@@ -208,7 +211,7 @@ internal sealed class LagrangeEventService : IEventService
         }
     }
 
-    private async Task PublishAsync(BotEvent botEvent)
+    internal async Task PublishAsync(BotEvent botEvent)
     {
         if (EventReceived is { } handler)
         {

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Lagrange.Core;
 using Lagrange.Core.Message;
+using Lagrange.Core.Message.Entities;
 using Lagrange.Core.Common.Entity;
 using Lagrange.Core.Common.Interface;
 
@@ -16,6 +17,14 @@ internal sealed class LagrangeSession
 
     private readonly ConcurrentDictionary<(long Peer, bool Group, ulong Sequence), BotMessage> _messages = new();
     private readonly ConcurrentQueue<(long Peer, bool Group, ulong Sequence)> _order = new();
+
+    internal event Action<BotMessage>? MessagePushed;
+
+    internal void CachePushedMessage(BotMessage message)
+    {
+        CacheMessage(message);
+        MessagePushed?.Invoke(message);
+    }
 
     public BotContext? ActiveContext { get; set; }
     public BotContext Context => ActiveContext ?? throw new InvalidOperationException("Lagrange 适配器尚未启动。");
@@ -39,7 +48,12 @@ internal sealed class LagrangeSession
         }
         else
         {
-            _messages[key] = message;
+            _messages.AddOrUpdate(key, message, (_, previous) =>
+                message.Contact.Uin == ActiveContext?.BotUin &&
+                previous.Entities.OfType<VideoEntity>().Any(video => video.IsBubble) &&
+                !message.Entities.OfType<VideoEntity>().Any(video => video.IsBubble)
+                    ? previous
+                    : message);
         }
     }
 
@@ -54,6 +68,6 @@ internal sealed class LagrangeSession
         var messages = await (group ? Context.GetGroupMessage(peer, sequence, sequence)
             : Context.GetC2CMessage(peer, sequence, sequence)).WaitAsync(cancellationToken);
         foreach (var message in messages) CacheMessage(message);
-        return messages.FirstOrDefault(x => x.Sequence == sequence);
+        return messages.FirstOrDefault(x => x.Sequence == sequence || (!group && x.ClientSequence == sequence));
     }
 }

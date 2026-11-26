@@ -117,7 +117,7 @@ public partial class LagrangeAdapter
                 }
                 var system = new Services.LagrangeQqSystemApi(_services);
                 var friend = new Services.LagrangeQqFriendApi(_services);
-                var messaging = new Services.LagrangeQqMessageApi(_services);
+                var messaging = _qqMessageApi ?? throw new InvalidOperationException("QQ 消息服务尚未就绪。");
                 var group = new Services.LagrangeQqGroupApi(_services);
                 await Check("login-info", async () => { await ((IQSystemApi)system).GetLoginInfoAsync(token); });
                 await Check("version-info", async () => { await ((IQSystemApi)system).GetImplInfoAsync(token); });
@@ -133,7 +133,7 @@ public partial class LagrangeAdapter
                 await Check("face-catalog", async () => { await LagrangeFaceCatalog.Create(_services.Context, 300, false); });
                 if (arguments?["groupId"]?.GetValue<string>() is { Length: > 0 } groupId)
                 {
-                    var files = new Services.LagrangeQqFileApi(_services);
+                    var files = _qqFileApi ?? throw new InvalidOperationException("QQ 文件服务尚未就绪。");
                     await Check("group-info", async () => { await group.GetGroupInfoAsync(groupId, false, token); });
                     await Check("self-member-info", async () => { await group.GetGroupMemberInfoAsync(groupId, _services.Context.BotUin.ToString(), false, token); });
                     await Check("group-notifications", async () => { await group.GetNotificationsAsync(limit: 5, cancellationToken: token); });

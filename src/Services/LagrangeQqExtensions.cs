@@ -453,7 +453,7 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
     }
 }
 
-internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
+internal sealed partial class LagrangeQqFileApi(LagrangeSession session, LagrangeFlashTransfers flash) : IQFileApi
 {
     public async Task<string> UploadPrivateFileAsync(string userId, string fileUri, string fileName,
         CancellationToken cancellationToken = default)
@@ -577,6 +577,18 @@ internal sealed class LagrangeQqFileApi(LagrangeSession session) : IQFileApi
 
 internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
 {
+    public async Task<IReadOnlyList<QOnlineClient>> GetOnlineClientsAsync(bool noCache = false,
+        CancellationToken cancellationToken = default)
+    {
+        var devices = await session.Context.GetOnlineDevicesAsync(noCache, cancellationToken);
+        return [.. devices.Select(device => new QOnlineClient
+        {
+            AppId = device.AppId,
+            DeviceName = string.IsNullOrEmpty(device.DeviceName) ? null : device.DeviceName,
+            DeviceKind = string.IsNullOrEmpty(device.DeviceKind) ? null : device.DeviceKind
+        })];
+    }
+
     public async Task<QUserProfile> GetUserProfileAsync(string userId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -742,7 +754,7 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     }
 }
 
-internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageApi
+internal sealed partial class LagrangeQqMessageApi(LagrangeSession session, LagrangeQqFileApi files) : IQMessageApi
 {
     public async Task<string> SendMessageAsync(QMessageScene scene, string peerId,
         IReadOnlyList<QOutgoingSegment> segments, CancellationToken cancellationToken = default) =>
@@ -788,15 +800,27 @@ internal sealed class LagrangeQqMessageApi(LagrangeSession session) : IQMessageA
     {
         cancellationToken.ThrowIfCancellationRequested();
         var context = session.Context;
-        var messages = await context.RunMessageOperationAsync(async () => scene == QMessageScene.Group
-            ? await context
-                .GetGroupMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId),
-                    ulong.Parse(messageId)).ConfigureAwait(false)
-            : await context
-                .GetC2CMessage(LagrangeMapper.ParseId(peerId, "peerId"), ulong.Parse(messageId), ulong.Parse(messageId))
-                .ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
+        var peer = LagrangeMapper.ParseId(peerId, nameof(peerId));
+        var message = await context.RunMessageOperationAsync(async () =>
+        {
+            var sequence = ulong.Parse(messageId, System.Globalization.CultureInfo.InvariantCulture);
+            var group = scene == QMessageScene.Group;
+            var cached = session.FindMessage(sequence, peer, group);
+            if (cached?.Contact.Uin == context.BotUin && cached.Entities
+                    .OfType<Lagrange.Core.Message.Entities.VideoEntity>()
+                    .FirstOrDefault(video => video.IsBubble) is { } bubble)
+            {
+                // QQ history can present sent bubbles as plain compatibility text on desktop sessions.
+                // The original media index belongs to this exact outgoing message and can resolve its download URL.
+                if (string.IsNullOrWhiteSpace(bubble.FileUrl))
+                    await bubble.Postprocess(context, cached);
+                return cached;
+            }
+            if (!group)
+                return await session.ResolveMessageAsync(messageId, peer, false, cancellationToken);
 
-        var message = messages.FirstOrDefault();
+            return (await context.GetGroupMessage(peer, sequence, sequence)).FirstOrDefault();
+        }, cancellationToken).ConfigureAwait(false);
         return message is null
             ? null
             : LagrangeMapper.ToMessageEvent(message, session.Context.BotUin.ToString()).Raw as QIncomingMessage;

@@ -24,7 +24,8 @@ internal static class HighwayUploadChecks
         await CheckImageUploadResponsesAsync();
         await CheckRemoteImageDownloadAsync();
         await CheckForwardImageDownloadsAsync();
-        await CheckFlashTransferAsync(content);
+        await CheckFlashTransferAsync(content, appId: 1415);
+        await CheckFlashTransferAsync(content, appId: 14901);
 
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -402,7 +403,7 @@ internal static class HighwayUploadChecks
         Console.WriteLine("Group and private image upload response checks passed.");
     }
 
-    private static async Task CheckFlashTransferAsync(byte[] content)
+    private static async Task CheckFlashTransferAsync(byte[] content, uint appId)
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -411,8 +412,14 @@ internal static class HighwayUploadChecks
         using var flash = (FlashTransferContext)Activator.CreateInstance(typeof(FlashTransferContext),
             BindingFlags.Instance | BindingFlags.NonPublic, null,
             [bot, new Uri($"http://{listener.LocalEndpoint}/sliceupload")], null)!;
-        using var video = new MemoryStream(content);
-        var upload = flash.UploadFile("test-upload-key", 1415, video);
+        using var media = new MemoryStream(content);
+        var progress = new List<long>();
+        var upload = flash.UploadFile("test-upload-key", appId, media, offset =>
+        {
+            progress.Add(offset);
+            return Task.CompletedTask;
+        });
+        byte[] prefixHash = SHA1.HashData(content.AsSpan(0, 1024 * 1024));
         byte[] finalHash = SHA1.HashData(content);
         int offset = 0;
         foreach (int length in new[] { 1024 * 1024, 17 })
@@ -424,6 +431,10 @@ internal static class HighwayUploadChecks
                 !payload.AsSpan().EndsWith(content.AsSpan(offset, length)) ||
                 payload.AsSpan().IndexOf(finalHash) < 0)
                 throw new Exception("FlashTransfer did not send the expected slice and final SHA-1.");
+            var wire = ProtoWire.Parse(payload);
+            var states = ProtoWire.Child(ProtoWire.Child(wire, 107), 6);
+            if (appId == 14901 && !states.Any(state => state.Bytes.AsSpan().SequenceEqual(prefixHash)))
+                throw new Exception("General FlashTransfer slice lacked its finalized prefix hash.");
             byte[] response = [0x2a, 7, (byte)'s', (byte)'u', (byte)'c', (byte)'c', (byte)'e', (byte)'s', (byte)'s'];
             await stream.WriteAsync(
                 Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {response.Length}\r\nConnection: close\r\n\r\n"),
@@ -431,8 +442,8 @@ internal static class HighwayUploadChecks
             await stream.WriteAsync(response, timeout.Token);
             offset += length;
         }
-        if (!await upload.WaitAsync(timeout.Token))
-            throw new Exception("FlashTransfer rejected a successful upload.");
+        if (!await upload.WaitAsync(timeout.Token) || !progress.SequenceEqual(new long[] { 1024L * 1024, content.Length }))
+            throw new Exception("FlashTransfer success did not report acknowledged progress.");
     }
 
     private static ReadOnlySpan<byte> Payload(byte[] frame)

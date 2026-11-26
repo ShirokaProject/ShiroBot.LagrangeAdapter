@@ -13,7 +13,7 @@ namespace ShiroBot.LagrangeAdapter;
 /// Lagrange.Core 模型 ↔ ShiroBot 核心模型 + 通用 QQ 模型的映射。
 /// 与 Milky/OneBot 适配器保持同构:Raw 携带 Qq.Model 类型,PlatformEvent Kind 复用 QEventKinds。
 /// </summary>
-public static class LagrangeMapper
+public static partial class LagrangeMapper
 {
     private static readonly HttpClient ResourceClient = new();
     private static readonly SemaphoreSlim ForwardImageDownloadSlots = new(8, 8);
@@ -233,6 +233,7 @@ public static class LagrangeMapper
             ResourceId = record.FileUuid,
             Duration = TimeSpan.FromSeconds(record.RecordLength)
         },
+        VideoEntity { IsBubble: true } bubble => new RawSegment(PlatformId, "bubble", ToBubble(bubble)),
         VideoEntity video => new VideoSegment(video.FileUrl)
         {
             ResourceId = video.FileUuid
@@ -247,6 +248,9 @@ public static class LagrangeMapper
             new QIncomingForward(multi.ResId ?? string.Empty)),
         LightAppEntity lightApp => new RawSegment(PlatformId, "light_app",
             new QIncomingLightApp(lightApp.AppName, lightApp.Payload)),
+        MarkdownEntity markdown => TryReadFlashCard(markdown.Content) is { } flash
+            ? new RawSegment(PlatformId, "flash_file", flash)
+            : new TextSegment(markdown.Content),
         _ => new RawSegment(PlatformId, entity.GetType().Name, entity)
     };
 
@@ -274,12 +278,21 @@ public static class LagrangeMapper
         {
             Duration = TimeSpan.FromSeconds(record.RecordLength)
         },
+        VideoEntity { IsBubble: true } bubble => ToBubble(bubble),
         VideoEntity video => new QIncomingVideo(video.FileUuid, video.FileUrl),
         GroupFileEntity file => new QIncomingFile(file.FileId, file.FileName, file.FileSize),
         PrivateFileEntity file => new QIncomingFile(file.FileId, file.FileName, file.FileSize) { FileHash = file.FileHash },
         MultiMsgEntity multi => new QIncomingForward(multi.ResId ?? string.Empty),
         LightAppEntity lightApp => new QIncomingLightApp(lightApp.AppName, lightApp.Payload),
+        MarkdownEntity markdown => (QIncomingSegment?)TryReadFlashCard(markdown.Content) ?? new QIncomingText(markdown.Content),
         _ => new QIncomingText(string.Empty)
+    };
+
+    private static QIncomingBubbleVideo ToBubble(VideoEntity video) => new(video.FileUuid, video.FileUrl)
+    {
+        Width = (int)video.VideoSize.X,
+        Height = (int)video.VideoSize.Y,
+        Duration = TimeSpan.FromSeconds(video.VideoLength)
     };
 
     // ─── 段:核心/Qq → Lagrange(出站) ───
@@ -381,6 +394,9 @@ public static class LagrangeMapper
                 break;
             case QOutgoingVideo video:
                 chain.Add(await CreateVideoAsync(video.Uri, video.ThumbUri, cancellationToken, resources).ConfigureAwait(false));
+                break;
+            case QOutgoingBubbleVideo bubble:
+                chain.Add(await CreateVideoAsync(bubble.Uri, bubble.ThumbUri, cancellationToken, resources, isBubble: true).ConfigureAwait(false));
                 break;
             case QOutgoingLightApp lightApp:
                 chain.Add(new LightAppEntity(lightApp.JsonPayload));
@@ -514,8 +530,8 @@ public static class LagrangeMapper
         }
     }
 
-    private static async Task<VideoEntity> CreateVideoAsync(string uri, string? thumbnailUri,
-        CancellationToken cancellationToken, List<Stream>? resources)
+    internal static async Task<VideoEntity> CreateVideoAsync(string uri, string? thumbnailUri,
+        CancellationToken cancellationToken, List<Stream>? resources, bool isBubble = false)
     {
         var video = await OpenMessageResourceAsync(uri, cancellationToken, null).ConfigureAwait(false);
         try
@@ -529,6 +545,7 @@ public static class LagrangeMapper
             if (thumbnail is not null) resources?.Add(thumbnail);
             return new VideoEntity(video, thumbnail, disposeOnCompletion: true)
             {
+                IsBubble = isBubble,
                 VideoSize = size,
                 VideoLength = duration
             };

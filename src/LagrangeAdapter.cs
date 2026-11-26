@@ -10,14 +10,14 @@ using ShiroBot.SDK.Dashboard;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.15")]
-[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.2")]
+[assembly: ShiroBotPackage("lagrange", ShiroBotPackageKind.Adapter, "0.1.16")]
+[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "1.0.5")]
 
 namespace ShiroBot.LagrangeAdapter;
 
 [BotAdapter("lagrange",
     Name = "Lagrange V2",
-    Version = "0.1.15",
+    Version = "0.1.16",
     Description = "基于 Lagrange.Core V2 的进程内 QQ 适配器，支持多实例、PC 扫码、Android 密码登录与登录验证。",
     Author = "ShirokaProject",
     GithubRepo = "ShirokaProject/ShiroBot.LagrangeAdapter",
@@ -220,9 +220,11 @@ public partial class LagrangeAdapter : IBotAdapter, ILifetimeAwareAdapter, IPlug
         _user = new LagrangeUserService(_session);
         _qqFriendApi = new LagrangeQqFriendApi(_session);
         _qqGroupApi = new LagrangeQqGroupApi(_session);
-        _qqFileApi = new LagrangeQqFileApi(_session);
+        var flash = new LagrangeFlashTransfers(context, Path.Combine(Path.GetDirectoryName(keystorePath)!, "flash-downloads"),
+            _eventService.PublishAsync, _loginCancellation.Token);
+        _qqFileApi = new LagrangeQqFileApi(_session, flash);
         _qqSystemApi = new LagrangeQqSystemApi(_session);
-        _qqMessageApi = new LagrangeQqMessageApi(_session);
+        _qqMessageApi = new LagrangeQqMessageApi(_session, _qqFileApi);
 
         if (config.TokenRelayEnabled && (protocol is Protocols.MacOs or Protocols.AndroidPhone or Protocols.AndroidPad) && Uri.TryCreate(config.SignServer, UriKind.Absolute, out var relayAddress) &&
             (relayAddress.Scheme == "https" || relayAddress.Scheme == "http" && relayAddress.IsLoopback))

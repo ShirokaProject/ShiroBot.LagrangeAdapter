@@ -62,6 +62,7 @@ Console.WriteLine("Embedded Mac/Android preset versions, platform, AppIDs and is
 
 var assembly = typeof(LagrangeAdapter).Assembly;
 await ParityChecks.Run();
+await QqModelChecks.Run();
 await TokenRelayChecks.Run();
 await HighwayUploadChecks.Run();
 await VideoMediaChecks.Run();
@@ -104,7 +105,7 @@ catch (OperationCanceledException)
 }
 
 var sessionType = assembly.GetType("ShiroBot.LagrangeAdapter.LagrangeSession")!;
-var session = Activator.CreateInstance(sessionType, nonPublic: true)!;
+var session = new LagrangeSession();
 var cache = sessionType.GetMethod("CacheMessage")!;
 var find = sessionType.GetMethod("FindMessage")!;
 var first = Lagrange.Core.Message.BotMessage.CreateCustomGroup(100, 1, "one", DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -155,12 +156,12 @@ if (stopped.Ok) throw new Exception("QR login must reject stopped adapters.");
 Console.WriteLine("Custom AppInfo, signing API and login action checks passed.");
 
 // Exercise newly implemented SDK dispatch with cancellation before connection access.
-var groups = (ShiroBot.Model.QQ.IQGroupApi)Activator.CreateInstance(
-    assembly.GetType("ShiroBot.LagrangeAdapter.Services.LagrangeQqGroupApi")!, session)!;
-var files = (ShiroBot.Model.QQ.IQFileApi)Activator.CreateInstance(
-    assembly.GetType("ShiroBot.LagrangeAdapter.Services.LagrangeQqFileApi")!, session)!;
-var nativeMessages = (ShiroBot.Model.QQ.IQMessageApi)Activator.CreateInstance(
-    assembly.GetType("ShiroBot.LagrangeAdapter.Services.LagrangeQqMessageApi")!, session)!;
+var groups = new ShiroBot.LagrangeAdapter.Services.LagrangeQqGroupApi(session);
+using var offlineBot = Lagrange.Core.Common.Interface.BotFactory.Create(new Lagrange.Core.Common.BotConfig());
+var flash = new ShiroBot.LagrangeAdapter.Services.LagrangeFlashTransfers(offlineBot, Path.GetTempPath(),
+    _ => Task.CompletedTask, CancellationToken.None);
+var files = new ShiroBot.LagrangeAdapter.Services.LagrangeQqFileApi(session, flash);
+var nativeMessages = new ShiroBot.LagrangeAdapter.Services.LagrangeQqMessageApi(session, files);
 foreach (var call in new[]
          {
              () => groups.MuteMemberAsync("100", "1", TimeSpan.Zero, canceledToken),
@@ -175,7 +176,11 @@ foreach (var call in new[]
              () => files.DeleteGroupFolderAsync("100", "folder", canceledToken),
              () => nativeMessages.SendMessageDetailedAsync(ShiroBot.Model.QQ.QMessageScene.Group, "100", [],
                  canceledToken),
-             () => nativeMessages.GetForwardedMessagesAsync("forward", canceledToken)
+             () => nativeMessages.GetForwardedMessagesAsync("forward", canceledToken),
+             () => nativeMessages.ForwardSingleMessageAsync(ShiroBot.Model.QQ.QMessageScene.Group, "100", "42",
+                 ShiroBot.Model.QQ.QMessageScene.Friend, "200", canceledToken),
+             () => files.ForwardGroupFileToFriendAsync("100", "file", "200", cancellationToken: canceledToken),
+             () => files.DownloadFlashFilesAsync("fileset", canceledToken)
          })
 {
     try
