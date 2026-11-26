@@ -38,7 +38,11 @@ internal static class VideoMediaChecks
         if (!redCover.AsSpan().SequenceEqual(suppliedCover))
             throw new Exception("The caller's cover was not retained.");
 
-        Console.WriteLine("Managed video metadata, QQ upload fields, generated covers and supplied cover checks passed.");
+        var hevc = new MessageChain();
+        await LagrangeMapper.AppendQqSegmentAsync(hevc, new QOutgoingVideo(FixtureUri("video-hevc.mp4")), ResolveQuoted);
+        await CheckVideoAsync((VideoEntity)hevc.Single(), width: 64, height: 64);
+
+        Console.WriteLine("Managed video metadata, QQ upload fields, generated H.264/HEVC covers and supplied cover checks passed.");
     }
 
     private static string FixtureUri(string name)
@@ -49,7 +53,7 @@ internal static class VideoMediaChecks
         return "base64://" + Convert.ToBase64String(bytes.ToArray());
     }
 
-    private static async Task<byte[]> CheckVideoAsync(VideoEntity video)
+    private static async Task<byte[]> CheckVideoAsync(VideoEntity video, uint width = 48, uint height = 32)
     {
         const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
         using var file = ((Lazy<Stream>)typeof(VideoEntity).GetProperty("Stream", flags)!.GetValue(video)!).Value;
@@ -57,8 +61,8 @@ internal static class VideoMediaChecks
         if (file.Position != 0)
             throw new Exception("The video stream must be rewound for upload.");
 
-        CheckFileInfo(video, 48, 32, 2);
-        CheckFileInfo(new ImageEntity(cover), 48, 32, 0);
+        CheckFileInfo(video, width, height, 2);
+        CheckFileInfo(new ImageEntity(cover), width, height, 0);
         using var jpeg = new MemoryStream();
         await cover.CopyToAsync(jpeg);
         var bytes = jpeg.ToArray();

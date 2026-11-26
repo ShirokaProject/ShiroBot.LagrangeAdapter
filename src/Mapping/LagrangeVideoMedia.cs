@@ -46,13 +46,16 @@ internal static class LagrangeVideoMedia
         try
         {
             using var demuxer = Demuxer.Open(source, leaveOpen: true);
-            if (demuxer.Video is not { } video || video.Codec is not (CodecIds.H264 or CodecIds.Mjpeg)) return null;
+            if (demuxer.Video is not { } video || video.Codec is not (CodecIds.H264 or CodecIds.Mjpeg or CodecIds.Hevc)) return null;
 
             var (width, height) = FrameSize(video);
             CheckFrameSize(width, height);
-            IVideoDecoder decoder = video.Codec == CodecIds.H264
-                ? new H264Decoder(video) { ConcealErrors = true }
-                : new MjpegDecoder(video);
+            IVideoDecoder decoder = video.Codec switch
+            {
+                CodecIds.H264 => new H264Decoder(video) { ConcealErrors = true },
+                CodecIds.Hevc => new LagrangeHevcKeyFrameDecoder(video, MaxFramePixels, timeout.Token),
+                _ => new MjpegDecoder(video)
+            };
             byte[]? damagedCover = null;
 
             await foreach (var packet in demuxer.ReadPacketsAsync(timeout.Token).ConfigureAwait(false))
@@ -66,7 +69,7 @@ internal static class LagrangeVideoMedia
                 {
                     frames = decoder.Decode(packet);
                 }
-                catch (InvalidDataException) when (video.Codec == CodecIds.Mjpeg)
+                catch (InvalidDataException) when (video.Codec != CodecIds.H264)
                 {
                     continue;
                 }

@@ -32,6 +32,9 @@ internal static class CodecIds
     /// <summary>H.264 / AVC, packets of length-prefixed NAL units as MP4 stores them.</summary>
     public const string H264 = "H264";
 
+    /// <summary>H.265 / HEVC, packets of length-prefixed NAL units as MP4 stores them.</summary>
+    public const string Hevc = "HEVC";
+
     /// <summary>MPEG-4 Part 2 Visual.</summary>
     public const string Mpeg4Visual = "MP4V";
 

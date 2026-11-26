@@ -1632,6 +1632,15 @@ internal sealed class Mp4Demuxer : IDemuxer
 
                     break;
 
+                case Box.Hvc1 or Box.Hev1:
+                    Codec = CodecIds.Hevc;
+                    if (FindChild(children, Box.HvcC, out var hvcC))
+                    {
+                        CodecPrivate = hvcC.ToArray();
+                    }
+
+                    break;
+
                 case Box.Mp4v:
                     if (FindChild(children, Box.Esds, out var esds))
                     {
@@ -1942,6 +1951,9 @@ internal sealed class Mp4Demuxer : IDemuxer
         public const uint Avc1 = 0x61766331;
         public const uint Avc3 = 0x61766333;
         public const uint AvcC = 0x61766343;
+        public const uint Hvc1 = 0x68766331;
+        public const uint Hev1 = 0x68657631;
+        public const uint HvcC = 0x68766343;
         public const uint Mp4v = 0x6D703476;
         public const uint Esds = 0x65736473;
         public const uint Wave = 0x77617665;
