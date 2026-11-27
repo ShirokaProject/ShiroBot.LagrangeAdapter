@@ -303,59 +303,67 @@ public static partial class LagrangeMapper
         CancellationToken cancellationToken = default, List<Stream>? resources = null)
     {
         var chain = new MessageChain();
-
-        foreach (var segment in segments)
+        var trackedResources = resources ?? [];
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            switch (segment)
+            foreach (var segment in segments)
             {
-                case TextSegment text:
-                    chain.Add(new TextEntity(text.Text));
-                    break;
-                case MentionAllSegment:
-                    chain.Add(new MentionEntity(0, "@全体成员"));
-                    break;
-                case MentionSegment mention:
-                    chain.Add(new MentionEntity(
-                        long.TryParse(mention.UserId, out var uin) ? uin : 0,
-                        mention.DisplayName));
-                    break;
-                case QuoteSegment quote:
-                    var quoted = await resolveQuoted(quote.MessageId).ConfigureAwait(false);
-                    if (quoted is not null)
-                    {
-                        chain.Add(new ReplyEntity(quoted));
-                    }
+                cancellationToken.ThrowIfCancellationRequested();
+                switch (segment)
+                {
+                    case TextSegment text:
+                        chain.Add(new TextEntity(text.Text));
+                        break;
+                    case MentionAllSegment:
+                        chain.Add(new MentionEntity(0, "@全体成员"));
+                        break;
+                    case MentionSegment mention:
+                        chain.Add(new MentionEntity(
+                            long.TryParse(mention.UserId, out var uin) ? uin : 0,
+                            mention.DisplayName));
+                        break;
+                    case QuoteSegment quote:
+                        var quoted = await resolveQuoted(quote.MessageId).ConfigureAwait(false);
+                        if (quoted is not null)
+                        {
+                            chain.Add(new ReplyEntity(quoted));
+                        }
 
-                    break;
-                case EmojiSegment emoji:
-                    chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(emoji.Id), false));
-                    break;
-                case ImageSegment image:
-                    chain.Add(new ImageEntity(await OpenMessageResourceAsync(image.Uri, cancellationToken, resources).ConfigureAwait(false),
-                        image.Summary ?? "[图片]", disposeOnCompletion: resources is null));
-                    break;
-                case AudioSegment audio:
-                    chain.Add(new RecordEntity(await OpenMessageResourceAsync(audio.Uri, cancellationToken, resources).ConfigureAwait(false),
-                        disposeOnCompletion: resources is null));
-                    break;
-                case VideoSegment video:
-                    chain.Add(await CreateVideoAsync(video.Uri, video.ThumbnailUri, cancellationToken, resources).ConfigureAwait(false));
-                    break;
-                case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
-                    await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context, cancellationToken, resources).ConfigureAwait(false);
-                    break;
-                case RawSegment { Payload: IMessageEntity lagrangeEntity }:
-                    chain.Add(lagrangeEntity);
-                    break;
-                case FileSegment:
-                    throw Unsupported("消息内文件段(请使用 IQFileApi.UploadGroupFileAsync/UploadPrivateFileAsync)");
-                default:
-                    throw Unsupported(segment.GetType().Name);
+                        break;
+                    case EmojiSegment emoji:
+                        chain.Add(await LagrangeFaceCatalog.Create(context, int.Parse(emoji.Id), false));
+                        break;
+                    case ImageSegment image:
+                        chain.Add(new ImageEntity(await OpenMessageResourceAsync(image.Uri, cancellationToken, trackedResources).ConfigureAwait(false),
+                            image.Summary ?? "[图片]", disposeOnCompletion: true));
+                        break;
+                    case AudioSegment audio:
+                        chain.Add(new RecordEntity(await OpenMessageResourceAsync(audio.Uri, cancellationToken, trackedResources).ConfigureAwait(false),
+                            disposeOnCompletion: true));
+                        break;
+                    case VideoSegment video:
+                        chain.Add(await CreateVideoAsync(video.Uri, video.ThumbnailUri, cancellationToken, trackedResources).ConfigureAwait(false));
+                        break;
+                    case RawSegment { Payload: QOutgoingSegment qqOutgoing }:
+                        await AppendQqSegmentAsync(chain, qqOutgoing, resolveQuoted, context, cancellationToken, trackedResources).ConfigureAwait(false);
+                        break;
+                    case RawSegment { Payload: IMessageEntity lagrangeEntity }:
+                        chain.Add(lagrangeEntity);
+                        break;
+                    case FileSegment:
+                        throw Unsupported("消息内文件段(请使用 IQFileApi.UploadGroupFileAsync/UploadPrivateFileAsync)");
+                    default:
+                        throw Unsupported(segment.GetType().Name);
+                }
             }
-        }
 
-        return chain;
+            return chain;
+        }
+        catch when (resources is null)
+        {
+            foreach (var stream in trackedResources) await stream.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     public static async Task AppendQqSegmentAsync(
@@ -386,11 +394,11 @@ public static partial class LagrangeMapper
                 break;
             case QOutgoingImage image:
                 chain.Add(new ImageEntity(await OpenMessageResourceAsync(image.Uri, cancellationToken, resources).ConfigureAwait(false),
-                    image.Summary ?? "[图片]", disposeOnCompletion: resources is null));
+                    image.Summary ?? "[图片]", disposeOnCompletion: true));
                 break;
             case QOutgoingRecord record:
                 chain.Add(new RecordEntity(await OpenMessageResourceAsync(record.Uri, cancellationToken, resources).ConfigureAwait(false),
-                    disposeOnCompletion: resources is null));
+                    disposeOnCompletion: true));
                 break;
             case QOutgoingVideo video:
                 chain.Add(await CreateVideoAsync(video.Uri, video.ThumbUri, cancellationToken, resources).ConfigureAwait(false));
@@ -421,6 +429,7 @@ public static partial class LagrangeMapper
         var remoteImages = forward.Messages.SelectMany(message => message.Segments).OfType<QOutgoingImage>()
             .Where(image => IsHttpResource(image.Uri)).ToArray();
         var downloaded = new Stream?[remoteImages.Length];
+        var nodeResources = resources ?? [];
         var completed = false;
         try
         {
@@ -464,10 +473,10 @@ public static partial class LagrangeMapper
                     if (segment is QOutgoingImage image && IsHttpResource(image.Uri))
                     {
                         chain.Add(new ImageEntity(downloaded[imageIndex++]!, image.Summary ?? "[图片]",
-                            disposeOnCompletion: resources is null));
+                            disposeOnCompletion: true));
                         continue;
                     }
-                    await AppendQqSegmentAsync(chain, segment, resolveQuoted, context, cancellationToken, resources).ConfigureAwait(false);
+                    await AppendQqSegmentAsync(chain, segment, resolveQuoted, context, cancellationToken, nodeResources).ConfigureAwait(false);
                 }
 
                 messages.Add(BotMessage.CreateCustomGroup(
@@ -483,8 +492,12 @@ public static partial class LagrangeMapper
         finally
         {
             if (!completed)
+            {
                 foreach (var stream in downloaded)
                     if (stream is not null) await stream.DisposeAsync().ConfigureAwait(false);
+                if (resources is null)
+                    foreach (var stream in nodeResources) await stream.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 
@@ -536,10 +549,10 @@ public static partial class LagrangeMapper
         var video = await OpenMessageResourceAsync(uri, cancellationToken, null).ConfigureAwait(false);
         try
         {
-            var (size, duration) = LagrangeVideoMedia.ReadMetadata(video);
-            var thumbnail = thumbnailUri is not null
-                ? await OpenMessageResourceAsync(thumbnailUri, cancellationToken, null).ConfigureAwait(false)
-                : await LagrangeVideoMedia.TryCreateThumbnailAsync(video, size, cancellationToken).ConfigureAwait(false);
+            var (size, duration, thumbnail) = await LagrangeVideoMedia.PrepareAsync(
+                video, generateThumbnail: thumbnailUri is null, cancellationToken).ConfigureAwait(false);
+            if (thumbnailUri is not null)
+                thumbnail = await OpenMessageResourceAsync(thumbnailUri, cancellationToken, null).ConfigureAwait(false);
             resources?.Add(video);
             // A missing cover is created internally by VideoEntity and must also be disposed after a send.
             if (thumbnail is not null) resources?.Add(thumbnail);
@@ -570,9 +583,10 @@ public static partial class LagrangeMapper
     public static async Task<Stream> OpenResourceAsync(string uri, bool bufferHttpResponse = true,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (uri.StartsWith("base64://", StringComparison.OrdinalIgnoreCase))
         {
-            return new MemoryStream(Convert.FromBase64String(uri["base64://".Length..]));
+            return await OpenBase64ResourceAsync(uri, cancellationToken).ConfigureAwait(false);
         }
 
         if (uri.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
@@ -593,16 +607,7 @@ public static partial class LagrangeMapper
         using var response = await ResourceClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
             .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
-        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        var options = new FileStreamOptions
-        {
-            Mode = FileMode.CreateNew,
-            Access = FileAccess.ReadWrite,
-            Options = FileOptions.Asynchronous | FileOptions.DeleteOnClose
-        };
-        if (!OperatingSystem.IsWindows())
-            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-        var file = new FileStream(path, options);
+        var file = CreateTemporaryResource();
         try
         {
             if (inactivityDeadline is not null)
@@ -620,6 +625,71 @@ public static partial class LagrangeMapper
         {
             await file.DisposeAsync().ConfigureAwait(false);
             throw;
+        }
+    }
+
+    private static FileStream CreateTemporaryResource()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.ReadWrite,
+            Options = FileOptions.Asynchronous | FileOptions.DeleteOnClose
+        };
+        if (!OperatingSystem.IsWindows())
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        return new FileStream(path, options);
+    }
+
+    private static async Task<Stream> OpenBase64ResourceAsync(string uri, CancellationToken cancellationToken)
+    {
+        const int blockSize = 16 * 1024;
+        var chars = ArrayPool<char>.Shared.Rent(blockSize);
+        var bytes = ArrayPool<byte>.Shared.Rent(blockSize / 4 * 3);
+        try
+        {
+            var file = CreateTemporaryResource();
+            try
+            {
+                var count = 0;
+                var padded = false;
+                for (var index = "base64://".Length; index < uri.Length; index++)
+                {
+                    if (index % blockSize == 0) cancellationToken.ThrowIfCancellationRequested();
+                    var character = uri[index];
+                    if (character is ' ' or '\t' or '\r' or '\n') continue;
+                    if (padded) throw new FormatException("Invalid Base64 media.");
+                    chars[count++] = character;
+                    if (count < blockSize) continue;
+
+                    if (!Convert.TryFromBase64Chars(chars.AsSpan(0, count), bytes, out var written))
+                        throw new FormatException("Invalid Base64 media.");
+                    await file.WriteAsync(bytes.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
+                    padded = character == '=';
+                    count = 0;
+                }
+
+                if (count > 0)
+                {
+                    if (!Convert.TryFromBase64Chars(chars.AsSpan(0, count), bytes, out var written))
+                        throw new FormatException("Invalid Base64 media.");
+                    await file.WriteAsync(bytes.AsMemory(0, written), cancellationToken).ConfigureAwait(false);
+                }
+
+                file.Position = 0;
+                return file;
+            }
+            catch
+            {
+                await file.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(bytes, clearArray: true);
+            ArrayPool<char>.Shared.Return(chars, clearArray: true);
         }
     }
 

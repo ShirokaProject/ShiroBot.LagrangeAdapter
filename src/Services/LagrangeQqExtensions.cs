@@ -347,7 +347,7 @@ internal sealed class LagrangeQqGroupApi(LagrangeSession session) : IQGroupApi
     public async Task SetGroupAvatarAsync(string groupId, string imageUri, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await using var source = await LagrangeMapper.OpenResourceAsync(imageUri);
+        await using var source = await LagrangeMapper.OpenResourceAsync(imageUri, bufferHttpResponse: false, cancellationToken);
         await LagrangeOperations.RequireSuccessAsync(session.Context.SetGroupAvatar(LagrangeMapper.ParseId(groupId, nameof(groupId)), source), "设置群头像", cancellationToken);
     }
 
@@ -670,7 +670,8 @@ internal sealed class LagrangeQqSystemApi(LagrangeSession session) : IQSystemApi
     public async Task SetAvatarAsync(string imageUri, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await using var stream = await LagrangeMapper.OpenResourceAsync(imageUri).ConfigureAwait(false);
+        await using var stream = await LagrangeMapper.OpenResourceAsync(imageUri, bufferHttpResponse: false, cancellationToken)
+            .ConfigureAwait(false);
         await LagrangeOperations.RequireSuccessAsync(session.Context.SetBotAvatar(stream), "设置头像", cancellationToken);
     }
 

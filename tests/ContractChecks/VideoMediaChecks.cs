@@ -42,7 +42,99 @@ internal static class VideoMediaChecks
         await LagrangeMapper.AppendQqSegmentAsync(hevc, new QOutgoingVideo(FixtureUri("video-hevc.mp4")), ResolveQuoted);
         await CheckVideoAsync((VideoEntity)hevc.Single(), width: 64, height: 64);
 
+        await CheckBase64SpoolingAsync();
+        CheckRecentMessageCache();
+        CheckSilkDurationFromStream();
         Console.WriteLine("Managed video metadata, QQ upload fields, generated H.264/HEVC covers and supplied cover checks passed.");
+    }
+
+    private static async Task CheckBase64SpoolingAsync()
+    {
+        const string scheme = "base64://";
+        var data = new byte[24 * 1024 + 1];
+        new Random(58).NextBytes(data);
+        var encoded = Convert.ToBase64String(data, Base64FormattingOptions.InsertLineBreaks);
+        string temporaryPath;
+        await using (var resource = await LagrangeMapper.OpenResourceAsync(scheme + encoded))
+        {
+            if (resource is not FileStream file || !file.CanSeek || file.Position != 0 || file.Length != data.Length)
+                throw new Exception("Base64 media must be spooled to a seekable, rewound temporary file.");
+            temporaryPath = file.Name;
+            var decoded = new byte[data.Length];
+            await file.ReadExactlyAsync(decoded);
+            if (!decoded.AsSpan().SequenceEqual(data))
+                throw new Exception("Base64 spooling changed decoded bytes across block or whitespace boundaries.");
+        }
+        if (File.Exists(temporaryPath))
+            throw new Exception("Disposing a Base64 resource did not delete the spool file.");
+
+        var blockWithPadding = Convert.ToBase64String(new byte[12 * 1024 - 1]);
+        try
+        {
+            await using var invalid = await LagrangeMapper.OpenResourceAsync(scheme + blockWithPadding + "YQ==");
+            throw new Exception("Base64 data was accepted after a padded block.");
+        }
+        catch (FormatException)
+        {
+        }
+    }
+
+    private static void CheckRecentMessageCache()
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var sourceProperty = typeof(RichMediaEntityBase).GetProperty("Stream", flags)!;
+        var thumbnailProperty = typeof(VideoEntity).GetProperty("ThumbnailStream", flags)!;
+        using var media = new MemoryStream(new byte[1024]);
+        using var cover = new MemoryStream(new byte[512]);
+        var image = new ImageEntity(media, "fixture");
+        var video = new VideoEntity(media, cover) { IsBubble = true, VideoLength = 2 };
+        var node = BotMessage.CreateCustomGroup(123, 1, "source", 1, [image]);
+        var forward = new MultiMsgEntity([node]);
+        typeof(MultiMsgEntity).GetProperty("ResId")!.SetValue(forward, "fixture-forward");
+        var message = BotMessage.CreateCustomGroup(123, 1, "source", 1, [image, video, forward]);
+        message.Sequence = 23;
+        var session = new LagrangeSession();
+        session.CacheMessage(message);
+        var retained = session.FindMessage(23, 123, true)!;
+        if (retained.ClientSequence != message.ClientSequence ||
+            retained.Entities[0] is not ImageEntity { Summary: "fixture" } cachedImage ||
+            retained.Entities[1] is not VideoEntity { IsBubble: true, VideoLength: 2 } cachedVideo ||
+            retained.Entities[2] is not MultiMsgEntity { ResId: "fixture-forward", Messages.Count: 0 } cachedForward ||
+            sourceProperty.GetValue(cachedImage) is not null || sourceProperty.GetValue(cachedVideo) is not null ||
+            thumbnailProperty.GetValue(cachedVideo) is not null)
+            throw new Exception("The recent-message cache retained input media or lost forwarding metadata.");
+
+        var build = typeof(IMessageEntity).GetMethod("Build", flags)!;
+        if (((Array)build.Invoke(cachedForward, null)!).Length != 1 ||
+            sourceProperty.GetValue(image) is null || thumbnailProperty.GetValue(video) is null ||
+            forward.Messages.Count != 1 || !media.CanRead || !cover.CanRead)
+            throw new Exception("Making a cache snapshot changed the original message or lost its forwarding card.");
+
+        Parallel.For(1, 4099, index =>
+        {
+            var item = BotMessage.CreateCustomGroup(321, 1, "source", 1, []);
+            item.Sequence = (ulong)index;
+            session.CacheMessage(item);
+        });
+        if (Enumerable.Range(1, 4098).Count(index => session.FindMessage((ulong)index, 321, true) is not null) != 4096 ||
+            session.FindMessage(23, 123, true) is not null)
+            throw new Exception("Concurrent caching exceeded the recent-message limit or failed to evict the oldest entry.");
+    }
+
+    private static void CheckSilkDurationFromStream()
+    {
+        foreach (bool tencent in new[] { false, true })
+        {
+            using var stream = new MemoryStream();
+            if (tencent) stream.WriteByte(2);
+            stream.Write("#!SILK_V3"u8);
+            for (var frame = 0; frame < 60; frame++)
+                stream.Write(new byte[] { 2, 0, 17, 19 });
+            if (!tencent) stream.Write(new byte[] { 255, 255 });
+            stream.Position = 0;
+            CheckFileInfo(new RecordEntity(stream), 0, 0, 1);
+            if (stream.Position != 0) throw new Exception("SILK duration probing did not rewind the audio source.");
+        }
     }
 
     private static string FixtureUri(string name)

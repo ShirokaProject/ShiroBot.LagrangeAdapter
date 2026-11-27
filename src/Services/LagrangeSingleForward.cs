@@ -87,11 +87,12 @@ internal sealed partial class LagrangeQqMessageApi
                             break;
                         case ImageEntity image:
                             if (string.IsNullOrEmpty(image.FileUrl)) await image.Postprocess(context, source);
-                            chain.Add(new ImageEntity(await OpenMediaAsync(image.FileUrl), image.Summary) { SubType = image.SubType });
+                            chain.Add(new ImageEntity(await OpenMediaAsync(image.FileUrl), image.Summary, disposeOnCompletion: true)
+                                { SubType = image.SubType });
                             break;
                         case RecordEntity record:
                             if (string.IsNullOrEmpty(record.FileUrl)) await record.Postprocess(context, source);
-                            chain.Add(new RecordEntity(await OpenMediaAsync(record.FileUrl)));
+                            chain.Add(new RecordEntity(await OpenMediaAsync(record.FileUrl), disposeOnCompletion: true));
                             break;
                         case ReplyEntity reply when scene != targetScene || sourcePeer != target:
                             var quoted = string.IsNullOrWhiteSpace(reply.QuotedText) ? "[引用消息]" : reply.QuotedText;

@@ -11,8 +11,27 @@ internal static class LagrangeVideoMedia
 {
     private const int CoverSize = 320;
     private const long MaxFramePixels = 16_777_216;
+    private static readonly SemaphoreSlim PreparationSlot = new(1, 1);
 
-    public static (Vector2 Size, uint Duration) ReadMetadata(Stream source)
+    internal static async Task<(Vector2 Size, uint Duration, Stream? Thumbnail)> PrepareAsync(
+        Stream source, bool generateThumbnail, CancellationToken cancellationToken)
+    {
+        await PreparationSlot.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var (size, duration) = ReadMetadata(source);
+            var thumbnail = generateThumbnail
+                ? await TryCreateThumbnailAsync(source, size, cancellationToken).ConfigureAwait(false)
+                : null;
+            return (size, duration, thumbnail);
+        }
+        finally
+        {
+            PreparationSlot.Release();
+        }
+    }
+
+    private static (Vector2 Size, uint Duration) ReadMetadata(Stream source)
     {
         try
         {
@@ -38,7 +57,7 @@ internal static class LagrangeVideoMedia
     private static uint DurationSeconds(double seconds) =>
         double.IsFinite(seconds) && seconds > 0 ? (uint)Math.Min(uint.MaxValue, Math.Ceiling(seconds)) : 0;
 
-    public static async Task<Stream?> TryCreateThumbnailAsync(Stream source, Vector2 videoSize, CancellationToken cancellationToken = default)
+    private static async Task<Stream?> TryCreateThumbnailAsync(Stream source, Vector2 videoSize, CancellationToken cancellationToken)
     {
         if (videoSize.X <= 0 || videoSize.Y <= 0) return null;
 
@@ -53,7 +72,7 @@ internal static class LagrangeVideoMedia
             CheckFrameSize(width, height);
             IVideoDecoder decoder = video.Codec switch
             {
-                CodecIds.H264 => new H264Decoder(video) { ConcealErrors = true },
+                CodecIds.H264 => new H264Decoder(video) { ConcealErrors = true, BorrowFrames = true },
                 CodecIds.Hevc => new LagrangeHevcKeyFrameDecoder(video, MaxFramePixels, timeout.Token),
                 _ => new MjpegDecoder(video)
             };

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using Lagrange.Core;
 using Lagrange.Core.Message;
 using Lagrange.Core.Message.Entities;
@@ -15,8 +14,9 @@ internal sealed class LagrangeSession
 {
     private const int MaxCachedMessages = 4096;
 
-    private readonly ConcurrentDictionary<(long Peer, bool Group, ulong Sequence), BotMessage> _messages = new();
-    private readonly ConcurrentQueue<(long Peer, bool Group, ulong Sequence)> _order = new();
+    private readonly Lock _cacheLock = new();
+    private readonly Dictionary<(long Peer, bool Group, ulong Sequence), BotMessage> _messages = new();
+    private readonly Queue<(long Peer, bool Group, ulong Sequence)> _order = new();
 
     internal event Action<BotMessage>? MessagePushed;
 
@@ -31,34 +31,40 @@ internal sealed class LagrangeSession
 
     public void Clear()
     {
-        _messages.Clear();
-        _order.Clear();
+        lock (_cacheLock)
+        {
+            _messages.Clear();
+            _order.Clear();
+        }
     }
 
     public void CacheMessage(BotMessage message)
     {
+        message = message.CreateCacheSnapshot();
         var key = (message.Contact is BotGroupMember member ? member.Group.GroupUin : message.Contact.Uin == ActiveContext?.BotUin ? message.Receiver.Uin : message.Contact.Uin, message.Type == MessageType.Group, message.Sequence);
-        if (_messages.TryAdd(key, message))
+        lock (_cacheLock)
         {
-            _order.Enqueue(key);
-            while (_messages.Count > MaxCachedMessages && _order.TryDequeue(out var oldest))
+            if (_messages.TryGetValue(key, out var previous))
             {
-                _messages.TryRemove(oldest, out _);
+                if (message.Contact.Uin != ActiveContext?.BotUin ||
+                    !previous.Entities.OfType<VideoEntity>().Any(video => video.IsBubble) ||
+                    message.Entities.OfType<VideoEntity>().Any(video => video.IsBubble))
+                    _messages[key] = message;
+                return;
             }
-        }
-        else
-        {
-            _messages.AddOrUpdate(key, message, (_, previous) =>
-                message.Contact.Uin == ActiveContext?.BotUin &&
-                previous.Entities.OfType<VideoEntity>().Any(video => video.IsBubble) &&
-                !message.Entities.OfType<VideoEntity>().Any(video => video.IsBubble)
-                    ? previous
-                    : message);
+
+            _messages.Add(key, message);
+            _order.Enqueue(key);
+            if (_messages.Count > MaxCachedMessages)
+                _messages.Remove(_order.Dequeue());
         }
     }
 
-    public BotMessage? FindMessage(ulong sequence, long peer, bool group) =>
-        _messages.GetValueOrDefault((peer, group, sequence));
+    public BotMessage? FindMessage(ulong sequence, long peer, bool group)
+    {
+        lock (_cacheLock)
+            return _messages.GetValueOrDefault((peer, group, sequence));
+    }
 
     public async Task<BotMessage?> ResolveMessageAsync(string messageId, long peer, bool group, CancellationToken cancellationToken = default)
     {

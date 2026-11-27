@@ -18,6 +18,8 @@ internal static class ParityChecks
         MapEntryBoundsChecks();
         WriterBoundsChecks();
         LightAppEncodingCheck();
+        ProtoBufferRetentionCheck();
+        await SendFailureDiagnosticsAsync();
         await ForwardMediaPreparationChecks();
         await UnavailableForwardPushKeepsMessageAsync();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
@@ -104,6 +106,67 @@ internal static class ParityChecks
         if (chain.Single() is not FaceEntity { FaceId: 14 }) throw new Exception("Generic emoji send mapping failed.");
         Console.WriteLine("Yogurt parity wire fixtures, protocol rejections, files, Web mappings, event mapping and actual FaceEntity encoding passed (offline).");
     }
+
+    private static void ProtoBufferRetentionCheck()
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var type = typeof(Lagrange.Proto.Serialization.ProtoSerializer).Assembly
+            .GetType("Lagrange.Proto.Utility.SegmentBufferWriter", throwOnError: true)!;
+        using var writer = (IDisposable)Activator.CreateInstance(type)!;
+        var buffer = (System.Buffers.IBufferWriter<byte>)writer;
+        buffer.GetSpan(32)[0] = 17;
+        buffer.Advance(1);
+        buffer.GetSpan(1024 * 1024)[0] = 23;
+        buffer.Advance(1);
+        byte[] Export() => (byte[])type.GetMethod("ToArray")!.Invoke(writer, null)!;
+        if (!Export().AsSpan().SequenceEqual(new byte[] { 17, 23 }))
+            throw new Exception("Growing the Protobuf writer changed the serialized bytes.");
+
+        type.GetMethod("Clear")!.Invoke(writer, null);
+        var current = (byte[])type.GetField("_currentSegment", flags)!.GetValue(writer)!;
+        var completed = (System.Collections.ICollection)type.GetField("_completedBuffers", flags)!.GetValue(writer)!;
+        if (current.Length > 2048 || completed.Count != 0 || Export().Length != 0)
+            throw new Exception("A reused Protobuf writer retained segments from a large serialization.");
+        buffer.GetSpan(1)[0] = 31;
+        buffer.Advance(1);
+        if (!Export().AsSpan().SequenceEqual(new byte[] { 31 }))
+            throw new Exception("The Protobuf writer failed to write after releasing large segments.");
+    }
+
+    private static async Task SendFailureDiagnosticsAsync()
+    {
+        using var bot = BotFactory.Create(new Lagrange.Core.Common.BotConfig { SignProvider = new OfflineSignProvider() });
+        bot.Keystore.Uin = 999;
+        bot.Keystore.Uid = "self";
+        var assembly = typeof(BotContext).Assembly;
+        var serviceType = assembly.GetType("Lagrange.Core.Internal.Services.Message.SendMessageService", true)!;
+        var service = (Lagrange.Core.Services.IService)Activator.CreateInstance(serviceType)!;
+        var rejected = await service.Parse(new ProtoWire().UInt(1, 16).Text(2, "fixture rejection").ToArray(), bot);
+        if (!Equals(rejected.GetType().GetProperty("ErrMsg")!.GetValue(rejected), "fixture rejection"))
+            throw new Exception("The send response lost the QQ error message.");
+
+        var cache = typeof(BotContext).GetProperty("CacheContext", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(bot)!;
+        cache.GetType().GetMethod("RememberPrivateMessageUid")!.Invoke(cache, [123L, "peer"]);
+        using var trace = new System.Diagnostics.Activity("private send fixture").Start();
+        var failureLog = new TaskCompletionSource<BotLogEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bot.EventInvoker.RegisterEvent<BotLogEvent>((_, log) =>
+        {
+            if (log.Tag == "MessagingLogic" && log.Level == LogLevel.Warning)
+                failureLog.TrySetResult(log);
+        });
+        try
+        {
+            await bot.SendFriendMessage(123, [new TextEntity("fixture")]);
+            throw new Exception("The signer failure was reported as a successful private send.");
+        }
+        catch (Lagrange.Core.Exceptions.LagrangeException e) when (e.InnerException is TimeoutException)
+        {
+            var log = await failureLog.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (!ReferenceEquals(log.Exception, e) || !log.Message.Contains(trace.TraceId.ToString(), StringComparison.Ordinal))
+                throw new Exception("The private send warning lost the exception or its trace ID.");
+        }
+    }
+
     private static async Task ColdCachePrivateMessage(BotContext bot)
     {
         var assembly = typeof(BotContext).Assembly;

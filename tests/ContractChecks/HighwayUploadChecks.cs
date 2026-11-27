@@ -75,7 +75,7 @@ internal static class HighwayUploadChecks
         using var backup = new TcpListener(IPAddress.Loopback, 0);
         primary.Start();
         backup.Start();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(35));
         using var bot = BotFactory.Create(new BotConfig { HighwayChunkSize = 1024 });
         var highway = typeof(BotContext).GetProperty("HighwayContext", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(bot)!;
@@ -87,22 +87,46 @@ internal static class HighwayUploadChecks
 
         byte[] accepted = [0x28, 0, 0, 0, 2, 0, 0, 0, 0, 0x18, 0, 0x29];
         byte[] rejected = [0x28, 0, 0, 0, 4, 0, 0, 0, 0, 0x12, 2, 0x28, 7, 0x29];
-        async Task<byte[]> ExchangeAsync(TcpListener endpoint, byte[] response, bool truncate = false)
+        async Task RespondAsync(NetworkStream stream, byte[] response)
+        {
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"HTTP/1.1 200 OK\r\nContent-Length: {response.Length}\r\nConnection: close\r\n\r\n"), timeout.Token);
+            await stream.WriteAsync(response, timeout.Token);
+        }
+
+        async Task<byte[]> ExchangeAsync(TcpListener endpoint, byte[] response)
         {
             using var socket = await endpoint.AcceptTcpClientAsync(timeout.Token);
             using var stream = socket.GetStream();
             var (_, body) = await ReadRequestAsync(stream, timeout.Token);
-            await stream.WriteAsync(Encoding.ASCII.GetBytes(
-                $"HTTP/1.1 200 OK\r\nContent-Length: {response.Length}\r\nConnection: close\r\n\r\n"), timeout.Token);
-            await stream.WriteAsync(response.AsMemory(0, truncate ? 1 : response.Length), timeout.Token);
+            await RespondAsync(stream, response);
             return body;
         }
 
         using var data = new MemoryStream(content, 0, 2500);
         var sending = Upload(data);
         var first = await ExchangeAsync(primary, accepted);
-        var stalled = await ExchangeAsync(primary, accepted, truncate: true);
-        var retried = await ExchangeAsync(backup, accepted);
+        using var stalledSocket = await primary.AcceptTcpClientAsync(timeout.Token);
+        using var stalledStream = stalledSocket.GetStream();
+        var (_, stalled) = await ReadRequestAsync(stalledStream, timeout.Token);
+
+        // Leave the primary connected without a response and wait for the fast request deadline.
+        using var failoverDeadline = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        failoverDeadline.CancelAfter(TimeSpan.FromSeconds(17));
+        using var retrySocket = await backup.AcceptTcpClientAsync(failoverDeadline.Token);
+        using var retryStream = retrySocket.GetStream();
+        var (_, retried) = await ReadRequestAsync(retryStream, timeout.Token);
+
+        // Start a second upload before the backup has acknowledged any blocks.
+        using var concurrentData = new MemoryStream(content, 0, 1024);
+        var concurrent = Upload(concurrentData);
+        await ExchangeAsync(backup, accepted);
+        if (!await concurrent.WaitAsync(timeout.Token) || primary.Pending())
+            throw new Exception("A concurrent upload did not skip the cooling endpoint.");
+
+        // With the primary cooling down, the backup may take longer than the fast deadline.
+        await Task.Delay(TimeSpan.FromSeconds(11), timeout.Token);
+        await RespondAsync(retryStream, accepted);
         var final = await ExchangeAsync(backup, accepted);
         if (!await sending.WaitAsync(timeout.Token) || !stalled.SequenceEqual(retried) ||
             !Payload(first).SequenceEqual(content.AsSpan(0, 1024)) ||
@@ -115,6 +139,7 @@ internal static class HighwayUploadChecks
         await ExchangeAsync(backup, rejected);
         if (await response.WaitAsync(timeout.Token) || primary.Pending())
             throw new Exception("Highway retried an explicit QQ response rejection on another endpoint.");
+        Console.WriteLine("Highway fast timeout, shared endpoint cooldown, and full fallback deadline checks passed.");
     }
 
     private static async Task CheckRemoteImageDownloadAsync()

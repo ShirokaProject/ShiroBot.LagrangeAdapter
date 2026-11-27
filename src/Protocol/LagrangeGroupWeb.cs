@@ -64,14 +64,12 @@ internal sealed class LagrangeGroupWeb(BotContext context)
             ["settings"] = "{\"is_show_edit_card\":0,\"tip_window_type\":1,\"confirm_required\":1}" };
         if (!string.IsNullOrEmpty(imageUri))
         {
-            await using var stream = await LagrangeMapper.OpenResourceAsync(imageUri);
-            using var buffer = new MemoryStream(); await stream.CopyToAsync(buffer, token);
-            if (buffer.Length > 20 * 1024 * 1024) throw new ArgumentException("公告图片不能超过 20 MiB。");
-            var bytes = buffer.ToArray();
+            await using var stream = await LagrangeMapper.OpenResourceAsync(imageUri, bufferHttpResponse: false, token);
+            if (stream.Length > 20 * 1024 * 1024) throw new ArgumentException("公告图片不能超过 20 MiB。");
             var upload = await Request("https://web.qun.qq.com/cgi-bin/announce/upload_img", new(), true, token, bkn =>
             {
                 var form = new MultipartFormDataContent { { new StringContent(bkn), "bkn" }, { new StringContent("troopNotice"), "source" }, { new StringContent("0"), "m" } };
-                var file = new ByteArrayContent(bytes); file.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+                var file = new StreamContent(stream); file.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
                 form.Add(file, "pic_up", "announcement.png"); return form;
             });
             var info = JsonNode.Parse(WebUtility.HtmlDecode(Text(upload, "id"))) ?? throw new InvalidDataException("公告图片上传结果无效。");
