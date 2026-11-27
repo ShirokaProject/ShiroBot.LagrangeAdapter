@@ -1,3 +1,2 @@
 # Unified diff context lines intentionally contain a leading space.
 docs/integration/*.patch -whitespace
-patches/lagrange-highway-upload.patch -whitespace

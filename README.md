@@ -17,7 +17,7 @@ adapter action <实例 ID> qr-login
 ```
 
 ## 编译与许可证
-本项目直接引用上游 [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core) 源码进行开发对接。
+本项目通过 Git 子模块固定 [ShirokaProject/Lagrange.Core](https://github.com/ShirokaProject/Lagrange.Core/tree/net11-async2) 的内核版本。首次检出后运行 `git submodule update --init --recursive`。
 
 版权均归 LagrangeDev 所有，如存在侵权或不当之处，请联系删除。
 

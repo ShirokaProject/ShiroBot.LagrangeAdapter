@@ -1,40 +1,4 @@
 <Project>
-  <PropertyGroup>
-    <LagrangePatchRoot>$(MSBuildThisFileDirectory)../external/LagrangeV2</LagrangePatchRoot>
-    <LagrangeLoginPatch>$(MSBuildThisFileDirectory)../patches/lagrange-login-challenges.patch</LagrangeLoginPatch>
-    <LagrangeHighwayPatch>$(MSBuildThisFileDirectory)../patches/lagrange-highway-upload.patch</LagrangeHighwayPatch>
-    <LagrangeQqModelPatch>$(MSBuildThisFileDirectory)../patches/lagrange-qq-model.patch</LagrangeQqModelPatch>
-  </PropertyGroup>
-  <!-- Apply during restore so new SDK source files exist before a fresh build graph enumerates Compile items. -->
-  <Target Name="ApplyLagrangePatches" BeforeTargets="CollectPackageReferences;ResolveProjectReferences"
-          Condition="'$(MSBuildProjectName)' == 'ShiroBot.LagrangeAdapter' and '$(DesignTimeBuild)' != 'true'">
-    <!-- The final patch extends files modified by both earlier patches. -->
-    <Exec Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeQqModelPatch)&quot;"
-          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
-      <Output TaskParameter="ExitCode" PropertyName="LagrangeQqModelPatchCheck" />
-    </Exec>
-    <CallTarget Condition="'$(LagrangeQqModelPatchCheck)' != '0'" Targets="ApplyLagrangeBasePatches" />
-    <Exec Condition="'$(LagrangeQqModelPatchCheck)' != '0'"
-          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply &quot;$(LagrangeQqModelPatch)&quot;" />
-  </Target>
-  <Target Name="ApplyLagrangeBasePatches">
-    <Exec Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --check &quot;$(LagrangeLoginPatch)&quot;"
-          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
-      <Output TaskParameter="ExitCode" PropertyName="LagrangeLoginPatchCheck" />
-    </Exec>
-    <Exec Condition="'$(LagrangeLoginPatchCheck)' == '0'"
-          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply &quot;$(LagrangeLoginPatch)&quot;" />
-    <Exec Condition="'$(LagrangeLoginPatchCheck)' != '0'"
-          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeLoginPatch)&quot;" />
-    <Exec Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --check &quot;$(LagrangeHighwayPatch)&quot;"
-          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
-      <Output TaskParameter="ExitCode" PropertyName="LagrangeHighwayPatchCheck" />
-    </Exec>
-    <Exec Condition="'$(LagrangeHighwayPatchCheck)' == '0'"
-          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply &quot;$(LagrangeHighwayPatch)&quot;" />
-    <Exec Condition="'$(LagrangeHighwayPatchCheck)' != '0'"
-          Command="git -C &quot;$(LagrangePatchRoot)&quot; apply --reverse --check &quot;$(LagrangeHighwayPatch)&quot;" />
-  </Target>
   <!--
     .NET 11 runtime-native async (Runtime Async V2). The compiler emits runtime-managed
     suspension instead of async state machines, and the .NET 11 runtime executes it.
