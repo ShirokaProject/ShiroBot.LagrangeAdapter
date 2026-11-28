@@ -42,6 +42,19 @@ internal sealed class OutputQueue
         return false;
     }
 
+    /// <summary>Takes an intact first picture whose presentation time the cover caller already verified.</summary>
+    internal VideoFrame? TakeSingleCoverFrame(long pts)
+    {
+        if (_held.Count != 1 || _held[0].Frame is not { IsDamaged: false, PictureType: PictureType.I } frame ||
+            frame.Pts != pts)
+        {
+            return null;
+        }
+
+        _held.Clear();
+        return frame;
+    }
+
     /// <summary>Returns every held frame, in order.</summary>
     public List<VideoFrame> Flush()
     {

@@ -39,7 +39,7 @@ internal static class VideoProbe
     /// which ffprobe gives none), from the first packet shown to the end of the last. MXF's streams last their header's
     /// track durations, which a file written to a pipe lacks: there its packets'.
     /// </summary>
-    internal static TimeSpan Duration(IDemuxer demuxer)
+    internal static TimeSpan Duration(IDemuxer demuxer, CancellationToken cancellationToken = default)
     {
         var streams = new Dictionary<int, (Rational TimeBase, long Duration, long Start, long End)>();
         if (demuxer.Video is { } video)
@@ -77,6 +77,7 @@ internal static class VideoProbe
             // SkipSamples counts decoded samples; the packets' times are in the stream's time base.
             foreach (var packet in packets)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!packet.Discard && streams.TryGetValue(packet.StreamIndex, out var s))
                 {
                     int sampleRate = sampleRates.GetValueOrDefault(packet.StreamIndex);

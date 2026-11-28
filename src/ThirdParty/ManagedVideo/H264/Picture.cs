@@ -259,6 +259,14 @@ internal sealed class Picture
         Long,
     }
 
+    internal void ClearSamples()
+    {
+        foreach (var plane in _planes)
+        {
+            Array.Clear(plane);
+        }
+    }
+
     public int LongTermFrameIdx { get; set; }
 
     /// <summary>

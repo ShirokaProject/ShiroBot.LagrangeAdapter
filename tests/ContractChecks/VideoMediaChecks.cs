@@ -2,6 +2,7 @@ using System.Reflection;
 using Lagrange.Core;
 using Lagrange.Core.Message;
 using Lagrange.Core.Message.Entities;
+using ManagedCodecs.Containers;
 using ShiroBot.LagrangeAdapter;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
@@ -29,6 +30,11 @@ internal static class VideoMediaChecks
         if (redCover.AsSpan().SequenceEqual(blueCover))
             throw new Exception("Distinct videos should generate distinct covers.");
 
+        var redAgain = await LagrangeMapper.ToChainAsync([new VideoSegment(redUri)], ResolveQuoted);
+        var redAgainCover = await CheckVideoAsync((VideoEntity)redAgain.Single());
+        if (!redCover.AsSpan().SequenceEqual(redAgainCover))
+            throw new Exception("A reused H.264 picture changed the cover after decoding a different video.");
+
         var supplied = new MessageChain();
         await LagrangeMapper.AppendQqSegmentAsync(supplied, new QOutgoingVideo(blueUri)
         {
@@ -42,10 +48,31 @@ internal static class VideoMediaChecks
         await LagrangeMapper.AppendQqSegmentAsync(hevc, new QOutgoingVideo(FixtureUri("video-hevc.mp4")), ResolveQuoted);
         await CheckVideoAsync((VideoEntity)hevc.Single(), width: 64, height: 64);
 
+        await CheckBorrowedMp4SamplesAsync();
         await CheckBase64SpoolingAsync();
         CheckRecentMessageCache();
         CheckSilkDurationFromStream();
         Console.WriteLine("Managed video metadata, QQ upload fields, generated H.264/HEVC covers and supplied cover checks passed.");
+    }
+
+    private static async Task CheckBorrowedMp4SamplesAsync()
+    {
+        using var source = typeof(VideoMediaChecks).Assembly.GetManifestResourceStream(
+            "ContractChecks.Fixtures.video-red.mp4")!;
+        using var demuxer = new Mp4Demuxer(source, leaveOpen: true);
+        var expected = demuxer.ReadPackets().Where(packet => packet.StreamIndex == demuxer.Video!.StreamIndex).ToArray();
+        int index = 0;
+        await foreach (var sample in demuxer.ReadBorrowedVideoPacketsAsync(CancellationToken.None))
+        {
+            if (index >= expected.Length)
+                throw new Exception("The borrowed MP4 path yielded an extra video sample.");
+            var original = expected[index++];
+            if (sample with { Data = default } != original with { Data = default } ||
+                !sample.Data.Span.SequenceEqual(original.Data.Span))
+                throw new Exception("Borrowing MP4 payloads changed sample bytes or presentation timing.");
+        }
+        if (index != expected.Length || index == 0)
+            throw new Exception("The borrowed MP4 path dropped video samples.");
     }
 
     private static async Task CheckBase64SpoolingAsync()

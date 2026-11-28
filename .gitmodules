@@ -2,3 +2,6 @@
 	path = external/LagrangeV2
 	url = https://github.com/ShirokaProject/Lagrange.Core.git
 	branch = net11-async2
+[submodule "external/SharpMP4"]
+	path = external/SharpMP4
+	url = https://github.com/greepar/SharpMP4.git

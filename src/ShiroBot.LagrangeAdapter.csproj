@@ -2,6 +2,7 @@
   <Import Project="../build/Package.props" />
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>15.0</LangVersion>
     <Version>0.1.19</Version>
     <AssemblyVersion>0.1.19.0</AssemblyVersion>
     <FileVersion>0.1.19.0</FileVersion>
@@ -25,6 +26,8 @@
     <PackageReference Include="ShiroBot.SDK" Version="1.0.5" />
     <PackageReference Include="Net.Codecrete.QrCodeGenerator" Version="3.2.1" />
     <ProjectReference Include="../external/LagrangeV2/Lagrange.Core/Lagrange.Core.csproj" />
+    <ProjectReference Include="../external/SharpMP4/src/SharpMP4Common/SharpMP4Common.csproj" AdditionalProperties="GeneratePackageOnBuild=false" />
+    <EmbeddedResource Include="../external/SharpMP4/LICENSE" LogicalName="SharpMP4.LICENSE" />
     <EmbeddedResource Include="Configuration/Presets/*.json" />
     <EmbeddedResource Include="Dashboard/index.html" LogicalName="dashboard/index.html" />
     <EmbeddedResource Include="ThirdParty/ManagedCodecs.NOTICE.md" />

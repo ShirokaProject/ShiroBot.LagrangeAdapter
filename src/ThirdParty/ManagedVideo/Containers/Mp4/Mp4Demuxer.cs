@@ -1,6 +1,9 @@
 using System.Buffers.Binary;
 using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
+using SharpMP4.Common;
 
 namespace ManagedCodecs.Containers;
 
@@ -105,7 +108,8 @@ internal sealed class Mp4Demuxer : IDemuxer
 
         try
         {
-            var moov = ReadMoov(stream, out bool hasFragments);
+            using var boxesBuffer = new MediaReadBuffer();
+            var moov = ReadMoov(stream, boxesBuffer, out bool hasFragments);
             uint movieTimescale = 0;
             var movieMatrix = Matrix.Identity;
             Track? video = null;
@@ -114,7 +118,7 @@ internal sealed class Mp4Demuxer : IDemuxer
             int priming = 0;
             ReadOnlySpan<byte> mvex = default;
 
-            ReadOnlySpan<byte> boxes = moov;
+            ReadOnlySpan<byte> boxes = moov.Span;
             while (NextBox(ref boxes, out uint type, out var payload))
             {
                 if (type == Box.Mvhd)
@@ -359,6 +363,31 @@ internal sealed class Mp4Demuxer : IDemuxer
     /// <inheritdoc cref="AviDemuxer.ReadPacketsAsync"/>
     public IAsyncEnumerable<Packet> ReadPacketsAsync(CancellationToken cancellationToken = default) => ReadSteps.RunAsync(_stream, Steps(), "MP4", cancellationToken);
 
+    /// <summary>
+    /// Reads only video samples for the serial cover decoder. Sample data is borrowed until the next move or disposal.
+    /// </summary>
+    internal async IAsyncEnumerable<Packet> ReadBorrowedVideoPacketsAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var buffer = new MediaReadBuffer();
+        long sequence = _video.PacketsBefore(_videoStart);
+        for (int index = _videoStart; index < _video.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int size = _video.Sizes[index];
+            if (size == 0) continue;
+
+            long offset = _video.Offsets[index];
+            if (offset < 0 || offset > _stream.Length - size)
+                throw new InvalidDataException($"Video sample {index} lies outside the file.");
+
+            var data = buffer.GetMemory(size);
+            await MediaInput.ReadExactlyAtAsync(_stream, offset, data, cancellationToken).ConfigureAwait(false);
+            var info = Info(_video, index, sequence++);
+            yield return new Packet(info.StreamIndex, info.Sequence, data, info.IsKeyframe,
+                info.Dts, info.Pts, info.Duration, info.SkipSamples, info.Discard);
+        }
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Times are those of the packets, edits applied, so a time a packet of the stream has finds it. The keyframe is
@@ -469,25 +498,22 @@ internal sealed class Mp4Demuxer : IDemuxer
     /// Scans the top-level boxes and reads the 'moov' box's payload; <paramref name="hasFragments"/>
     /// tells whether any 'moof' box follows (or precedes) it.
     /// </summary>
-    private static byte[] ReadMoov(Stream stream, out bool hasFragments)
+    private static Memory<byte> ReadMoov(Stream stream, MediaReadBuffer buffer, out bool hasFragments)
     {
-        byte[]? moov = null;
+        Memory<byte>? moov = null;
         hasFragments = false;
         foreach (var (type, offset, headerSize, size) in TopLevelBoxes(stream))
         {
             if (type == Box.Moov && moov is null)
             {
-                moov = new byte[checked((int)(size - headerSize))];
-                stream.Position = offset + headerSize;
-                stream.ReadExactly(moov);
+                var data = buffer.GetMemory(checked((int)(size - headerSize)));
+                MediaInput.ReadExactlyAt(stream, offset + headerSize, data.Span);
+                moov = data;
             }
             else if (type == Box.Moof)
             {
                 hasFragments = true;
-                if (moov is not null)
-                {
-                    break; // whether there are fragments is all that is needed here
-                }
+                if (moov is not null) break;
             }
             else if (type == Box.Cmov)
             {
@@ -501,41 +527,20 @@ internal sealed class Mp4Demuxer : IDemuxer
     /// <summary>The top-level boxes: type, file offset, header size and total size.</summary>
     private static IEnumerable<(uint Type, long Offset, int HeaderSize, long Size)> TopLevelBoxes(Stream stream)
     {
-        var header = new byte[16]; // an iterator cannot keep stack memory across yield
+        var header = new byte[16];
         long length = stream.Length;
-        long pos = 0;
-
-        while (pos + 8 <= length)
+        long offset = 0;
+        while (offset <= length - 8)
         {
-            stream.Position = pos;
-            stream.ReadExactly(header, 0, 8);
-            long size = BinaryPrimitives.ReadUInt32BigEndian(header);
-            uint type = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(4));
-            int headerSize = 8;
+            int available = (int)Math.Min(header.Length, length - offset);
+            MediaInput.ReadExactlyAt(stream, offset, header.AsSpan(0, available));
+            var box = IsoBoxHeader.Read(header.AsSpan(0, available), length - offset);
+            if (box.Type is Box.Moov or Box.Moof && box.Size > length - offset)
+                throw new InvalidDataException($"The '{Box.Name(box.Type)}' box is truncated.");
 
-            if (size == 1)
-            {
-                stream.ReadExactly(header, 8, 8);
-                size = checked((long)BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8)));
-                headerSize = 16;
-            }
-            else if (size == 0)
-            {
-                size = length - pos; // extends to the end of the file
-            }
-
-            if (size < headerSize)
-            {
-                throw new InvalidDataException($"Invalid size {size} for box '{Box.Name(type)}' at offset {pos}.");
-            }
-
-            if (type is Box.Moov or Box.Moof && pos + size > length)
-            {
-                throw new InvalidDataException($"The '{Box.Name(type)}' box is truncated.");
-            }
-
-            yield return (type, pos, headerSize, size);
-            pos += size;
+            yield return (box.Type, offset, box.HeaderSize, box.Size);
+            if (box.Size >= length - offset) yield break;
+            offset += box.Size;
         }
     }
 
@@ -564,16 +569,16 @@ internal sealed class Mp4Demuxer : IDemuxer
     /// <summary>Adds the samples of every track fragment of every 'moof' to the tracks they belong to (8.8.4).</summary>
     private static void ReadFragments(Stream stream, Track?[] tracks)
     {
-        foreach (var (type, offset, headerSize, size) in TopLevelBoxes(stream).ToList())
+        using var fragmentBuffer = new MediaReadBuffer();
+        foreach (var (type, offset, headerSize, size) in TopLevelBoxes(stream))
         {
             if (type != Box.Moof)
             {
                 continue;
             }
 
-            var moof = new byte[checked((int)(size - headerSize))];
-            stream.Position = offset + headerSize;
-            stream.ReadExactly(moof);
+            var moof = fragmentBuffer.GetMemory(checked((int)(size - headerSize)));
+            MediaInput.ReadExactlyAt(stream, offset + headerSize, moof.Span);
 
             // Without an explicit base, the first track fragment's data starts at the 'moof' and
             // each later one's where the previous one's ended (8.8.7.1). Where that one belongs to a
@@ -581,7 +586,7 @@ internal sealed class Mp4Demuxer : IDemuxer
             // without a base of its own cannot be placed.
             long dataEnd = offset;
             bool skipped = false;
-            ReadOnlySpan<byte> boxes = moof;
+            ReadOnlySpan<byte> boxes = moof.Span;
             while (NextBox(ref boxes, out uint child, out var traf))
             {
                 if (child != Box.Traf)
@@ -624,40 +629,11 @@ internal sealed class Mp4Demuxer : IDemuxer
     /// </summary>
     private static bool NextBox(scoped ref ReadOnlySpan<byte> data, out uint type, out ReadOnlySpan<byte> payload)
     {
-        type = 0;
-        payload = default;
-        if (data.Length < 8)
-        {
-            return false;
-        }
-
-        ulong size = BinaryPrimitives.ReadUInt32BigEndian(data);
-        type = BinaryPrimitives.ReadUInt32BigEndian(data[4..]);
-        int headerSize = 8;
-
-        if (size == 1)
-        {
-            if (data.Length < 16)
-            {
-                throw new InvalidDataException($"Truncated box '{Box.Name(type)}'.");
-            }
-
-            size = BinaryPrimitives.ReadUInt64BigEndian(data[8..]);
-            headerSize = 16;
-        }
-        else if (size == 0)
-        {
-            size = (ulong)data.Length;
-        }
-
-        if (size < (ulong)headerSize || size > (ulong)data.Length)
-        {
-            throw new InvalidDataException($"Invalid size {size} for box '{Box.Name(type)}'.");
-        }
-
-        payload = data[headerSize..(int)size];
-        data = data[(int)size..];
-        return true;
+        var reader = new IsoBoxReader(data);
+        bool found = reader.TryRead(out var header, out payload);
+        type = header.Type;
+        data = reader.Remaining;
+        return found;
     }
 
     private static bool FindChild(ReadOnlySpan<byte> parent, uint wanted, out ReadOnlySpan<byte> payload)
@@ -1334,11 +1310,10 @@ internal sealed class Mp4Demuxer : IDemuxer
                     return sizes;
                 }
 
-                Require(_stsz, 12 + (4 * count), "stsz");
-                for (int i = 0; i < count; i++)
-                {
-                    sizes[i] = SampleSize(ReadUInt32(_stsz, 12 + (4 * i)));
-                }
+                Require(_stsz, checked(12 + (sizeof(uint) * count)), "stsz");
+                Mp4BigEndian.ReadUInt32s(_stsz.AsSpan(12), MemoryMarshal.Cast<int, uint>(sizes));
+                foreach (int size in sizes)
+                    if (size < 0) throw new InvalidDataException($"Sample size {(uint)size} is too large.");
 
                 return sizes;
             }

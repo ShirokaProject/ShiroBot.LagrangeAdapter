@@ -18,6 +18,7 @@ namespace ManagedCodecs.H264;
 /// </remarks>
 internal sealed class H264Decoder : IVideoDecoder
 {
+    private const int MaxCoverPictureMacroblocks = (4096 / 16) * (2304 / 16);
     private readonly Dictionary<int, SequenceParameterSet> _sps = [];
     private readonly Dictionary<int, PictureParameterSet> _pps = [];
     private readonly ReferenceList _references = new();
@@ -32,6 +33,7 @@ internal sealed class H264Decoder : IVideoDecoder
     // borrows them (output is a copy, see Crop, unless BorrowFrames), and so is the per-macroblock
     // state, as long as the picture size stays the same.
     private readonly List<Picture> _pictures = [];
+    private Picture? _reusablePicture;
 
     // The planes of copied frames, back from frames the caller disposed.
     private readonly VideoFramePool _framePool = new();
@@ -126,6 +128,20 @@ internal sealed class H264Decoder : IVideoDecoder
         _containerHeight = stream.Height;
         _stream = stream;
     }
+
+    // Only the serial cover decoder passes a picture between streams. Keep the cache to one
+    // 8-bit 4:2:0 picture, with at most the macroblock area of a 4096 × 2304 frame.
+    internal H264Decoder(VideoStreamInfo stream, Picture? reusablePicture) : this(stream)
+    {
+        _reusablePicture = reusablePicture;
+    }
+
+    internal Picture? CoverPictureForReuse => _pictures.Find(static picture =>
+        picture.BitDepth == 8 && picture.MbWidthC == 8 && picture.MbHeightC == 8 &&
+        (long)picture.WidthInMbs * picture.HeightInMbs <= MaxCoverPictureMacroblocks);
+
+    internal VideoFrame? TakeQueuedCoverFrame(long pts) =>
+        _lengthSize > 0 && _firstField is null ? _output.TakeSingleCoverFrame(pts) : null;
 
     /// <summary>
     /// Return frames that point into the decoder's own pictures instead of copies, which saves a
@@ -1106,7 +1122,18 @@ internal sealed class H264Decoder : IVideoDecoder
         var picture = _pictures.Find(p => Fits(p) && !_references.Contains(p) && !_output.Holds(p) && !InUse(p));
         if (picture is null)
         {
-            picture = new Picture(sps.WidthInMbs, sps.HeightInMbs, sps.MbHeightC, sps.BitDepthLuma, sps.MbWidthC, sps.SeparateColourPlanes);
+            var reusable = _reusablePicture;
+            _reusablePicture = null;
+            if (reusable is not null && Fits(reusable))
+            {
+                picture = reusable;
+                // A damaged slice must never expose pixels from a different video.
+                picture.ClearSamples();
+            }
+            else
+            {
+                picture = new Picture(sps.WidthInMbs, sps.HeightInMbs, sps.MbHeightC, sps.BitDepthLuma, sps.MbWidthC, sps.SeparateColourPlanes);
+            }
             _pictures.Add(picture);
         }
 

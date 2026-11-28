@@ -19,6 +19,7 @@ internal static class HighwayUploadChecks
 {
     internal static async Task Run()
     {
+        await CheckUploadHashesAsync();
         var content = new byte[1024 * 1024 + 17];
         new Random(41).NextBytes(content);
         await CheckImageUploadResponsesAsync();
@@ -58,6 +59,70 @@ internal static class HighwayUploadChecks
         await CheckHighwayShutdownAsync(content);
         await CheckFlashTransferShutdownAsync(content);
         Console.WriteLine("Remote image download, FlashTransfer and Highway upload, retry, cancellation and shutdown checks passed.");
+    }
+
+    private static async Task CheckUploadHashesAsync()
+    {
+        const int sampleSize = 10 * 1024 * 1024;
+        const int prefixSize = 10_002_432;
+        var assembly = typeof(BotContext).Assembly;
+        var triSha = assembly.GetType("Lagrange.Core.Utility.Cryptography.TriSha1Provider")!
+            .GetMethod("CalculateTriSha1", [typeof(Stream)])!;
+        var prefixMd5 = assembly.GetType("Lagrange.Core.Internal.Logic.OperationLogic")!
+            .GetMethod("HashFilePrefixAsync", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var data = new byte[3 * sampleSize + 137];
+        new Random(42).NextBytes(data);
+        var lengthSuffix = new byte[sizeof(long)];
+
+        foreach (var length in new[] { 0, 65_539, 3 * sampleSize, data.Length })
+        {
+            using var stream = new MemoryStream(data, 0, length);
+            if (length != 0) stream.Position = 1;
+            var prefix = await (Task<byte[]>)prefixMd5.Invoke(null, [stream, CancellationToken.None])!;
+            if (stream.Position != 0 ||
+                !prefix.AsSpan().SequenceEqual(MD5.HashData(data.AsSpan(0, Math.Min(length, prefixSize)))))
+                throw new Exception($"File prefix MD5 changed for {length} bytes.");
+
+            using var expected = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+            if (length <= 3 * sampleSize)
+                expected.AppendData(data, 0, length);
+            else
+            {
+                expected.AppendData(data, 0, sampleSize);
+                expected.AppendData(data, (length - sampleSize) / 2, sampleSize);
+                expected.AppendData(data, length - sampleSize, sampleSize);
+            }
+            BinaryPrimitives.WriteInt64LittleEndian(lengthSuffix, length);
+            expected.AppendData(lengthSuffix);
+            if (length != 0) stream.Position = 1;
+            var actual = (byte[])triSha.Invoke(null, [stream])!;
+            if (stream.Position != 0 || !actual.AsSpan().SequenceEqual(expected.GetHashAndReset()))
+                throw new Exception($"File Tri-SHA1 changed for {length} bytes.");
+        }
+
+        var cancellableTriSha = triSha.DeclaringType!.GetMethod("CalculateTriSha1", [typeof(Stream), typeof(CancellationToken)])!;
+        using var cancellation = new CancellationTokenSource();
+        using var interrupted = new CancelAfterReadStream(data, cancellation);
+        try
+        {
+            cancellableTriSha.Invoke(null, [interrupted, cancellation.Token]);
+            throw new Exception("Tri-SHA1 ignored cancellation during the file read.");
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is OperationCanceledException)
+        {
+            if (interrupted.Position != 0)
+                throw new Exception("Cancelled Tri-SHA1 did not rewind the file.");
+        }
+    }
+
+    private sealed class CancelAfterReadStream(byte[] data, CancellationTokenSource cancellation) : MemoryStream(data)
+    {
+        public override int Read(Span<byte> buffer)
+        {
+            var count = base.Read(buffer);
+            cancellation.Cancel();
+            return count;
+        }
     }
 
     private static void InstallSession(object highway, byte[] ticket, params string[] urls)
