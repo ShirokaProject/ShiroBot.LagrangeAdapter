@@ -5,9 +5,10 @@ namespace ManagedCodecs.H264;
 
 /// <summary>
 /// A decoded picture in macroblock-aligned planes (4:2:0, 4:2:2, 4:4:4, or luma alone in monochrome), with its motion
-/// field (which direct prediction of later B pictures reads) and its reference marking state.
+/// field (which direct prediction of later B pictures reads) and its reference marking state. Samples and motion live in
+/// native memory (<see cref="NativeBuffer{T}"/>), handed back by <see cref="Dispose"/>.
 /// </summary>
-internal sealed class Picture
+internal sealed class Picture : IDisposable
 {
     public Picture(int widthInMbs, int heightInMbs, int mbHeightC = 8, int bitDepth = 8, int mbWidthC = 8, bool separatePlanes = false)
     {
@@ -21,16 +22,16 @@ internal sealed class Picture
         int lumaSize = LumaStride * heightInMbs * 16;
         int chromaSize = ChromaStride * heightInMbs * mbHeightC;
         _planes = bitDepth > 8
-            ? [new ushort[lumaSize], new ushort[chromaSize], new ushort[chromaSize]]
-            : [new byte[lumaSize], new byte[chromaSize], new byte[chromaSize]];
+            ? [new NativeBuffer<ushort>(lumaSize), new NativeBuffer<ushort>(chromaSize), new NativeBuffer<ushort>(chromaSize)]
+            : [new NativeBuffer<byte>(lumaSize), new NativeBuffer<byte>(chromaSize), new NativeBuffer<byte>(chromaSize)];
 
         int mbCount = widthInMbs * heightInMbs;
-        MvX = [new short[mbCount * 16], new short[mbCount * 16]];
-        MvY = [new short[mbCount * 16], new short[mbCount * 16]];
-        RefIdx = [new sbyte[mbCount * 4], new sbyte[mbCount * 4]];
-        RefId = [new long[mbCount * 4], new long[mbCount * 4]];
-        RefParity = [new sbyte[mbCount * 4], new sbyte[mbCount * 4]];
-        FieldMb = new bool[mbCount];
+        MvX = NativeBuffers.Pair<short>(mbCount * 16);
+        MvY = NativeBuffers.Pair<short>(mbCount * 16);
+        RefIdx = NativeBuffers.Pair<sbyte>(mbCount * 4);
+        RefId = NativeBuffers.Pair<long>(mbCount * 4);
+        RefParity = NativeBuffers.Pair<sbyte>(mbCount * 4);
+        FieldMb = new NativeBuffer<bool>(mbCount);
         Frame = this;
         Whole = this;
         Parity = -1;
@@ -55,14 +56,14 @@ internal sealed class Picture
         HeightInMbs = frame.HeightInMbs;
         BitDepth = frame.BitDepth;
         LumaStride = frame.LumaStride;
-        Array none = BitDepth > 8 ? Array.Empty<ushort>() : Array.Empty<byte>();
+        object none = BitDepth > 8 ? NativeBuffer<ushort>.Empty : NativeBuffer<byte>.Empty;
         _planes = [frame._planes[plane], none, none];
-        MvX = [new short[mbCount * 16], new short[mbCount * 16]];
-        MvY = [new short[mbCount * 16], new short[mbCount * 16]];
-        RefIdx = [new sbyte[mbCount * 4], new sbyte[mbCount * 4]];
-        RefId = [new long[mbCount * 4], new long[mbCount * 4]];
-        RefParity = [new sbyte[mbCount * 4], new sbyte[mbCount * 4]];
-        FieldMb = new bool[mbCount];
+        MvX = NativeBuffers.Pair<short>(mbCount * 16);
+        MvY = NativeBuffers.Pair<short>(mbCount * 16);
+        RefIdx = NativeBuffers.Pair<sbyte>(mbCount * 4);
+        RefId = NativeBuffers.Pair<long>(mbCount * 4);
+        RefParity = NativeBuffers.Pair<sbyte>(mbCount * 4);
+        FieldMb = new NativeBuffer<bool>(mbCount);
         Frame = frame;
         Whole = this;
         Parity = -1;
@@ -120,8 +121,8 @@ internal sealed class Picture
     /// <summary>Whether the frame is decoded as three colour planes (<see cref="ColourPlane"/>).</summary>
     public bool SeparatePlanes => Frame._colourPlanes is not null;
 
-    // The Y, Cb and Cr planes: byte[] for 8-bit samples, ushort[] for deeper ones.
-    private readonly Array[] _planes;
+    // The Y, Cb and Cr planes: NativeBuffer<byte> for 8-bit samples, NativeBuffer<ushort> for deeper ones.
+    private readonly object[] _planes;
     private Picture? _top;
     private Picture? _bottom;
     private readonly Picture[]? _colourPlanes;
@@ -150,11 +151,11 @@ internal sealed class Picture
     public int BitDepth { get; }
 
     /// <summary>The 8-bit planes (<see cref="BitDepth"/> 8).</summary>
-    public byte[] Y => (byte[])_planes[0];
+    public NativeBuffer<byte> Y => (NativeBuffer<byte>)_planes[0];
 
-    public byte[] Cb => (byte[])_planes[1];
+    public NativeBuffer<byte> Cb => (NativeBuffer<byte>)_planes[1];
 
-    public byte[] Cr => (byte[])_planes[2];
+    public NativeBuffer<byte> Cr => (NativeBuffer<byte>)_planes[2];
 
     /// <summary>
     /// Identifies the picture decoded into this object; pictures are reused once they stop being
@@ -187,7 +188,7 @@ internal sealed class Picture
     }
 
     /// <summary>Per macroblock (MBAFF addresses): coded as a field macroblock; all false outside MBAFF frames.</summary>
-    public bool[] FieldMb { get; }
+    public NativeBuffer<bool> FieldMb { get; }
 
     /// <summary>
     /// Whether the frame's macroblocks are stored by pair (MBAFF addresses for <see cref="FieldMb"/>
@@ -196,21 +197,21 @@ internal sealed class Picture
     public bool Mbaff { get; set; }
 
     /// <summary>Motion vector per list (0, 1) and luma 4x4 block, in quarter samples.</summary>
-    public short[][] MvX { get; }
+    public NativeBuffer<short>[] MvX { get; }
 
-    public short[][] MvY { get; }
+    public NativeBuffer<short>[] MvY { get; }
 
     /// <summary>Reference index per list and 8x8 block; -1 where the list is not used (and in intra macroblocks).</summary>
-    public sbyte[][] RefIdx { get; }
+    public NativeBuffer<sbyte>[] RefIdx { get; }
 
     /// <summary><see cref="Id"/> of the referenced picture per list and 8x8 block, where <see cref="RefIdx"/> is not -1.</summary>
-    public long[][] RefId { get; }
+    public NativeBuffer<long>[] RefId { get; }
 
     /// <summary>
     /// Which field of <see cref="RefId"/> the block refers to (0 top, 1 bottom) where the block
     /// predicts from a field (field macroblocks, field pictures); -1 where from a frame.
     /// </summary>
-    public sbyte[][] RefParity { get; }
+    public NativeBuffer<sbyte>[] RefParity { get; }
 
     public int FrameNum { get; set; }
 
@@ -259,14 +260,6 @@ internal sealed class Picture
         Long,
     }
 
-    internal void ClearSamples()
-    {
-        foreach (var plane in _planes)
-        {
-            Array.Clear(plane);
-        }
-    }
-
     public int LongTermFrameIdx { get; set; }
 
     /// <summary>
@@ -289,18 +282,28 @@ internal sealed class Picture
     {
         for (int c = 0; c < 3; c++)
         {
-            var plane = (Array)_planes[c];
-            if (source is not null)
+            if (_planes[c] is NativeBuffer<ushort> wide)
             {
-                Array.Copy((Array)source.Frame._planes[c], plane, plane.Length);
-            }
-            else if (plane is ushort[] wide)
-            {
-                Array.Fill(wide, (ushort)(1 << (BitDepth - 1)));
+                if (source is not null)
+                {
+                    ((NativeBuffer<ushort>)source.Frame._planes[c]).Span[..wide.Length].CopyTo(wide.Span);
+                }
+                else
+                {
+                    wide.Fill((ushort)(1 << (BitDepth - 1)));
+                }
             }
             else
             {
-                Array.Fill((byte[])plane, (byte)128);
+                var plane = (NativeBuffer<byte>)_planes[c];
+                if (source is not null)
+                {
+                    ((NativeBuffer<byte>)source.Frame._planes[c]).Span[..plane.Length].CopyTo(plane.Span);
+                }
+                else
+                {
+                    plane.Fill(128);
+                }
             }
         }
 
@@ -317,25 +320,55 @@ internal sealed class Picture
     {
         for (int list = 0; list < 2; list++)
         {
-            Array.Clear(MvX[list]);
-            Array.Clear(MvY[list]);
-            Array.Fill(RefIdx[list], (sbyte)-1);
-            Array.Clear(RefId[list]);
-            Array.Clear(RefParity[list]);
+            MvX[list].Clear();
+            MvY[list].Clear();
+            RefIdx[list].Fill(-1);
+            RefId[list].Clear();
+            RefParity[list].Clear();
         }
 
-        Array.Clear(FieldMb);
+        FieldMb.Clear();
         Mbaff = false;
         CodedAsFields = false;
     }
 
-    public byte[] Plane(int component) => (byte[])_planes[component];
+    public NativeBuffer<byte> Plane(int component) => (NativeBuffer<byte>)_planes[component];
 
     /// <summary>Plane <paramref name="component"/> (0 Y, 1 Cb, 2 Cr) as samples of <typeparamref name="TPixel"/>, byte or ushort as <see cref="BitDepth"/> says.</summary>
-    public TPixel[] Plane<TPixel>(int component)
+    public NativeBuffer<TPixel> Plane<TPixel>(int component)
+        where TPixel : unmanaged
     {
-        Debug.Assert(_planes[component] is TPixel[], "The sample type does not match the bit depth.");
-        return Unsafe.As<TPixel[]>(_planes[component]);
+        Debug.Assert(_planes[component] is NativeBuffer<TPixel>, "The sample type does not match the bit depth.");
+        return Unsafe.As<NativeBuffer<TPixel>>(_planes[component]);
+    }
+
+    /// <summary>
+    /// Frees the frame's samples and motion (and its colour planes' motion). Called on the frame, once nothing decodes
+    /// into it, predicts from it or borrows it; afterwards every buffer is empty.
+    /// </summary>
+    public void Dispose()
+    {
+        Debug.Assert(Frame == this, "Only a frame owns its buffers.");
+        foreach (var plane in _planes)
+        {
+            ((IDisposable)plane).Dispose();
+        }
+
+        DisposeMotion();
+        foreach (var plane in _colourPlanes ?? [])
+        {
+            plane.DisposeMotion();
+        }
+    }
+
+    private void DisposeMotion()
+    {
+        NativeBuffers.Dispose(MvX);
+        NativeBuffers.Dispose(MvY);
+        NativeBuffers.Dispose(RefIdx);
+        NativeBuffers.Dispose(RefId);
+        NativeBuffers.Dispose(RefParity);
+        FieldMb.Dispose();
     }
 
     // ---- Decoding progress, for frame threading (H264Decoder.Threads) ----
@@ -386,18 +419,29 @@ internal sealed class Picture
         var frame = Frame;
         for (int c = 0; c < 3; c++)
         {
-            var plane = frame._planes[c];
             int stride = c == 0 ? LumaStride : ChromaStride;
-            if (plane.Length == 0 || stride == 0)
+            if (frame._planes[c] is NativeBuffer<ushort> wide)
             {
-                continue;
+                CopyOtherFieldRows(wide.Span, stride, parity);
             }
+            else
+            {
+                CopyOtherFieldRows(((NativeBuffer<byte>)frame._planes[c]).Span, stride, parity);
+            }
+        }
+    }
 
-            int rows = plane.Length / stride;
-            for (int y = parity; y < rows; y += 2)
-            {
-                Array.Copy(plane, (y ^ 1) * stride, plane, y * stride, stride);
-            }
+    private static void CopyOtherFieldRows<T>(Span<T> plane, int stride, int parity)
+    {
+        if (plane.Length == 0 || stride == 0)
+        {
+            return;
+        }
+
+        int rows = plane.Length / stride;
+        for (int y = parity; y < rows; y += 2)
+        {
+            plane.Slice((y ^ 1) * stride, stride).CopyTo(plane.Slice(y * stride, stride));
         }
     }
 

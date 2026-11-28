@@ -19,6 +19,14 @@ internal sealed class SeparatePlanesDecoder : IPictureDecoder
         _planes = planes;
     }
 
+    public void Dispose()
+    {
+        foreach (var plane in _planes)
+        {
+            plane.Dispose();
+        }
+    }
+
     /// <inheritdoc/>
     public SequenceParameterSet Sps => _planes[0].Sps;
 

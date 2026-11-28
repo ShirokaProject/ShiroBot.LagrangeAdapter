@@ -54,7 +54,7 @@ internal sealed partial class PictureDecoder<TPixel>
 
     // Per macroblock, once its deblocking has looked at it: inter, one block of motion in each list
     // and no luma coefficients (HasUniformMotionWithoutCoefficients), for its neighbours' edges.
-    private bool[]? _uniformMb;
+    private NativeBuffer<bool>? _uniformMb;
 
     // The edge parameters of the slice deblocked last (8-bit 4:2:0 frames).
 #if NET
@@ -159,7 +159,7 @@ internal sealed partial class PictureDecoder<TPixel>
         Span<byte> vertical = stackalloc byte[16];
         Span<byte> horizontal = stackalloc byte[16];
 
-        _uniformMb ??= new bool[_mbCount];
+        _uniformMb ??= new NativeBuffer<bool>(_mbCount);
         for (int mbAddr = firstRow * _widthInMbs; mbAddr < endRow * _widthInMbs; mbAddr++)
         {
             // Kept for every macroblock, filtered or not, before its right and lower neighbours read it.
@@ -234,7 +234,7 @@ internal sealed partial class PictureDecoder<TPixel>
                     _edgeTables = new EdgeTables(slice);
                 }
 
-                FilterMacroblock420(Unsafe.As<byte[]>(PlaneY), Unsafe.As<byte[]>(PlaneCb), Unsafe.As<byte[]>(PlaneCr), lumaOrigin, lumaStride, chromaOrigin, chromaStride, vertical, horizontal, qpLeft, qpAbove, qp, _edgeTables);
+                FilterMacroblock420(Unsafe.As<NativeBuffer<byte>>(PlaneY), Unsafe.As<NativeBuffer<byte>>(PlaneCb), Unsafe.As<NativeBuffer<byte>>(PlaneCr), lumaOrigin, lumaStride, chromaOrigin, chromaStride, vertical, horizontal, qpLeft, qpAbove, qp, _edgeTables);
                 continue;
             }
 #endif
@@ -280,12 +280,12 @@ internal sealed partial class PictureDecoder<TPixel>
     /// slice's <see cref="EdgeTables"/> and the vector filters called directly. The two must agree
     /// (<c>Macroblock420_MatchesEdgeByEdge</c>).
     /// </summary>
-    internal static void FilterMacroblock420(byte[] y, byte[] cb, byte[] cr, int lumaOrigin, int lumaStride, int chromaOrigin, int chromaStride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, SliceInfo slice) =>
+    internal static void FilterMacroblock420(NativeBuffer<byte> y, NativeBuffer<byte> cb, NativeBuffer<byte> cr, int lumaOrigin, int lumaStride, int chromaOrigin, int chromaStride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, SliceInfo slice) =>
         FilterMacroblock420(y, cb, cr, lumaOrigin, lumaStride, chromaOrigin, chromaStride, vertical, horizontal, qpLeft, qpAbove, qp, new EdgeTables(slice));
 #endif
 
 #if NET
-    private static void FilterMacroblock420(byte[] y, byte[] cb, byte[] cr, int lumaOrigin, int lumaStride, int chromaOrigin, int chromaStride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, EdgeTables tables)
+    private static void FilterMacroblock420(NativeBuffer<byte> y, NativeBuffer<byte> cb, NativeBuffer<byte> cr, int lumaOrigin, int lumaStride, int chromaOrigin, int chromaStride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, EdgeTables tables)
     {
         // Edge parameters by (qpP + qpQ + 1) >> 1, for the luma or chroma QPs of the two sides.
         var parameters = tables.Parameters;
@@ -364,7 +364,7 @@ internal sealed partial class PictureDecoder<TPixel>
             FilterChromaRows(cb, cr, chromaOrigin + (4 * chromaStride), chromaStride, SegmentLanes(horizontal[8..], ChromaSegments), parameters[cb0], parameters[cr0]);
         }
 
-        static void LumaColumn(byte[] plane, int q0, int stride, ReadOnlySpan<byte> strengths, in EdgeParameters parameters) =>
+        static void LumaColumn(NativeBuffer<byte> plane, int q0, int stride, ReadOnlySpan<byte> strengths, in EdgeParameters parameters) =>
             FilterColumns(plane, plane, q0 - 4, q0 - 4 + (8 * stride), stride, SegmentLanes(strengths, LumaSegments), parameters, parameters, chroma: false);
     }
 #endif
@@ -405,7 +405,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// filter: luma, or a 4:4:4 chroma component. The QPs are of the left, upper and current
     /// macroblocks (the QP_C of the component for chroma).
     /// </summary>
-    private void FilterLumaEdges(TPixel[] plane, int origin, int stride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, SliceInfo slice)
+    private void FilterLumaEdges(NativeBuffer<TPixel> plane, int origin, int stride, ReadOnlySpan<byte> vertical, ReadOnlySpan<byte> horizontal, int qpLeft, int qpAbove, int qp, SliceInfo slice)
     {
         for (int edge = 0; edge < 4; edge++)
         {
@@ -937,7 +937,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// or of i / 4 with <paramref name="segmentShift"/> 2 (vertical edges of 4:2:2 chroma). Samples
     /// of <paramref name="bitDepth"/> bits; the vector version takes 8-bit ones.
     /// </summary>
-    internal static void FilterEdge(TPixel[] plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int qpP, int qpQ, int alphaOffset, int betaOffset, bool chroma, bool vectorized = true, int segmentShift = 0, int bitDepth = 8)
+    internal static void FilterEdge(NativeBuffer<TPixel> plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int qpP, int qpQ, int alphaOffset, int betaOffset, bool chroma, bool vectorized = true, int segmentShift = 0, int bitDepth = 8)
     {
         if (segmentShift == 0)
         {
@@ -964,12 +964,12 @@ internal sealed partial class PictureDecoder<TPixel>
 #if NET
         if (typeof(TPixel) == typeof(byte) && vectorized && Vector128.IsHardwareAccelerated)
         {
-            FilterEdgeVector(Unsafe.As<byte[]>(plane), q0, across, along, length, strengths, segmentShift, indexA, alpha, beta, chroma);
+            FilterEdgeVector(Unsafe.As<NativeBuffer<byte>>(plane), q0, across, along, length, strengths, segmentShift, indexA, alpha, beta, chroma);
         }
         else if (typeof(TPixel) == typeof(ushort) && vectorized && Vector128.IsHardwareAccelerated && bitDepth <= 12)
         {
             // 16-bit lanes: the widest sum (8 samples and a rounding term, 8-479) fits up to 12 bits.
-            FilterEdgeVector16(Unsafe.As<ushort[]>(plane), q0, across, along, length, strengths, segmentShift, indexA, alpha, beta, chroma, bitDepth);
+            FilterEdgeVector16(Unsafe.As<NativeBuffer<ushort>>(plane), q0, across, along, length, strengths, segmentShift, indexA, alpha, beta, chroma, bitDepth);
         }
         else
 #endif
@@ -979,7 +979,7 @@ internal sealed partial class PictureDecoder<TPixel>
     }
 
     /// <summary>The filter of 8.7.2.3 / 8.7.2.4 sample by sample; the reference for the vector version.</summary>
-    private static void FilterEdgeScalar(TPixel[] plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
+    private static void FilterEdgeScalar(NativeBuffer<TPixel> plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
     {
         for (int i = 0; i < length; i++)
         {
@@ -998,7 +998,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// on in steps of <paramref name="qStep"/> (the two sides differ where an MBAFF frame macroblock
     /// meets a field macroblock).
     /// </summary>
-    private static void FilterSamples(TPixel[] plane, int p0, int pStep, int q0, int qStep, int bS, int indexA, int alpha, int beta, bool chroma, int bitDepth)
+    private static void FilterSamples(NativeBuffer<TPixel> plane, int p0, int pStep, int q0, int qStep, int bS, int indexA, int alpha, int beta, bool chroma, int bitDepth)
     {
         int max = Samples.Max<TPixel>(bitDepth);
         int p0v = Samples.ToInt(plane[p0]);
@@ -1087,7 +1087,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// (p3 .. q3) loaded as rows (horizontal edges) or transposed from them (vertical ones),
     /// filtered in 16-bit lanes with per-lane bS, and written back.
     /// </summary>
-    private static void FilterEdgeVector(byte[] plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma)
+    private static void FilterEdgeVector(NativeBuffer<byte> plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma)
     {
         var parameters = new EdgeParameters(indexA, alpha, beta);
 
@@ -1112,7 +1112,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// results clipped to its largest value.
     /// </summary>
     [SkipLocalsInit]
-    private static void FilterEdgeVector16(ushort[] plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
+    private static void FilterEdgeVector16(NativeBuffer<ushort> plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
     {
         if (FilterEdgeRegisters16(plane, q0, across, along, length, strengths, segmentShift, indexA, alpha, beta, chroma, bitDepth))
         {
@@ -1168,7 +1168,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// load as they are, a vertical edge's through an 8x8 transpose (p3 .. q3 side by side in a row). False, with
     /// nothing changed, where the edge doesn't fit (a length not a multiple of 8, or rows outside the plane).
     /// </summary>
-    private static bool FilterEdgeRegisters16(ushort[] plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
+    private static bool FilterEdgeRegisters16(NativeBuffer<ushort> plane, int q0, int across, int along, int length, ReadOnlySpan<byte> strengths, int segmentShift, int indexA, int alpha, int beta, bool chroma, int bitDepth)
     {
         bool columns = across == 1;
         int reach = chroma && !columns ? 2 : 4;
@@ -1182,7 +1182,7 @@ internal sealed partial class PictureDecoder<TPixel>
         var maxV = Vector128.Create((short)((1 << bitDepth) - 1));
         var alphaV = Vector128.Create((short)alpha);
         var betaV = Vector128.Create((short)beta);
-        ref short origin = ref Unsafe.As<ushort, short>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(plane), q0));
+        ref short origin = ref Unsafe.As<ushort, short>(ref Unsafe.Add(ref plane.DataReference, q0));
         for (int h = 0; h < length; h += 8)
         {
             EdgeLanes t = default;
@@ -1323,7 +1323,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// <see cref="FilterEdge"/> on each component.
     /// </summary>
     [SkipLocalsInit]
-    internal static void FilterChromaEdge(TPixel[] cbPlane, TPixel[] crPlane, int q0, int across, int along, ReadOnlySpan<byte> strengths, int qpPCb, int qpQCb, int qpPCr, int qpQCr, int alphaOffset, int betaOffset, bool vectorized = true, int bitDepth = 8)
+    internal static void FilterChromaEdge(NativeBuffer<TPixel> cbPlane, NativeBuffer<TPixel> crPlane, int q0, int across, int along, ReadOnlySpan<byte> strengths, int qpPCb, int qpQCb, int qpPCr, int qpQCr, int alphaOffset, int betaOffset, bool vectorized = true, int bitDepth = 8)
     {
         if (MemoryMarshal.Read<uint>(strengths) == 0)
         {
@@ -1341,8 +1341,8 @@ internal sealed partial class PictureDecoder<TPixel>
         }
 
 #if NET
-        byte[] cb = Unsafe.As<byte[]>(cbPlane);
-        byte[] cr = Unsafe.As<byte[]>(crPlane);
+        NativeBuffer<byte> cb = Unsafe.As<NativeBuffer<byte>>(cbPlane);
+        NativeBuffer<byte> cr = Unsafe.As<NativeBuffer<byte>>(crPlane);
         var cbParameters = ChromaParameters(qpPCb, qpQCb, alphaOffset, betaOffset, out bool cbFiltered);
         var crParameters = ChromaParameters(qpPCr, qpQCr, alphaOffset, betaOffset, out bool crFiltered);
         if (!cbFiltered && !crFiltered)
@@ -1597,7 +1597,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// A horizontal edge of 16 or 8 8-bit samples, filtered in place: the rows p3 .. q3 (luma) or
     /// p1 .. q1 (chroma) loaded whole from the plane.
     /// </summary>
-    private static void FilterRows(byte[] plane, int q0, int stride, int length, Vector128<byte> bs, in EdgeParameters parameters, bool chroma)
+    private static void FilterRows(NativeBuffer<byte> plane, int q0, int stride, int length, Vector128<byte> bs, in EdgeParameters parameters, bool chroma)
     {
         // Rows q0 - reach * stride .. q0 + (reach - 1) * stride, length bytes each.
         int reach = chroma ? 2 : 4;
@@ -1607,7 +1607,7 @@ internal sealed partial class PictureDecoder<TPixel>
         }
 
         // With 8 samples the upper lanes hold zeros: filtered (or not) for nothing, and never stored.
-        ref byte origin = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(plane), q0);
+        ref byte origin = ref Unsafe.Add(ref plane.DataReference, q0);
         EdgeBytes taps = default;
         if (!chroma)
         {
@@ -1679,7 +1679,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// edges the same way, 4:2:0's Cb in the top half and Cr in the bottom, two rows to a segment,
     /// each with its own parameters (<paramref name="low"/> for lanes 0-7, <paramref name="high"/> for 8-15).
     /// </summary>
-    private static void FilterColumns(byte[] top, byte[] bottom, int start, int bottomStart, int stride, Vector128<byte> bs, in EdgeParameters low, in EdgeParameters high, bool chroma)
+    private static void FilterColumns(NativeBuffer<byte> top, NativeBuffer<byte> bottom, int start, int bottomStart, int stride, Vector128<byte> bs, in EdgeParameters low, in EdgeParameters high, bool chroma)
     {
         // Eight rows of eight bytes from each start.
         if (start < 0 || bottomStart < 0 || start + (7 * stride) + 8 > top.Length || bottomStart + (7 * stride) + 8 > bottom.Length)
@@ -1687,8 +1687,8 @@ internal sealed partial class PictureDecoder<TPixel>
             throw new ArgumentOutOfRangeException(nameof(start));
         }
 
-        ref byte upper = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(top), start);
-        ref byte lower = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(bottom), bottomStart);
+        ref byte upper = ref Unsafe.Add(ref top.DataReference, start);
+        ref byte lower = ref Unsafe.Add(ref bottom.DataReference, bottomStart);
         var taps = Columns<NativeZip>(ref upper, ref lower, stride);
         if (!FilterBytes(ref taps, bs, low, high, chroma))
         {
@@ -1701,7 +1701,7 @@ internal sealed partial class PictureDecoder<TPixel>
 
 #if NET
     /// <summary>The 4:2:0 chroma edge of 8 rows or columns of Cb (lanes 0-7) and Cr (lanes 8-15), filtered in place.</summary>
-    private static void FilterChromaRows(byte[] cb, byte[] cr, int q0, int stride, Vector128<byte> bs, in EdgeParameters low, in EdgeParameters high)
+    private static void FilterChromaRows(NativeBuffer<byte> cb, NativeBuffer<byte> cr, int q0, int stride, Vector128<byte> bs, in EdgeParameters low, in EdgeParameters high)
     {
         // Rows p1 .. q1, eight bytes each.
         if (q0 - (2 * stride) < 0 || q0 + stride + 8 > cb.Length || q0 + stride + 8 > cr.Length)
@@ -1709,8 +1709,8 @@ internal sealed partial class PictureDecoder<TPixel>
             throw new ArgumentOutOfRangeException(nameof(q0));
         }
 
-        ref byte b = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(cb), q0);
-        ref byte r = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(cr), q0);
+        ref byte b = ref Unsafe.Add(ref cb.DataReference, q0);
+        ref byte r = ref Unsafe.Add(ref cr.DataReference, q0);
         EdgeBytes taps = default;
         taps.P1 = Pair(ref Unsafe.Subtract(ref b, 2 * stride), ref Unsafe.Subtract(ref r, 2 * stride));
         taps.P0 = Pair(ref Unsafe.Subtract(ref b, stride), ref Unsafe.Subtract(ref r, stride));
@@ -2015,7 +2015,7 @@ internal sealed partial class PictureDecoder<TPixel>
     /// <see cref="Columns"/> with <see cref="PortableZip"/>, into <paramref name="taps"/> (tap k at
     /// k * 16): the transpose WebAssembly runs, tested against its definition on x64 and ARM64 too.
     /// </summary>
-    internal static void TransposeInVector128(byte[] top, int topStart, byte[] bottom, int bottomStart, int stride, Span<byte> taps)
+    internal static void TransposeInVector128(NativeBuffer<byte> top, int topStart, NativeBuffer<byte> bottom, int bottomStart, int stride, Span<byte> taps)
     {
         var columns = Columns<PortableZip>(ref top[topStart], ref bottom[bottomStart], stride);
         ReadOnlySpan<Vector128<byte>> rows = [columns.P3, columns.P2, columns.P1, columns.P0, columns.Q0, columns.Q1, columns.Q2, columns.Q3];
@@ -2025,7 +2025,7 @@ internal sealed partial class PictureDecoder<TPixel>
 
 #if NET
     /// <summary><see cref="WriteColumns"/> with <see cref="PortableZip"/>, from taps as <see cref="TransposeInVector128"/> writes them.</summary>
-    internal static void TransposeOutVector128(ReadOnlySpan<byte> taps, byte[] top, int topStart, byte[] bottom, int bottomStart, int stride)
+    internal static void TransposeOutVector128(ReadOnlySpan<byte> taps, NativeBuffer<byte> top, int topStart, NativeBuffer<byte> bottom, int bottomStart, int stride)
     {
         EdgeBytes columns;
         columns.P3 = Vector128.Create(taps[..16]);

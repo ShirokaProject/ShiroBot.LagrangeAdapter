@@ -20,7 +20,7 @@ internal static partial class InterPrediction
     /// is at (<paramref name="x"/>, <paramref name="y"/>) in the picture, with a motion vector in
     /// quarter samples, into <paramref name="dest"/> at the same position.
     /// </summary>
-    public static void PredictLumaReference<TPixel>(Picture reference, TPixel[] dest, int stride, int x, int y, int width, int height, int mvX, int mvY)
+    public static void PredictLumaReference<TPixel>(Picture reference, NativeBuffer<TPixel> dest, int stride, int x, int y, int width, int height, int mvX, int mvY)
         where TPixel : unmanaged =>
         PredictLumaReference(reference, x, y, width, height, mvX, mvY, dest.AsSpan((y * stride) + x), stride);
 
@@ -34,7 +34,7 @@ internal static partial class InterPrediction
     {
         var (origin, stride, maxY) = Plane(reference, reference.LumaStride, reference.HeightInMbs * 16);
         int maxX = (reference.WidthInMbs * 16) - 1;
-        TPixel[] src = reference.Plane<TPixel>(component);
+        NativeBuffer<TPixel> src = reference.Plane<TPixel>(component);
         int max = Samples.Max<TPixel>(reference.BitDepth);
         int xFrac = mvX & 3;
         int yFrac = mvY & 3;
@@ -87,7 +87,7 @@ internal static partial class InterPrediction
     /// a motion vector in eighth chroma samples (8.4.2.2.2): the luma vector in 4:2:0; in 4:2:2,
     /// whose chroma has the luma's rows, its vertical component doubled.
     /// </summary>
-    public static void PredictChromaReference<TPixel>(Picture reference, int component, TPixel[] dest, int stride, int x, int y, int width, int height, int mvX, int mvY)
+    public static void PredictChromaReference<TPixel>(Picture reference, int component, NativeBuffer<TPixel> dest, int stride, int x, int y, int width, int height, int mvX, int mvY)
         where TPixel : unmanaged =>
         PredictChromaReference(reference, component, x, y, width, height, mvX, mvY, dest.AsSpan((y * stride) + x), stride);
 
@@ -97,7 +97,7 @@ internal static partial class InterPrediction
     {
         var (origin, stride, maxY) = Plane(reference, reference.ChromaStride, reference.HeightInMbs * reference.MbHeightC);
         int maxX = (reference.WidthInMbs * 8) - 1;
-        TPixel[] src = reference.Plane<TPixel>(component);
+        NativeBuffer<TPixel> src = reference.Plane<TPixel>(component);
         int xFrac = mvX & 7;
         int yFrac = mvY & 7;
 

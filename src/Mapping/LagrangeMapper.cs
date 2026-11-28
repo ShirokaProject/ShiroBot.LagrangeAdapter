@@ -487,7 +487,13 @@ public static partial class LagrangeMapper
             if (resources is not null)
                 foreach (var stream in downloaded) resources.Add(stream!);
             completed = true;
-            return new MultiMsgEntity(messages);
+            return new MultiMsgEntity(messages)
+            {
+                Title = forward.Title,
+                Preview = forward.Preview,
+                Summary = forward.Summary,
+                Prompt = forward.Prompt
+            };
         }
         finally
         {
@@ -503,39 +509,11 @@ public static partial class LagrangeMapper
 
     private static async Task<Stream> DownloadForwardImageAsync(string uri, CancellationToken token)
     {
-        var host = new Uri(uri).IdnHost;
         await ForwardImageDownloadSlots.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            for (var attempt = 1; ; attempt++)
-            {
-                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-                deadline.CancelAfter(ForwardImageInactivityTimeout);
-                try
-                {
-                    return await OpenHttpResourceAsync(uri, deadline.Token, deadline).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
-                {
-                    if (attempt == 2)
-                        throw new TimeoutException($"Downloading a forwarded image from {host} timed out after two attempts.");
-                }
-                catch (HttpRequestException exception)
-                {
-                    if (attempt == 2 || exception.StatusCode is { } status && (int)status < 500 &&
-                        status is not (System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests))
-                    {
-                        var reason = exception.StatusCode is { } response ? $"HTTP {(int)response}" : "connection error";
-                        throw new HttpRequestException($"Downloading a forwarded image from {host} failed ({reason}).", statusCode: exception.StatusCode, inner: null);
-                    }
-                }
-                catch (HttpIOException)
-                {
-                    if (attempt == 2)
-                        throw new HttpRequestException($"Downloading a forwarded image from {host} failed while reading the response.");
-                }
-                await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
-            }
+            return await DownloadHttpResourceAsync(uri, bufferResponse: false, forwardedImage: true, token)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -595,13 +573,60 @@ public static partial class LagrangeMapper
         }
 
         if (!IsHttpResource(uri)) return File.OpenRead(uri);
-        if (bufferHttpResponse)
-            return new MemoryStream(await ResourceClient.GetByteArrayAsync(uri, cancellationToken).ConfigureAwait(false));
-
-        return await OpenHttpResourceAsync(uri, cancellationToken).ConfigureAwait(false);
+        return await DownloadHttpResourceAsync(uri, bufferHttpResponse, forwardedImage: false, cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    private static async Task<Stream> OpenHttpResourceAsync(string uri, CancellationToken cancellationToken,
+    private static async Task<Stream> DownloadHttpResourceAsync(string uri, bool bufferResponse, bool forwardedImage,
+        CancellationToken cancellationToken)
+    {
+        string host = new Uri(uri).IdnHost;
+        string resource = forwardedImage ? "a forwarded image" : "media";
+        for (int attempt = 1; ; attempt++)
+        {
+            using var deadline = forwardedImage ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+            deadline?.CancelAfter(ForwardImageInactivityTimeout);
+            var token = deadline?.Token ?? cancellationToken;
+            try
+            {
+                return bufferResponse
+                    ? new MemoryStream(await ResourceClient.GetByteArrayAsync(uri, token).ConfigureAwait(false))
+                    : await ReadHttpResourceAsync(uri, token, deadline).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested &&
+                (deadline?.IsCancellationRequested == true || exception.InnerException is TimeoutException))
+            {
+                if (attempt == 2)
+                    throw new TimeoutException($"Downloading {resource} from {host} timed out after two attempts.");
+            }
+            catch (HttpRequestException exception)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (attempt == 2 || !IsTransientDownloadFailure(exception))
+                {
+                    var reason = exception.StatusCode is { } status ? $"HTTP {(int)status}" : exception.HttpRequestError.ToString();
+                    throw new HttpRequestException(exception.HttpRequestError,
+                        $"Downloading {resource} from {host} failed ({reason}).", inner: null, exception.StatusCode);
+                }
+            }
+            catch (HttpIOException exception)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (attempt == 2)
+                    throw new HttpRequestException(exception.HttpRequestError,
+                        $"Downloading {resource} from {host} failed while reading the response.");
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsTransientDownloadFailure(HttpRequestException exception) =>
+        exception.StatusCode is { } status
+            ? status is System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests || (int)status >= 500
+            : exception.HttpRequestError is HttpRequestError.Unknown or HttpRequestError.NameResolutionError or
+                HttpRequestError.ConnectionError or HttpRequestError.ResponseEnded;
+
+    private static async Task<Stream> ReadHttpResourceAsync(string uri, CancellationToken cancellationToken,
         CancellationTokenSource? inactivityDeadline = null)
     {
         using var response = await ResourceClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)

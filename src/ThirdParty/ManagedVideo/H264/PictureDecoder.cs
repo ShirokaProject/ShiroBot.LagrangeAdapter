@@ -17,7 +17,7 @@ internal enum MbKind : byte
 internal sealed record SliceInfo(int DisableDeblockingFilterIdc, int AlphaOffset, int BetaOffset, int CbQpOffset, int CrQpOffset);
 
 /// <summary>A <see cref="PictureDecoder{TPixel}"/> of either sample type, as <see cref="H264Decoder"/> holds it.</summary>
-internal interface IPictureDecoder
+internal interface IPictureDecoder : IDisposable
 {
     SequenceParameterSet Sps { get; }
 
@@ -62,8 +62,8 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
 
     // Each macroblock address's column and row (of a pair address in MBAFF frames and field pictures), so that
     // placing a macroblock takes no division.
-    private readonly int[] _mbColumn;
-    private readonly int[] _mbRow;
+    private readonly NativeBuffer<int> _mbColumn;
+    private readonly NativeBuffer<int> _mbRow;
 
     // MbWidthC and MbHeightC (8 or 16) and the chroma 4x4 blocks of a component (4 or 8). In
     // 4:4:4 (ChromaArrayType 3) Cb and Cr are coded and reconstructed as luma is, each with its
@@ -89,20 +89,20 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
     private readonly int _plane;
 
     // Per macroblock.
-    private readonly int[] _sliceOfMb;
-    private readonly MbKind[] _kind;
-    private readonly int[] _qp;
-    private readonly bool[] _transform8x8;
+    private readonly NativeBuffer<int> _sliceOfMb;
+    private readonly NativeBuffer<MbKind> _kind;
+    private readonly NativeBuffer<int> _qp;
+    private readonly NativeBuffer<bool> _transform8x8;
 
     // Per macroblock the addresses of A, B, C and D (left, above, above right, above left; 6.4.9) inside the picture,
     // -1 outside it: whether they are in the same slice is checked when they are asked for.
-    private readonly int[] _neighborMbs;
+    private readonly NativeBuffer<int> _neighborMbs;
 
     // Per 4x4 block: TotalCoeff of luma (and in 4:4:4 of Cb and Cr, as luma blocks), of 4:2:0 and 4:2:2 chroma.
-    private readonly byte[][] _totalCoeff;
-    private readonly byte[] _totalCoeffLuma;
-    private readonly byte[] _totalCoeffChroma;
-    private readonly sbyte[] _intra4x4Mode;
+    private readonly NativeBuffer<byte>[] _totalCoeff;
+    private readonly NativeBuffer<byte> _totalCoeffLuma;
+    private readonly NativeBuffer<byte> _totalCoeffChroma;
+    private readonly NativeBuffer<sbyte> _intra4x4Mode;
 
     private readonly List<SliceInfo> _slices = [];
 
@@ -138,11 +138,11 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
         _bitDepth = sps.BitDepthLuma;
         _qpBdOffset = 6 * (_bitDepth - 8);
 
-        _sliceOfMb = new int[_mbCount];
-        Array.Fill(_sliceOfMb, -1);
-        _neighborMbs = new int[_mbCount * 4];
-        _mbColumn = new int[_mbCount];
-        _mbRow = new int[_mbCount];
+        _sliceOfMb = new NativeBuffer<int>(_mbCount);
+        _sliceOfMb.Fill(-1);
+        _neighborMbs = new NativeBuffer<int>(_mbCount * 4);
+        _mbColumn = new NativeBuffer<int>(_mbCount);
+        _mbRow = new NativeBuffer<int>(_mbCount);
         for (int mb = 0; mb < _mbCount; mb++)
         {
             int mbX = mb % _widthInMbs;
@@ -155,17 +155,36 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
             _neighborMbs[(mb * 4) + 3] = above && mbX > 0 ? mb - _widthInMbs - 1 : -1;
         }
 
-        _kind = new MbKind[_mbCount];
-        _qp = new int[_mbCount];
-        _transform8x8 = new bool[_mbCount];
-        _totalCoeff = _chroma444 ? [new byte[_mbCount * 16], new byte[_mbCount * 16], new byte[_mbCount * 16]] : [new byte[_mbCount * 16], [], []];
+        _kind = new NativeBuffer<MbKind>(_mbCount);
+        _qp = new NativeBuffer<int>(_mbCount);
+        _transform8x8 = new NativeBuffer<bool>(_mbCount);
+        _totalCoeff = _chroma444
+            ? [new NativeBuffer<byte>(_mbCount * 16), new NativeBuffer<byte>(_mbCount * 16), new NativeBuffer<byte>(_mbCount * 16)]
+            : [new NativeBuffer<byte>(_mbCount * 16), NativeBuffer<byte>.Empty, NativeBuffer<byte>.Empty];
         _totalCoeffLuma = _totalCoeff[0];
         _residuals = _chroma444 ? [_residual, new(), new()] : [_residual];
-        _totalCoeffChroma = new byte[_mbCount * 16];
-        _intra4x4Mode = new sbyte[_mbCount * 16];
+        _totalCoeffChroma = new NativeBuffer<byte>(_mbCount * 16);
+        _intra4x4Mode = new NativeBuffer<sbyte>(_mbCount * 16);
 
         InitInter();
         InitCabacState();
+    }
+
+    /// <summary>Frees the per-macroblock state (native memory); the decoder decodes nothing after it.</summary>
+    public void Dispose()
+    {
+        foreach (var buffer in (IDisposable?[])[
+            _sliceOfMb, _neighborMbs, _mbColumn, _mbRow, _kind, _qp, _transform8x8, _totalCoeffChroma, _intra4x4Mode,
+            _direct, _cbp, _chromaPredMode, _dcCoded, _directMb, _uniformMb,
+            _predictionL0, _predictionL1, _scratchY, _scratchCb, _scratchCr])
+        {
+            buffer?.Dispose();
+        }
+
+        foreach (var buffers in (NativeBuffer<byte>[][])[_totalCoeff, _refHandle, .. _absMvd])
+        {
+            NativeBuffers.Dispose(buffers);
+        }
     }
 
     /// <summary>The current picture's SPS; another one of the same size may follow, so <see cref="Begin"/> sets it.</summary>
@@ -175,11 +194,11 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
     public Picture Picture { get; private set; } = null!;
 
     // The current picture's planes as samples of TPixel.
-    private TPixel[] PlaneY => Picture.Plane<TPixel>(0);
+    private NativeBuffer<TPixel> PlaneY => Picture.Plane<TPixel>(0);
 
-    private TPixel[] PlaneCb => Picture.Plane<TPixel>(1);
+    private NativeBuffer<TPixel> PlaneCb => Picture.Plane<TPixel>(1);
 
-    private TPixel[] PlaneCr => Picture.Plane<TPixel>(2);
+    private NativeBuffer<TPixel> PlaneCr => Picture.Plane<TPixel>(2);
 
     public int DecodedMbCount { get; private set; }
 
@@ -225,16 +244,16 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
         }
 
         picture.Damaged = false;
-        Array.Fill(_sliceOfMb, -1);
-        Array.Clear(_kind);
-        Array.Clear(_qp);
-        Array.Clear(_transform8x8);
-        Array.Clear(_totalCoeff[0]);
-        Array.Clear(_totalCoeff[1]);
-        Array.Clear(_totalCoeff[2]);
-        Array.Clear(_totalCoeffChroma);
-        Array.Clear(_intra4x4Mode);
-        Array.Fill(_fieldMb, fieldParity >= 0); // a frame coded as fields: all field macroblocks, by pair
+        _sliceOfMb.Fill(-1);
+        _kind.Clear();
+        _qp.Clear();
+        _transform8x8.Clear();
+        _totalCoeff[0].Clear();
+        _totalCoeff[1].Clear();
+        _totalCoeff[2].Clear();
+        _totalCoeffChroma.Clear();
+        _intra4x4Mode.Clear();
+        _fieldMb.Fill(fieldParity >= 0); // a frame coded as fields: all field macroblocks, by pair
         picture.Mbaff = fieldParity >= 0;
         picture.CodedAsFields = fieldParity >= 0;
         ResetInter(picture);
@@ -1012,7 +1031,7 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
     };
 
     /// <summary>The plane, first sample and row stride of a component of a target.</summary>
-    private static (TPixel[] Plane, int Origin, int Stride) ComponentOf(in MbTarget target, int component) => component switch
+    private static (NativeBuffer<TPixel> Plane, int Origin, int Stride) ComponentOf(in MbTarget target, int component) => component switch
     {
         0 => (target.Y, target.YOrigin, target.YStride),
         1 => (target.Cb, target.COrigin, target.CStride),
@@ -1130,7 +1149,7 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
     /// with its DC level in place, summed over the whole 16x16 block for vertical or horizontal prediction.
     /// </summary>
     [SkipLocalsInit]
-    private void AddBypass16x16(int mbAddr, Residual residual, byte[] counts, int predMode16x16, Span<TPixel> dest, int stride)
+    private void AddBypass16x16(int mbAddr, Residual residual, NativeBuffer<byte> counts, int predMode16x16, Span<TPixel> dest, int stride)
     {
         Span<int> r = stackalloc int[256];
         for (int i = 0; i < 16; i++)
@@ -1189,7 +1208,7 @@ internal sealed partial class PictureDecoder<TPixel> : IPictureDecoder
             // QP'C (8.5.11): QP_C plus QpBdOffsetC (the same as luma's here: equal bit depths).
             int qpc = ChromaQp(_qp[mbAddr], c == 0 ? slice.Pps.ChromaQpIndexOffset : slice.Pps.SecondChromaQpIndexOffset, _qpBdOffset) + _qpBdOffset;
             var levelScale = slice.Scaling.LevelScale4x4((intraMode >= 0 ? 1 : 4) + c); // Intra or Inter Cb, Cr
-            TPixel[] plane = c == 0 ? target.Cb : target.Cr;
+            NativeBuffer<TPixel> plane = c == 0 ? target.Cb : target.Cr;
             if (intraMode >= 0)
             {
                 IntraPrediction.PredictChroma(intraMode, plane, origin, stride, new IntraNeighbors(LeftChromaRows(0), mbs.B, mbs.C, mbs.D), _bitDepth, LeftChromaBlocks(), _mbHeightC);

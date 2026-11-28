@@ -13,7 +13,7 @@ internal static partial class InterPrediction
     // The largest luma block is 16x16; its 6-tap filters need 2 samples before and 3 after.
     private const int WindowStride = 16 + 5;
 
-    /// <summary>Same output as <see cref="PredictLumaReference{TPixel}(Picture, TPixel[], int, int, int, int, int, int, int)"/>.</summary>
+    /// <summary>Same output as <see cref="PredictLumaReference{TPixel}(Picture, NativeBuffer<TPixel>, int, int, int, int, int, int, int)"/>.</summary>
     public static void PredictLuma(Picture reference, byte[] dest, int stride, int x, int y, int width, int height, int mvX, int mvY) =>
         PredictLuma(reference, x, y, width, height, mvX, mvY, dest.AsSpan((y * stride) + x), stride);
 
@@ -162,10 +162,10 @@ internal static partial class InterPrediction
         int stride = reference.LumaStride;
         int row = y + (phase * 4);
         int column = x + 64;
-        byte[] luma = reference.Y;
+        NativeBuffer<byte> luma = reference.Y;
         if ((uint)column < (uint)stride && row >= 0 && ((row + 4) * stride) <= luma.Length)
         {
-            byte* p = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(luma), (row * stride) + column));
+            byte* p = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref luma.DataReference, (row * stride) + column));
             Sse.Prefetch0(p);
             Sse.Prefetch0(p + stride);
             Sse.Prefetch0(p + (2 * stride));
@@ -175,12 +175,12 @@ internal static partial class InterPrediction
         int chromaStride = reference.ChromaStride;
         int chromaRow = (y >> 1) + (phase * 2);
         int chromaColumn = column >> 1;
-        byte[] cb = reference.Cb;
+        NativeBuffer<byte> cb = reference.Cb;
         if ((uint)chromaColumn < (uint)chromaStride && chromaRow >= 0 && ((chromaRow + 2) * chromaStride) <= cb.Length)
         {
             int offset = (chromaRow * chromaStride) + chromaColumn;
-            byte* b = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(cb), offset));
-            byte* r = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(reference.Cr), offset));
+            byte* b = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref cb.DataReference, offset));
+            byte* r = (byte*)Unsafe.AsPointer(ref Unsafe.Add(ref reference.Cr.DataReference, offset));
             Sse.Prefetch0(b);
             Sse.Prefetch0(b + chromaStride);
             Sse.Prefetch0(r);
@@ -188,7 +188,7 @@ internal static partial class InterPrediction
         }
     }
 
-    /// <summary>Same output as <see cref="PredictChromaReference{TPixel}(Picture, int, TPixel[], int, int, int, int, int, int, int)"/>.</summary>
+    /// <summary>Same output as <see cref="PredictChromaReference{TPixel}(Picture, int, NativeBuffer<TPixel>, int, int, int, int, int, int, int)"/>.</summary>
     public static void PredictChroma(Picture reference, int component, byte[] dest, int stride, int x, int y, int width, int height, int mvX, int mvY) =>
         PredictChroma(reference, component, x, y, width, height, mvX, mvY, dest.AsSpan((y * stride) + x), stride);
 

@@ -177,7 +177,7 @@ internal static partial class InterPrediction
     /// of the plane at <paramref name="origin"/>, each coordinate clamped to the picture, into
     /// <paramref name="window"/> as ints.
     /// </summary>
-    private static void FetchClamped<TPixel>(TPixel[] plane, int origin, int stride, int maxX, int maxY, int left, int top, int width, int height, Span<int> window, int windowStride)
+    private static void FetchClamped<TPixel>(NativeBuffer<TPixel> plane, int origin, int stride, int maxX, int maxY, int left, int top, int width, int height, Span<int> window, int windowStride)
         where TPixel : unmanaged
     {
         bool inside = left >= 0 && left + width - 1 <= maxX;

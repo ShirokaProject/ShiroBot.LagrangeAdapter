@@ -14,10 +14,15 @@ namespace ManagedCodecs;
 /// allocating and collecting them; a disposed frame's samples must not be used again, and
 /// <see cref="Planes"/>, <see cref="GetRow"/> and <see cref="WritePacked"/> throw.
 /// </para>
+/// <para>
+/// A borrowed frame on a decoder's native planes (<see cref="NativeBuffer{T}"/>) has no <see cref="Planes"/> arrays: read
+/// it through <see cref="GetRow"/>.
+/// </para>
 /// </remarks>
 internal sealed class VideoFrame : IDisposable
 {
     private readonly byte[][] _planes;
+    private readonly INativeBytes[]? _nativePlanes;
     private readonly VideoFramePool? _pool;
     private bool _disposed;
 
@@ -85,6 +90,39 @@ internal sealed class VideoFrame : IDisposable
         Offsets = offsets;
     }
 
+    /// <summary>
+    /// Wraps a decoder's native planes without copying, as the array constructor does arrays. The planes are read as
+    /// bytes, so those of the formats deeper than 8 bits are buffers of 16-bit words (little-endian in memory).
+    /// </summary>
+    internal VideoFrame(int width, int height, PixelFormat format, INativeBytes[] planes, int[] strides, int[] offsets)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
+        int count = format.PlaneCount();
+        if (planes.Length != count || strides.Length != count || offsets.Length != count)
+        {
+            throw new ArgumentException($"{format} has {count} planes.");
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            var (planeWidth, planeHeight) = format.PlaneSize(i, width, height);
+            planeWidth *= format.BytesPerSample();
+            if (strides[i] < planeWidth || offsets[i] < 0 || offsets[i] + ((planeHeight - 1) * (long)strides[i]) + planeWidth > planes[i].ByteLength)
+            {
+                throw new ArgumentException($"Plane {i} does not hold {planeWidth}x{planeHeight} samples at offset {offsets[i]}, stride {strides[i]}.");
+            }
+        }
+
+        Width = width;
+        Height = height;
+        Format = format;
+        _planes = [];
+        _nativePlanes = planes;
+        Strides = strides;
+        Offsets = offsets;
+    }
+
     /// <summary>Visible width in luma samples.</summary>
     public int Width { get; }
 
@@ -96,7 +134,9 @@ internal sealed class VideoFrame : IDisposable
 
     /// <summary>The planes (Y, or Y, Cb and Cr), each a byte array laid out by <see cref="Strides"/> and <see cref="Offsets"/>.</summary>
     /// <exception cref="ObjectDisposedException">The frame was disposed.</exception>
-    public byte[][] Planes => _disposed ? throw new ObjectDisposedException(nameof(VideoFrame)) : _planes;
+    /// <exception cref="NotSupportedException">The frame borrows native planes (read it through <see cref="GetRow"/>).</exception>
+    public byte[][] Planes => _disposed ? throw new ObjectDisposedException(nameof(VideoFrame))
+        : _nativePlanes is not null ? throw new NotSupportedException("The frame borrows native planes; read it by row.") : _planes;
 
     /// <summary>Bytes from one row of each plane to the next.</summary>
     public int[] Strides { get; }
@@ -200,7 +240,10 @@ internal sealed class VideoFrame : IDisposable
         var (planeWidth, planeHeight) = Format.PlaneSize(plane, Width, Height);
         ArgumentOutOfRangeException.ThrowIfNegative(y);
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(y, planeHeight);
-        return Planes[plane].AsSpan(Offsets[plane] + (y * Strides[plane]), planeWidth * Format.BytesPerSample());
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int start = Offsets[plane] + (y * Strides[plane]);
+        int length = planeWidth * Format.BytesPerSample();
+        return _nativePlanes is { } native ? native[plane].Bytes.Slice(start, length) : _planes[plane].AsSpan(start, length);
     }
 
     /// <summary>
@@ -210,7 +253,8 @@ internal sealed class VideoFrame : IDisposable
     public void WritePacked(Stream destination)
     {
         ArgumentNullException.ThrowIfNull(destination);
-        for (int plane = 0; plane < Planes.Length; plane++)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        for (int plane = 0; plane < Format.PlaneCount(); plane++)
         {
             var (_, planeHeight) = Format.PlaneSize(plane, Width, Height);
             for (int y = 0; y < planeHeight; y++)

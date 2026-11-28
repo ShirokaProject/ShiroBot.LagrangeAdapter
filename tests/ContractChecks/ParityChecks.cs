@@ -18,10 +18,12 @@ internal static class ParityChecks
         MapEntryBoundsChecks();
         WriterBoundsChecks();
         LightAppEncodingCheck();
+        await ForwardCardEncodingCheckAsync();
         ProtoBufferRetentionCheck();
         await SendFailureDiagnosticsAsync();
         await ForwardMediaPreparationChecks();
         await UnavailableForwardPushKeepsMessageAsync();
+        await IncomingImageRetryChecks.RunAsync();
         // Known protobuf wire fixtures, including unknown fixed fields and malformed lengths.
         var wire = new ProtoWire().UInt(1, 150).Text(2, "A").ToArray();
         Equal(wire, "089601120141");
@@ -444,7 +446,51 @@ internal static class ParityChecks
     private static void LightAppEncodingCheck()
     {
         const string payload = """{"app":"com.tencent.music.lua","view":"music","meta":{"music":{"title":"开不了口"}}}""";
-        var entity = new LightAppEntity(payload);
+        if (DecodeLightApp(new LightAppEntity(payload)) != payload)
+            throw new Exception("LightApp encoding changed the card JSON.");
+    }
+
+    private static async Task ForwardCardEncodingCheckAsync()
+    {
+        var nodes = Enumerable.Range(1, 5)
+            .Select(index => new QForwardedMessage("123", $"用户{index}", [new QOutgoingText($"消息{index}")]))
+            .ToArray();
+        var custom = new QOutgoingForward(nodes)
+        {
+            Title = "自定义标题",
+            Preview = ["预览一", "预览二"],
+            Summary = "自定义摘要",
+            Prompt = "自定义提示"
+        };
+
+        async Task<JsonObject> Encode(QOutgoingForward outgoing)
+        {
+            var entity = await LagrangeMapper.ToMultiMsgAsync(outgoing, _ => Task.FromResult<BotMessage?>(null));
+            typeof(MultiMsgEntity).GetProperty(nameof(MultiMsgEntity.ResId))!.SetValue(entity, "fixture-forward");
+            return JsonNode.Parse(DecodeLightApp(entity))!.AsObject();
+        }
+
+        var card = await Encode(custom);
+        var detail = card["meta"]!["detail"]!;
+        if ((string?)detail["source"] != "自定义标题" ||
+            (string?)detail["summary"] != "自定义摘要" ||
+            (string?)card["prompt"] != "自定义提示" ||
+            (string?)detail["resid"] != "fixture-forward" ||
+            !detail["news"]!.AsArray().Select(item => (string?)item!["text"]).SequenceEqual(custom.Preview))
+            throw new Exception("Custom forward card display was lost between mapping and encoding.");
+
+        card = await Encode(new QOutgoingForward(nodes));
+        detail = card["meta"]!["detail"]!;
+        if ((string?)detail["source"] != "聊天记录" ||
+            (string?)detail["summary"] != "查看4条转发消息" ||
+            (string?)card["prompt"] != "[聊天记录]" ||
+            !detail["news"]!.AsArray().Select(item => (string?)item!["text"])
+                .SequenceEqual(nodes.Take(4).Select((_, index) => $"用户{index + 1}: 消息{index + 1}")))
+            throw new Exception("Default forward card display changed when display fields were omitted.");
+    }
+
+    private static string DecodeLightApp(IMessageEntity entity)
+    {
         var build = typeof(IMessageEntity).GetMethod("Build", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var elements = (Array)build.Invoke(entity, null)!;
         var element = elements.GetValue(0)!;
@@ -452,8 +498,7 @@ internal static class ParityChecks
         var bytes = (ReadOnlyMemory<byte>)lightApp.GetType().GetProperty("BytesData")!.GetValue(lightApp)!;
         if (bytes.Span[0] != 1) throw new Exception("LightApp compression marker is missing.");
         var decoded = Lagrange.Core.Utility.Compression.ZCompression.ZDecompress(bytes.Span[1..]);
-        if (System.Text.Encoding.UTF8.GetString(decoded) != payload)
-            throw new Exception("LightApp encoding changed the card JSON.");
+        return System.Text.Encoding.UTF8.GetString(decoded);
     }
 
     private static void Equal(byte[] actual, string expected)

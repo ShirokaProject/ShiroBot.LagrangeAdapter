@@ -26,7 +26,7 @@ internal sealed partial class PictureDecoder<TPixel>
     // parity of the field picture being decoded (-1 for a frame).
     private bool _pairSlots;
     private int _fieldParity = -1;
-    private bool[] _fieldMb = [];
+    private NativeBuffer<bool> _fieldMb = NativeBuffer<bool>.Empty;
 
     // The current macroblock's pairs for Table 6-4 (AffPairsOf), and the slice they were found for.
     private AffPairs _affPairs = new(-1, false, -1, false, -1, false, -1, false, -1, false);
@@ -45,9 +45,9 @@ internal sealed partial class PictureDecoder<TPixel>
     // gathered around the macroblock (row 0 and column 0), then copies the result out.
     private const int ScratchLumaStride = 32;
     private const int ScratchChromaStride = 32;
-    private readonly TPixel[] _scratchY = new TPixel[ScratchLumaStride * 20];
-    private readonly TPixel[] _scratchCb = new TPixel[ScratchChromaStride * 20]; // row -1, 8 or 16 rows (4:2:2, 4:4:4), slack
-    private readonly TPixel[] _scratchCr = new TPixel[ScratchChromaStride * 20];
+    private readonly NativeBuffer<TPixel> _scratchY = new NativeBuffer<TPixel>(ScratchLumaStride * 20);
+    private readonly NativeBuffer<TPixel> _scratchCb = new NativeBuffer<TPixel>(ScratchChromaStride * 20); // row -1, 8 or 16 rows (4:2:2, 4:4:4), slack
+    private readonly NativeBuffer<TPixel> _scratchCr = new NativeBuffer<TPixel>(ScratchChromaStride * 20);
 
     // Inverse scans of field macroblocks (8.5.6, Tables 8-13 and 8-14), as raster indices.
     private static ReadOnlySpan<byte> Field4x4 => [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
@@ -75,7 +75,7 @@ internal sealed partial class PictureDecoder<TPixel>
     public FieldStatistics FieldStatistics { get; init; } = new();
 
     /// <summary>Where a macroblock is the planes being reconstructed into: the picture, or the MBAFF scratch.</summary>
-    private readonly record struct MbTarget(TPixel[] Y, int YOrigin, int YStride, TPixel[] Cb, TPixel[] Cr, int COrigin, int CStride);
+    private readonly record struct MbTarget(NativeBuffer<TPixel> Y, int YOrigin, int YStride, NativeBuffer<TPixel> Cb, NativeBuffer<TPixel> Cr, int COrigin, int CStride);
 
     /// <summary>Whether the macroblock is a field macroblock: of an MBAFF frame, or of a field picture (field scans and contexts, field geometry).</summary>
     private bool IsFieldMb(int mbAddr) => _pairSlots && _fieldMb[mbAddr];
@@ -697,7 +697,7 @@ internal sealed partial class PictureDecoder<TPixel>
         return new MbTarget(_scratchY, ScratchLumaStride + 1, ScratchLumaStride, _scratchCb, _scratchCr, ScratchChromaStride + 1, ScratchChromaStride);
     }
 
-    private void GatherPlane(int mbAddr, TPixel[] plane, TPixel[] scratch, int scratchStride, int maxW, int maxH, int topWidth)
+    private void GatherPlane(int mbAddr, NativeBuffer<TPixel> plane, NativeBuffer<TPixel> scratch, int scratchStride, int maxW, int maxH, int topWidth)
     {
         bool luma = plane == PlaneY;
         Copy(-1, -1);
@@ -785,7 +785,8 @@ internal sealed partial class PictureDecoder<TPixel>
         int step = _fieldParity >= 0 ? 2 : 1;
         if (_uniformMb is null || _uniformMb.Length < _fieldMb.Length)
         {
-            _uniformMb = new bool[_fieldMb.Length];
+            _uniformMb?.Dispose();
+            _uniformMb = new NativeBuffer<bool>(_fieldMb.Length);
         }
 
         for (int mbAddr = (firstRow * 2 * _widthInMbs) + first; mbAddr < endRow * 2 * _widthInMbs; mbAddr += step)
@@ -1195,7 +1196,7 @@ internal sealed partial class PictureDecoder<TPixel>
     }
 
     /// <summary>One luma line across an MBAFF macroblock edge, with the QPs of its two macroblocks.</summary>
-    private void FilterMbaffLine(TPixel[] plane, int p0, int pStep, int q0, int qStep, int bS, int qpP, int qpQ, SliceInfo slice, bool chroma)
+    private void FilterMbaffLine(NativeBuffer<TPixel> plane, int p0, int pStep, int q0, int qStep, int bS, int qpP, int qpQ, SliceInfo slice, bool chroma)
     {
         int qpAv = (qpP + qpQ + 1) >> 1;
         int indexA = Math.Clamp(qpAv + slice.AlphaOffset, 0, 51);

@@ -69,7 +69,8 @@ internal sealed class LagrangeSignClient : IDisposable
         catch (HttpRequestException ex)
         {
             // Network exceptions can contain the full URL, including a path Token.
-            throw new HttpRequestException(LagrangeSecrets.Redact(ex.Message, _options), null, ex.StatusCode);
+            throw new HttpRequestException(ex.HttpRequestError, LagrangeSecrets.Redact(ex.Message, _options),
+                inner: null, ex.StatusCode);
         }
     }
 

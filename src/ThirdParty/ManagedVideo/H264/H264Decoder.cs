@@ -16,9 +16,8 @@ namespace ManagedCodecs.H264;
 /// count, 8.2.1), held back as far as the stream's max_num_reorder_frames says reordering can
 /// reach; <see cref="Flush"/> returns the rest at the end.
 /// </remarks>
-internal sealed class H264Decoder : IVideoDecoder
+internal sealed class H264Decoder : IVideoDecoder, IDisposable
 {
-    private const int MaxCoverPictureMacroblocks = (4096 / 16) * (2304 / 16);
     private readonly Dictionary<int, SequenceParameterSet> _sps = [];
     private readonly Dictionary<int, PictureParameterSet> _pps = [];
     private readonly ReferenceList _references = new();
@@ -32,8 +31,10 @@ internal sealed class H264Decoder : IVideoDecoder
     // Pictures are reused once they are no longer references and no frame waiting for output
     // borrows them (output is a copy, see Crop, unless BorrowFrames), and so is the per-macroblock
     // state, as long as the picture size stays the same.
+    // Their samples and motion, and the decoders' per-macroblock state, are native memory, freed when a picture or
+    // decoder is dropped and by Dispose.
     private readonly List<Picture> _pictures = [];
-    private Picture? _reusablePicture;
+    private bool _disposed;
 
     // The planes of copied frames, back from frames the caller disposed.
     private readonly VideoFramePool _framePool = new();
@@ -129,17 +130,6 @@ internal sealed class H264Decoder : IVideoDecoder
         _stream = stream;
     }
 
-    // Only the serial cover decoder passes a picture between streams. Keep the cache to one
-    // 8-bit 4:2:0 picture, with at most the macroblock area of a 4096 × 2304 frame.
-    internal H264Decoder(VideoStreamInfo stream, Picture? reusablePicture) : this(stream)
-    {
-        _reusablePicture = reusablePicture;
-    }
-
-    internal Picture? CoverPictureForReuse => _pictures.Find(static picture =>
-        picture.BitDepth == 8 && picture.MbWidthC == 8 && picture.MbHeightC == 8 &&
-        (long)picture.WidthInMbs * picture.HeightInMbs <= MaxCoverPictureMacroblocks);
-
     internal VideoFrame? TakeQueuedCoverFrame(long pts) =>
         _lengthSize > 0 && _firstField is null ? _output.TakeSingleCoverFrame(pts) : null;
 
@@ -150,8 +140,8 @@ internal sealed class H264Decoder : IVideoDecoder
     /// picture into the same memory; copy what has to be kept longer. Its planes are the
     /// decoder's macroblock-aligned buffers (read rows through <see cref="VideoFrame.GetRow"/>, or
     /// with its offsets and strides), and they must not be written: later pictures predict from them.
-    /// Frames of more than 8 bits are copies all the same (the decoder keeps their samples as 16-bit
-    /// words, which a frame's byte planes cannot hold without one).
+    /// Frames of more than 8 bits are borrowed too: their planes are the decoder's 16-bit words, read
+    /// as little-endian bytes as <see cref="VideoFrame.GetRow"/> gives them.
     /// </summary>
     public bool BorrowFrames { get; init; }
 
@@ -231,6 +221,7 @@ internal sealed class H264Decoder : IVideoDecoder
     /// <summary>A picture's NAL units; a <paramref name="discard"/> picture (<see cref="Packet.Discard"/>) is decoded and gives no frame.</summary>
     private List<VideoFrame> Decode(ReadOnlySpan<byte> data, long pts, bool discard)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (BorrowFrames && Threads > 1)
         {
             throw new NotSupportedException("Borrowed frames with more than one thread are not supported.");
@@ -370,6 +361,7 @@ internal sealed class H264Decoder : IVideoDecoder
     /// <inheritdoc/>
     public IReadOnlyList<VideoFrame> Flush()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var frames = TakeHeld();
         try
         {
@@ -408,6 +400,51 @@ internal sealed class H264Decoder : IVideoDecoder
         {
             DrainOldest(frames);
         }
+    }
+
+    /// <summary>
+    /// Waits for the pictures being decoded, then frees every picture's samples and motion and every decoder's state. Frames
+    /// borrowed from the decoder (<see cref="BorrowFrames"/>) end with it: their rows read as empty.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        while (_inFlight.TryDequeue(out var job))
+        {
+            try
+            {
+                job.Wait();
+            }
+#pragma warning disable CA1031 // whatever decoding it threw, it has stopped touching its picture, freed below
+            catch (Exception)
+            {
+            }
+#pragma warning restore CA1031
+        }
+
+        StopThreads();
+        foreach (var decoder in _decoders)
+        {
+            decoder.Dispose();
+        }
+
+        _decoders.Clear();
+        foreach (var picture in _pictures)
+        {
+            picture.Dispose();
+        }
+
+        _pictures.Clear();
+        _references.Clear();
+        _output.Flush();
+        _lastReference = null;
+        _firstField = null;
+        _held = null;
     }
 
     /// <summary>Waits for the oldest picture being decoded and outputs it; rethrows what decoding it threw.</summary>
@@ -555,7 +592,7 @@ internal sealed class H264Decoder : IVideoDecoder
             return;
         }
 
-        bool borrow = BorrowFrames && picture.BitDepth == 8;
+        bool borrow = BorrowFrames;
         var frame = job.Frame ?? (borrow ? Borrow(picture, state.Sps, state.Size) : Crop(picture, state.Sps, state.Size));
         frame.Pts = job.Pts;
         frame.IsDamaged = picture.Damaged;
@@ -950,6 +987,11 @@ internal sealed class H264Decoder : IVideoDecoder
         {
             Drain(frames, all: true);
             StopThreads();
+            foreach (var old in _decoders)
+            {
+                old.Dispose();
+            }
+
             _decoders.Clear();
             _previousInterlaced = true;
         }
@@ -1118,22 +1160,20 @@ internal sealed class H264Decoder : IVideoDecoder
         // A picture whose frame was returned by the previous call may be reused: borrowed frames
         // are valid until the next call. One waiting in the output queue may not.
         bool Fits(Picture p) => FitsFormat(p, sps);
-        _pictures.RemoveAll(p => !Fits(p) && !_references.Contains(p) && !_output.Holds(p) && !InUse(p));
+        _pictures.RemoveAll(p =>
+        {
+            if (Fits(p) || _references.Contains(p) || _output.Holds(p) || InUse(p))
+            {
+                return false;
+            }
+
+            p.Dispose();
+            return true;
+        });
         var picture = _pictures.Find(p => Fits(p) && !_references.Contains(p) && !_output.Holds(p) && !InUse(p));
         if (picture is null)
         {
-            var reusable = _reusablePicture;
-            _reusablePicture = null;
-            if (reusable is not null && Fits(reusable))
-            {
-                picture = reusable;
-                // A damaged slice must never expose pixels from a different video.
-                picture.ClearSamples();
-            }
-            else
-            {
-                picture = new Picture(sps.WidthInMbs, sps.HeightInMbs, sps.MbHeightC, sps.BitDepthLuma, sps.MbWidthC, sps.SeparateColourPlanes);
-            }
+            picture = new Picture(sps.WidthInMbs, sps.HeightInMbs, sps.MbHeightC, sps.BitDepthLuma, sps.MbWidthC, sps.SeparateColourPlanes);
             _pictures.Add(picture);
         }
 
@@ -1243,22 +1283,29 @@ internal sealed class H264Decoder : IVideoDecoder
     private static VideoFrame Borrow(Picture picture, SequenceParameterSet sps, (int Width, int Height) size)
     {
         var (left, _, top, _) = sps.Crop;
-        int lumaOffset = (top * picture.LumaStride) + left;
         var format = FormatOf(picture);
+        // Strides and offsets count bytes: two a sample past 8 bits, whose planes hold 16-bit words.
+        int sampleBytes = format.BytesPerSample();
+        int lumaStride = picture.LumaStride * sampleBytes;
+        int lumaOffset = ((top * picture.LumaStride) + left) * sampleBytes;
         if (format.PlaneCount() == 1)
         {
-            return new VideoFrame(size.Width, size.Height, format, [picture.Y], [picture.LumaStride], [lumaOffset]);
+            return new VideoFrame(size.Width, size.Height, format, [NativePlane(picture, 0)], [lumaStride], [lumaOffset]);
         }
 
-        int chromaOffset = ((picture.MbHeightC == 16 ? top : top >> 1) * picture.ChromaStride) + (picture.MbWidthC == 16 ? left : left >> 1);
+        int chromaStride = picture.ChromaStride * sampleBytes;
+        int chromaOffset = (((picture.MbHeightC == 16 ? top : top >> 1) * picture.ChromaStride) + (picture.MbWidthC == 16 ? left : left >> 1)) * sampleBytes;
         return new VideoFrame(
             size.Width,
             size.Height,
             format,
-            [picture.Y, picture.Cb, picture.Cr],
-            [picture.LumaStride, picture.ChromaStride, picture.ChromaStride],
+            [NativePlane(picture, 0), NativePlane(picture, 1), NativePlane(picture, 2)],
+            [lumaStride, chromaStride, chromaStride],
             [lumaOffset, chromaOffset, chromaOffset]);
     }
+
+    private static INativeBytes NativePlane(Picture picture, int component) =>
+        picture.BitDepth == 8 ? picture.Plane<byte>(component) : picture.Plane<ushort>(component);
 
     private static PixelFormat FormatOf(Picture picture) =>
         PixelFormatExtensions.Of(picture.MbWidthC == 16 ? 3 : picture.MbHeightC switch { 0 => 0, 16 => 2, _ => 1 }, picture.BitDepth);

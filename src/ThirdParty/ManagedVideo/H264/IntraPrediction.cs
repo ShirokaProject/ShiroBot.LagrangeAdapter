@@ -20,7 +20,7 @@ internal static class IntraPrediction
     /// plane's neighbours; the other modes, and blocks too near the plane's ends for whole-row access, go to
     /// <see cref="Predict4x4Reference"/>, which IntraPredictionTests compares this with.
     /// </remarks>
-    public static void Predict4x4<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    public static void Predict4x4<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         if (mode > 2 || !RowsInside(plane, offset, stride, 4, 4))
@@ -81,7 +81,7 @@ internal static class IntraPrediction
 
     /// <summary>Intra_4x4 prediction by the equations, sample by sample: the reference for <see cref="Predict4x4"/>.</summary>
     [SkipLocalsInit]
-    internal static void Predict4x4Reference<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    internal static void Predict4x4Reference<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         // The edge layout of PredictBlock: p[-1, y] for y = 3..0 at e[4..7], p[-1, -1] at e[8],
@@ -126,7 +126,7 @@ internal static class IntraPrediction
     /// it with.
     /// </summary>
     [SkipLocalsInit]
-    public static void Predict8x8<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    public static void Predict8x8<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         if (mode <= 2 && RowsInside(plane, offset, stride, 8, 8))
@@ -142,7 +142,7 @@ internal static class IntraPrediction
 
     /// <summary>Intra_8x8 prediction by the equations, sample by sample: the reference for <see cref="Predict8x8"/>.</summary>
     [SkipLocalsInit]
-    internal static void Predict8x8Reference<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    internal static void Predict8x8Reference<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         Span<int> e = stackalloc int[25];
@@ -155,7 +155,7 @@ internal static class IntraPrediction
     /// p'[-1, y] at e[7 - y], p'[x, -1] at e[9 + x].
     /// </summary>
     [SkipLocalsInit]
-    private static void FilteredEdges8x8<TPixel>(TPixel[] plane, int offset, int stride, IntraNeighbors n, Span<int> e)
+    private static void FilteredEdges8x8<TPixel>(NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, Span<int> e)
         where TPixel : unmanaged
     {
         // p[-1, y] for y = 7..-1 then p[x, -1] for x = 0..15: p[-1, y] is e[7 - y], p[x, -1] is e[9 + x].
@@ -230,7 +230,7 @@ internal static class IntraPrediction
     /// <see cref="PredictBlockReference"/>. The caller checked that the block's rows, the row above with its top right
     /// and the top-left sample lie inside the plane.
     /// </summary>
-    private static void PredictFlat8x8<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    private static void PredictFlat8x8<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         // From the top-left sample and the column to the left, so that every offset is non-negative (as Predict4x4's).
@@ -329,7 +329,7 @@ internal static class IntraPrediction
     /// either size): p[-1, y] at e[7 - y] for y = -1..size - 1 and p[x, -1] at e[9 + x] for
     /// x = 0..2 * size - 1. The mode is chosen once for the whole block.
     /// </summary>
-    private static void PredictBlockReference<TPixel>(int size, int mode, ReadOnlySpan<int> e, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    private static void PredictBlockReference<TPixel>(int size, int mode, ReadOnlySpan<int> e, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         int last = size - 1;
@@ -503,7 +503,7 @@ internal static class IntraPrediction
     /// Intra_16x16 prediction (8.3.3), a row at a time (<see cref="PredictMacroblock"/>); blocks too near the plane's ends
     /// for whole-row access go to <see cref="Predict16x16Reference"/>, which IntraPredictionTests compares this with.
     /// </summary>
-    public static void Predict16x16<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    public static void Predict16x16<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged
     {
         if (RowsInside(plane, offset, stride, 16, 16))
@@ -517,7 +517,7 @@ internal static class IntraPrediction
     }
 
     /// <summary>Intra_16x16 prediction by the equations, sample by sample: the reference for <see cref="Predict16x16"/>.</summary>
-    internal static void Predict16x16Reference<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth)
+    internal static void Predict16x16Reference<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth)
         where TPixel : unmanaged =>
         PredictMacroblockReference(mode, plane, offset, stride, n, width: 16, height: 16, bitDepth);
 
@@ -527,7 +527,7 @@ internal static class IntraPrediction
     /// be used, where that differs from <see cref="IntraNeighbors.Left"/> (MBAFF with constrained
     /// intra prediction): only DC prediction treats the rows apart. -1: as Left says, for all.
     /// </param>
-    public static void PredictChroma<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth, int leftBlocks = -1, int height = 8)
+    public static void PredictChroma<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth, int leftBlocks = -1, int height = 8)
         where TPixel : unmanaged
     {
         // Chroma mode numbers differ from 16x16: 0 DC, 1 Horizontal, 2 Vertical, 3 Plane.
@@ -558,7 +558,7 @@ internal static class IntraPrediction
     }
 
     /// <summary>Chroma's horizontal, vertical and plane modes (1 to 3) by the equations: the reference for <see cref="PredictChroma"/>.</summary>
-    internal static void PredictChromaReference<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int bitDepth, int height = 8)
+    internal static void PredictChromaReference<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int bitDepth, int height = 8)
         where TPixel : unmanaged =>
         PredictMacroblockReference(LumaStyleMode(mode), plane, offset, stride, n, width: 8, height, bitDepth);
 
@@ -583,7 +583,7 @@ internal static class IntraPrediction
     /// copied or filled, the plane's samples stepped by its gradient along each row. The same values as
     /// <see cref="PredictMacroblockReference"/>; the caller checked that the block's rows lie inside the plane.
     /// </summary>
-    private static void PredictMacroblock<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int width, int height, int bitDepth)
+    private static void PredictMacroblock<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int width, int height, int bitDepth)
         where TPixel : unmanaged
     {
         // From the row above and the column to the left, so that every Unsafe.Add offset is non-negative (as Predict4x4's).
@@ -681,7 +681,7 @@ internal static class IntraPrediction
     }
 
     /// <summary>Vertical (0), Horizontal (1), DC (2, luma only) and Plane (3) for 16x16, 8x8 or 8x16, by the equations.</summary>
-    private static void PredictMacroblockReference<TPixel>(int mode, TPixel[] plane, int offset, int stride, IntraNeighbors n, int width, int height, int bitDepth)
+    private static void PredictMacroblockReference<TPixel>(int mode, NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int width, int height, int bitDepth)
         where TPixel : unmanaged
     {
         int Top(int x) => Samples.ToInt(plane[offset - stride + x]);
@@ -780,7 +780,7 @@ internal static class IntraPrediction
     /// Chroma DC, a row of each 4x4 block at a time, the top sums found once for all rows of blocks: the same values as
     /// <see cref="PredictChromaDcReference"/>; the caller checked that the block's rows lie inside the plane.
     /// </summary>
-    private static void PredictChromaDc<TPixel>(TPixel[] plane, int offset, int stride, IntraNeighbors n, int leftBlocks, int height, int bitDepth)
+    private static void PredictChromaDc<TPixel>(NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int leftBlocks, int height, int bitDepth)
         where TPixel : unmanaged
     {
         // From the row above and the column to the left, so that every offset is non-negative (as Predict4x4's).
@@ -843,7 +843,7 @@ internal static class IntraPrediction
     }
 
     /// <summary>Chroma DC (8.3.4.1-3): each 4x4 block gets its own average with its own fallbacks.</summary>
-    internal static void PredictChromaDcReference<TPixel>(TPixel[] plane, int offset, int stride, IntraNeighbors n, int leftBlocks, int height, int bitDepth)
+    internal static void PredictChromaDcReference<TPixel>(NativeBuffer<TPixel> plane, int offset, int stride, IntraNeighbors n, int leftBlocks, int height, int bitDepth)
         where TPixel : unmanaged
     {
         for (int yO = 0; yO < height; yO += 4)
@@ -892,7 +892,8 @@ internal static class IntraPrediction
     /// and its column to the left (the top-left sample, and 2 * width samples above for Intra_4x4's top right) lie
     /// inside <paramref name="plane"/>, so that the row-at-a-time paths may skip the array's bounds checks.
     /// </summary>
-    private static bool RowsInside<TPixel>(TPixel[] plane, int offset, int stride, int width, int height) =>
+    private static bool RowsInside<TPixel>(NativeBuffer<TPixel> plane, int offset, int stride, int width, int height)
+        where TPixel : unmanaged =>
         stride >= 2 * width && offset - stride - 1 >= 0 && offset + ((height - 1) * stride) + (2 * width) <= plane.Length;
 
     /// <summary>Copies <paramref name="count"/> (4, 8 or 16) samples from <paramref name="source"/> to <paramref name="destination"/>.</summary>

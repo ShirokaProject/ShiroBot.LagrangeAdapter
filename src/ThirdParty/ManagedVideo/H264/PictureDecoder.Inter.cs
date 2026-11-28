@@ -50,16 +50,16 @@ internal sealed partial class PictureDecoder<TPixel>
     // Per list (0, 1) and luma 4x4 block: motion vector in quarter samples; per list and 8x8 block:
     // reference index (-1 = list not used) and the referenced picture's Id. These are the current
     // picture's own arrays (Picture.MvX ...), kept for direct prediction of later pictures.
-    private short[][] _mvX = [[], []];
-    private short[][] _mvY = [[], []];
-    private sbyte[][] _refIdx = [[], []];
-    private long[][] _refId = [[], []];
-    private sbyte[][] _refParity = [[], []];
+    private NativeBuffer<short>[] _mvX = [NativeBuffer<short>.Empty, NativeBuffer<short>.Empty];
+    private NativeBuffer<short>[] _mvY = [NativeBuffer<short>.Empty, NativeBuffer<short>.Empty];
+    private NativeBuffer<sbyte>[] _refIdx = [NativeBuffer<sbyte>.Empty, NativeBuffer<sbyte>.Empty];
+    private NativeBuffer<long>[] _refId = [NativeBuffer<long>.Empty, NativeBuffer<long>.Empty];
+    private NativeBuffer<sbyte>[] _refParity = [NativeBuffer<sbyte>.Empty, NativeBuffer<sbyte>.Empty];
 
     // Per list and 8x8 block: the referenced picture, for motion compensation and deblocking, as its index in
     // _handlePictures (0: the list is unused). Bytes rather than references: no write barrier a partition, a quarter
     // of the memory to clear a picture, and a macroblock's four compared as one uint.
-    private byte[][] _refHandle = [[], []];
+    private NativeBuffer<byte>[] _refHandle = [NativeBuffer<byte>.Empty, NativeBuffer<byte>.Empty];
 
     // The pictures the current picture's partitions refer to (each view, frame or field, its own entry), from 1.
     // Every one is in the reference lists, so the decoded picture buffer bounds them (16 frames, 3 views each).
@@ -71,12 +71,12 @@ internal sealed partial class PictureDecoder<TPixel>
     private long _handlesOf = -1;
 
     // Per 8x8 block: predicted in direct mode (B_Skip, B_Direct_16x16, B_Direct_8x8).
-    private bool[] _direct = [];
+    private NativeBuffer<bool> _direct = NativeBuffer<bool>.Empty;
 
     // Bi-prediction: each list's prediction of one partition before they are averaged.
     // 16 x 16, and slack for whole-vector row reads (16 bytes) of a 4:2:2 Cr block at column 8 (PredictFromTwo).
-    private readonly TPixel[] _predictionL0 = new TPixel[(16 * 16) + 16];
-    private readonly TPixel[] _predictionL1 = new TPixel[(16 * 16) + 16];
+    private readonly NativeBuffer<TPixel> _predictionL0 = new NativeBuffer<TPixel>((16 * 16) + 16);
+    private readonly NativeBuffer<TPixel> _predictionL1 = new NativeBuffer<TPixel>((16 * 16) + 16);
 
     private enum PartitionShape
     {
@@ -87,8 +87,8 @@ internal sealed partial class PictureDecoder<TPixel>
 
     private void InitInter()
     {
-        _refHandle = [new byte[_mbCount * 4], new byte[_mbCount * 4]];
-        _direct = new bool[_mbCount * 4];
+        _refHandle = NativeBuffers.Pair<byte>(_mbCount * 4);
+        _direct = new NativeBuffer<bool>(_mbCount * 4);
     }
 
     /// <summary>
@@ -105,14 +105,14 @@ internal sealed partial class PictureDecoder<TPixel>
         _refParity = picture.RefParity;
         for (int list = 0; list < 2; list++)
         {
-            Array.Clear(_mvX[list]);
-            Array.Clear(_mvY[list]);
-            Array.Fill(_refIdx[list], (sbyte)-1);
-            Array.Clear(_refId[list]);
-            Array.Clear(_refHandle[list]);
+            _mvX[list].Clear();
+            _mvY[list].Clear();
+            _refIdx[list].Fill(-1);
+            _refId[list].Clear();
+            _refHandle[list].Clear();
         }
 
-        Array.Clear(_direct);
+        _direct.Clear();
         ResetHandles(picture);
     }
 
@@ -124,8 +124,8 @@ internal sealed partial class PictureDecoder<TPixel>
     {
         if (_handlesOf != picture.Id)
         {
-            Array.Clear(_refHandle[0]);
-            Array.Clear(_refHandle[1]);
+            _refHandle[0].Clear();
+            _refHandle[1].Clear();
             ResetHandles(picture);
         }
     }

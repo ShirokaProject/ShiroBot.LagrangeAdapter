@@ -62,16 +62,16 @@ internal sealed partial class PictureDecoder<TPixel>
 
     // Per macroblock, for the context derivations: coded_block_pattern (luma | chroma << 4),
     // intra_chroma_pred_mode, and the coded_block_flag of the DC blocks (bit 0 luma, 1 Cb, 2 Cr).
-    private byte[] _cbp = [];
-    private byte[] _chromaPredMode = [];
-    private byte[] _dcCoded = [];
+    private NativeBuffer<byte> _cbp = NativeBuffer<byte>.Empty;
+    private NativeBuffer<byte> _chromaPredMode = NativeBuffer<byte>.Empty;
+    private NativeBuffer<byte> _dcCoded = NativeBuffer<byte>.Empty;
 
     // Per macroblock: B_Skip or B_Direct_16x16 (for the contexts of mb_type in B slices).
-    private bool[] _directMb = [];
+    private NativeBuffer<bool> _directMb = NativeBuffer<bool>.Empty;
 
     // Per list, component and luma 4x4 block: |mvd|, capped (only sums up to 33 matter, also
     // after the halving of 9.3.3.1.1.7).
-    private byte[][][] _absMvd = [[[], []], [[], []]];
+    private NativeBuffer<byte>[][] _absMvd = [[NativeBuffer<byte>.Empty, NativeBuffer<byte>.Empty], [NativeBuffer<byte>.Empty, NativeBuffer<byte>.Empty]];
 
     /// <summary>ctxBlockCat (Table 9-42).</summary>
     private enum BlockCategory
@@ -86,23 +86,23 @@ internal sealed partial class PictureDecoder<TPixel>
 
     private void InitCabacState()
     {
-        _cbp = new byte[_mbCount];
-        _chromaPredMode = new byte[_mbCount];
-        _dcCoded = new byte[_mbCount];
-        _directMb = new bool[_mbCount];
-        _absMvd = [[new byte[_mbCount * 16], new byte[_mbCount * 16]], [new byte[_mbCount * 16], new byte[_mbCount * 16]]];
+        _cbp = new NativeBuffer<byte>(_mbCount);
+        _chromaPredMode = new NativeBuffer<byte>(_mbCount);
+        _dcCoded = new NativeBuffer<byte>(_mbCount);
+        _directMb = new NativeBuffer<bool>(_mbCount);
+        _absMvd = [NativeBuffers.Pair<byte>(_mbCount * 16), NativeBuffers.Pair<byte>(_mbCount * 16)];
     }
 
     private void ResetCabacState()
     {
-        Array.Clear(_cbp);
-        Array.Clear(_chromaPredMode);
-        Array.Clear(_dcCoded);
-        Array.Clear(_directMb);
+        _cbp.Clear();
+        _chromaPredMode.Clear();
+        _dcCoded.Clear();
+        _directMb.Clear();
         foreach (var list in _absMvd)
         {
-            Array.Clear(list[0]);
-            Array.Clear(list[1]);
+            list[0].Clear();
+            list[1].Clear();
         }
     }
 
@@ -421,7 +421,7 @@ internal sealed partial class PictureDecoder<TPixel>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int CabacMvd(Cabac c, int list, int mbAddr, int x, int y, int component)
     {
-        byte[] absMvd = _absMvd[list][component];
+        NativeBuffer<byte> absMvd = _absMvd[list][component];
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         int AbsMvd(int nx, int ny)
         {
@@ -684,7 +684,7 @@ internal sealed partial class PictureDecoder<TPixel>
             return 1;
         }
 
-        byte[] counts = chroma ? _totalCoeffChroma : _totalCoeff[component];
+        NativeBuffer<byte> counts = chroma ? _totalCoeffChroma : _totalCoeff[component];
         int bx = xW >> 2;
         int by = yW >> 2;
         return category switch

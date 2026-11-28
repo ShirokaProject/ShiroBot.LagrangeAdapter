@@ -24,6 +24,7 @@ internal static class HighwayUploadChecks
         new Random(41).NextBytes(content);
         await CheckImageUploadResponsesAsync();
         await CheckRemoteImageDownloadAsync();
+        await CheckHttpMediaRetriesAsync();
         await CheckForwardImageDownloadsAsync();
         await CheckFlashTransferAsync(content, appId: 1415);
         await CheckFlashTransferAsync(content, appId: 14901);
@@ -249,6 +250,50 @@ internal static class HighwayUploadChecks
         await cancellation.CancelAsync();
         await ExpectCancellationAsync(interrupted, timeout.Token);
         if (resources.Count != 0) throw new Exception("An incomplete image was passed to the message chain.");
+    }
+
+    private static async Task CheckHttpMediaRetriesAsync()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var uri = $"http://{listener.LocalEndpoint}/image?token=fixture-secret";
+
+        async Task RespondAsync(string response)
+        {
+            using var client = await listener.AcceptTcpClientAsync(timeout.Token);
+            using var stream = client.GetStream();
+            using var reader = new StreamReader(stream, leaveOpen: true);
+            while (await reader.ReadLineAsync(timeout.Token) is { Length: > 0 }) { }
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(response), timeout.Token);
+        }
+
+        foreach (var (buffer, failure) in new[]
+        {
+            (true, "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            (false, "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nincomplete")
+        })
+        {
+            var pending = LagrangeMapper.OpenResourceAsync(uri, buffer, timeout.Token);
+            await RespondAsync(failure);
+            await RespondAsync("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            await using var result = await pending;
+            if (result.Position != 0 || result.Length != 2 || result.ReadByte() != 'o' || result.ReadByte() != 'k')
+                throw new Exception("Media retry passed through bytes from the unsuccessful response.");
+        }
+
+        var denied = LagrangeMapper.OpenResourceAsync(uri, bufferHttpResponse: false, timeout.Token);
+        await RespondAsync("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        try
+        {
+            await denied;
+            throw new Exception("A forbidden media download was accepted.");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+        {
+            if (listener.Pending() || ex.Message.Contains("fixture-secret", StringComparison.Ordinal))
+                throw new Exception("A forbidden media download retried or leaked its URL token.");
+        }
     }
 
     private static async Task CheckForwardImageDownloadsAsync()

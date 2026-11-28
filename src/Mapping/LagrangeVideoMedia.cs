@@ -12,8 +12,6 @@ internal static class LagrangeVideoMedia
     private const int CoverSize = 320;
     private const long MaxFramePixels = 16_777_216;
     private static readonly SemaphoreSlim PreparationSlot = new(1, 1);
-    // Accessed while holding PreparationSlot. Idle workspaces are eligible for collection.
-    private static readonly WeakReference<Picture?> H264CoverPicture = new(null);
 
     internal static async Task<(Vector2 Size, uint Duration, Stream? Thumbnail)> PrepareAsync(
         Stream source, bool generateThumbnail, CancellationToken cancellationToken)
@@ -69,7 +67,7 @@ internal static class LagrangeVideoMedia
             CheckFrameSize(width, height);
             IVideoDecoder decoder = video.Codec switch
             {
-                CodecIds.H264 => h264 = CreateH264CoverDecoder(video),
+                CodecIds.H264 => h264 = new H264Decoder(video) { ConcealErrors = true, BorrowFrames = true },
                 CodecIds.Hevc => new LagrangeHevcKeyFrameDecoder(video, MaxFramePixels, timeout.Token),
                 _ => new MjpegDecoder(video)
             };
@@ -117,15 +115,13 @@ internal static class LagrangeVideoMedia
         }
         finally
         {
+            // The H.264 pictures and decoding state are native memory: give it back now, not at some later GC.
             if (h264 is not null)
-                H264CoverPicture.SetTarget(h264.CoverPictureForReuse);
+            {
+                h264.Dispose();
+                NativeBuffers.TrimAllocator();
+            }
         }
-    }
-
-    private static H264Decoder CreateH264CoverDecoder(VideoStreamInfo video)
-    {
-        H264CoverPicture.TryGetTarget(out var picture);
-        return new H264Decoder(video, picture) { ConcealErrors = true, BorrowFrames = true };
     }
 
     private static bool IsFirstPresentedSample(Mp4Demuxer demuxer, Packet candidate, CancellationToken cancellationToken)
